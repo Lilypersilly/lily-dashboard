@@ -87,12 +87,18 @@ pub fn init_session_tracker() {
     }
 
     std::thread::spawn(move || {
+        let mut last_saved_json = String::new();
         loop {
             std::thread::sleep(Duration::from_secs(5));
             if let Some(session) = capture_hyprland_clients() {
                 if !session.windows.is_empty() {
                     if let Ok(json) = serde_json::to_string_pretty(&session) {
-                        let _ = fs::write(current_session_path(), json);
+                        // Only write to the SSD if the open windows/positions actually changed!
+                        if json != last_saved_json {
+                            if fs::write(current_session_path(), &json).is_ok() {
+                                last_saved_json = json;
+                            }
+                        }
                     }
                 }
             }

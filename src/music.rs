@@ -1,46 +1,337 @@
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box, Button, Entry, GestureClick, Label, Orientation, PolicyType, Popover, Scale,
-    ScrolledWindow, SearchEntry, Stack,
+    Align, Box, Button, Entry, GestureClick, Image, Label, Orientation, Overflow, PolicyType,
+    Popover, Scale, ScrolledWindow, SearchEntry, Stack,
 };
-use serde::Deserialize;
-use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig};
+use serde::{Deserialize, Serialize};
+use souvlaki::{
+    MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
+};
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+    mpsc,
+};
 use std::time::{Duration, Instant};
 
 const MPV_SOCKET: &str = "/tmp/lily-ymusic-mpv.sock";
+const COOKIE_CACHE_FILE: &str = "/tmp/lily-ymusic-cookies.txt";
+const THUMB_RAM_DIR: &str = "/tmp/lily-ymusic-thumbs";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MediaKind {
+    Song,
+    Album,
+    Playlist,
+}
+
+impl Default for MediaKind {
+    fn default() -> Self {
+        Self::Song
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlaylistItem {
     pub title: String,
     pub url: String,
+    #[serde(default)]
+    pub thumb_url: String,
+    #[serde(default)]
+    pub is_album: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrackItem {
     pub id: String,
     pub title: String,
     pub uploader: String,
     pub duration_str: String,
+    #[serde(default)]
+    pub thumb_url: String,
+    #[serde(default)]
+    pub kind: MediaKind,
+    #[serde(default)]
+    pub list_url: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct MusicStatsData {
+    #[serde(default)]
+    song_plays: HashMap<String, (u32, TrackItem)>,
+    #[serde(default)]
+    playlist_plays: HashMap<String, (u32, PlaylistItem)>,
+}
+
+impl MusicStatsData {
+    fn path() -> std::path::PathBuf {
+        let mut p = glib::user_config_dir();
+        p.push("lily-dashboard");
+        let _ = std::fs::create_dir_all(&p);
+        p.push("music_stats.json");
+        p
+    }
+
+    fn load() -> Self {
+        if let Ok(data) = std::fs::read_to_string(Self::path()) {
+            if let Ok(parsed) = serde_json::from_str::<Self>(&data) {
+                return parsed;
+            }
+        }
+        Self::default()
+    }
+
+    fn save(&self) {
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(Self::path(), json);
+        }
+    }
+
+    fn record_song(&mut self, mut track: TrackItem) {
+        track.kind = MediaKind::Song;
+        let entry = self
+            .song_plays
+            .entry(track.id.clone())
+            .or_insert((0, track.clone()));
+        entry.0 += 1;
+        entry.1 = track;
+        self.save();
+    }
+
+    fn record_playlist(&mut self, pl: PlaylistItem) {
+        let entry = self
+            .playlist_plays
+            .entry(pl.url.clone())
+            .or_insert((0, pl.clone()));
+        entry.0 += 1;
+        entry.1 = pl;
+        self.save();
+    }
+
+    fn top_playlists(&self, limit: usize) -> Vec<(u32, PlaylistItem)> {
+        let mut v: Vec<(u32, PlaylistItem)> = self.playlist_plays.values().cloned().collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0));
+        v.into_iter().take(limit).collect()
+    }
+
+    fn top_songs(&self, limit: usize) -> Vec<(u32, TrackItem)> {
+        let mut v: Vec<(u32, TrackItem)> = self.song_plays.values().cloned().collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0));
+        v.into_iter().take(limit).collect()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum QueueSource {
+    Manual,
+    PlaylistSequential(u64),
+    PlaylistShuffled(u64),
 }
 
 enum WorkerMsg {
     PlaylistsLoaded(Result<(String, Vec<PlaylistItem>), String>),
-    PlaylistTracksLoaded(Result<(String, Vec<TrackItem>), String>),
+    TrackStreamStart {
+        gen_id: u64,
+        title: String,
+    },
+    TrackStreamItem {
+        gen_id: u64,
+        track: TrackItem,
+    },
+    TrackStreamDone {
+        gen_id: u64,
+    },
+    TrackStreamError {
+        gen_id: u64,
+        error: String,
+    },
+}
+
+static STREAM_URL_CACHE: std::sync::OnceLock<Mutex<HashMap<String, (String, Instant)>>> =
+    std::sync::OnceLock::new();
+
+fn get_stream_cache() -> &'static Mutex<HashMap<String, (String, Instant)>> {
+    STREAM_URL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_cached_stream_url(video_id: &str) -> Option<String> {
+    let cache = get_stream_cache().lock().ok()?;
+    if let Some((url, ts)) = cache.get(video_id) {
+        if ts.elapsed() < Duration::from_secs(7200) {
+            return Some(url.clone());
+        }
+    }
+    None
+}
+
+fn prefetch_upcoming_streams(tracks_to_prefetch: Vec<String>, browser_spec: Option<String>) {
+    std::thread::spawn(move || {
+        for video_id in tracks_to_prefetch {
+            if get_cached_stream_url(&video_id).is_some() {
+                continue;
+            }
+
+            let watch_url = format!("https://www.youtube.com/watch?v={}", video_id);
+            let mut cmd = Command::new("yt-dlp");
+            cmd.args([
+                "-g",
+                "-f",
+                "bestaudio/best",
+                "--no-warnings",
+                "--no-playlist",
+            ]);
+
+            if std::path::Path::new(COOKIE_CACHE_FILE).exists() {
+                cmd.args(["--cookies", COOKIE_CACHE_FILE]);
+            } else if let Some(ref spec) = browser_spec {
+                if !spec.is_empty() {
+                    cmd.args(["--cookies-from-browser", spec]);
+                }
+            }
+            cmd.arg(&watch_url);
+
+            if let Ok(output) = cmd.output() {
+                if output.status.success() {
+                    let direct_url = String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+
+                    if direct_url.starts_with("http") {
+                        if let Ok(mut cache) = get_stream_cache().lock() {
+                            cache.insert(video_id, (direct_url, Instant::now()));
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn hash_key(s: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", hash)
+}
+
+/// Loads an image file, crops off YouTube's 16:9 left/right pillarbox bars to keep
+/// only the 1:1 center square of album art, and scales it to an exact 36x36 Texture!
+fn set_cropped_square_art(img: &Image, path: &std::path::Path) {
+    use gtk4::gdk;
+    use gtk4::gdk_pixbuf::{InterpType, Pixbuf};
+
+    let Ok(pixbuf) = Pixbuf::from_file(path) else {
+        return;
+    };
+    let w = pixbuf.width();
+    let h = pixbuf.height();
+    if w <= 0 || h <= 0 {
+        return;
+    }
+
+    // Crop out the dead-center 1:1 square (removes YouTube's left/right dark bars!)
+    let side = w.min(h);
+    let offset_x = (w - side) / 2;
+    let offset_y = (h - side) / 2;
+
+    let square = pixbuf.new_subpixbuf(offset_x, offset_y, side, side);
+    if let Some(scaled) = square.scale_simple(36, 36, InterpType::Bilinear) {
+        let texture = gdk::Texture::for_pixbuf(&scaled);
+        img.set_paintable(Some(&texture));
+    }
+}
+
+/// Builds a strictly uniform 36x36 square Album Art widget in `/tmp` RAM disk!
+fn build_album_art_widget(key: &str, thumb_url: &str) -> Box {
+    let frame = Box::builder()
+        .css_classes(vec!["music-art-frame".to_string()])
+        .width_request(36)
+        .height_request(36)
+        .valign(Align::Center)
+        .halign(Align::Center)
+        .overflow(Overflow::Hidden)
+        .build();
+
+    if key.is_empty() || thumb_url.is_empty() {
+        return frame;
+    }
+
+    let img = Image::builder()
+        .pixel_size(36)
+        .width_request(36)
+        .height_request(36)
+        .build();
+    frame.append(&img);
+
+    let _ = std::fs::create_dir_all(THUMB_RAM_DIR);
+    let cache_file = std::path::PathBuf::from(THUMB_RAM_DIR)
+        .join(format!("{}.jpg", hash_key(&format!("{}|{}", key, thumb_url))));
+
+    if cache_file.exists() {
+        set_cropped_square_art(&img, &cache_file);
+        return frame;
+    }
+
+    let url_owned = thumb_url.to_string();
+    let path_owned = cache_file.clone();
+    let (tx, rx) = mpsc::channel::<bool>();
+
+    std::thread::spawn(move || {
+        let status = Command::new("curl")
+            .args([
+                "-sL",
+                "--max-time",
+                "5",
+                "-o",
+                &path_owned.to_string_lossy(),
+                &url_owned,
+            ])
+            .status();
+        let ok = status.map(|s| s.success()).unwrap_or(false) && path_owned.exists();
+        let _ = tx.send(ok);
+    });
+
+    let img_weak = img.downgrade();
+    let mut ticks = 0u8;
+    glib::timeout_add_local(Duration::from_millis(80), move || {
+        ticks += 1;
+        if let Ok(ok) = rx.try_recv() {
+            if ok {
+                if let Some(i) = img_weak.upgrade() {
+                    set_cropped_square_art(&i, &cache_file);
+                }
+            }
+            return glib::ControlFlow::Break;
+        }
+        if ticks > 70 {
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+
+    frame
 }
 
 struct PlayerState {
     mpv_child: Option<Child>,
     is_paused: bool,
     current_track: Option<TrackItem>,
+    started_at: Instant,
     queue: Vec<TrackItem>,
     queue_idx: usize,
+    queue_source: QueueSource,
     mpris: Option<MediaControls>,
 }
 
@@ -57,26 +348,39 @@ impl PlayerState {
             mpv_child: None,
             is_paused: false,
             current_track: None,
+            started_at: Instant::now(),
             queue: Vec::new(),
             queue_idx: 0,
+            queue_source: QueueSource::Manual,
             mpris,
         }
     }
 
-    fn play_track(&mut self, track: TrackItem, cookie_arg: Option<&str>) {
-        self.stop_mpv();
+    fn ensure_mpv_daemon(&mut self, cookie_arg: Option<&str>) {
+        let alive = if let Some(ref mut child) = self.mpv_child {
+            matches!(child.try_wait(), Ok(None))
+        } else {
+            false
+        };
+
+        if alive && std::path::Path::new(MPV_SOCKET).exists() {
+            return;
+        }
 
         let _ = std::fs::remove_file(MPV_SOCKET);
-        let url = format!("https://www.youtube.com/watch?v={}", track.id);
-
         let mut cmd = Command::new("mpv");
         cmd.args([
+            "--idle=yes",
             "--no-video",
+            "--load-scripts=no",
             "--ytdl-format=bestaudio/best",
+            "--audio-buffer=0.2",
             &format!("--input-ipc-server={}", MPV_SOCKET),
         ]);
 
-        if let Some(browser_spec) = cookie_arg {
+        if std::path::Path::new(COOKIE_CACHE_FILE).exists() {
+            cmd.arg(format!("--ytdl-raw-options=cookies={}", COOKIE_CACHE_FILE));
+        } else if let Some(browser_spec) = cookie_arg {
             if !browser_spec.is_empty() {
                 cmd.arg(format!(
                     "--ytdl-raw-options=cookies-from-browser={}",
@@ -85,47 +389,137 @@ impl PlayerState {
             }
         }
 
-        cmd.arg(&url);
-
         if let Ok(child) = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
             self.mpv_child = Some(child);
+        }
+    }
+
+    fn play_track(&mut self, track: TrackItem, cookie_arg: Option<&str>) {
+        self.ensure_mpv_daemon(cookie_arg);
+
+        let target_url = get_cached_stream_url(&track.id)
+            .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={}", track.id));
+
+        let load_cmd = serde_json::json!({
+            "command": ["loadfile", target_url, "replace"]
+        })
+        .to_string()
+            + "\n";
+
+        let title_cmd = serde_json::json!({
+            "command": ["set_property", "force-media-title", track.title]
+        })
+        .to_string()
+            + "\n";
+
+        let unpause_cmd = b"{\"command\": [\"set_property\", \"pause\", false]}\n";
+
+        let mut sent = false;
+        for _ in 0..30 {
+            if let Ok(mut stream) = UnixStream::connect(MPV_SOCKET) {
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
+                let _ = stream.write_all(load_cmd.as_bytes());
+                let _ = stream.write_all(title_cmd.as_bytes());
+                let _ = stream.write_all(unpause_cmd);
+                sent = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        if sent {
             self.is_paused = false;
             self.current_track = Some(track.clone());
+            self.started_at = Instant::now();
+
+            let clean_artist = track
+                .uploader
+                .strip_suffix(" - Topic")
+                .unwrap_or(&track.uploader);
+            let cover_url = if !track.thumb_url.is_empty() {
+                track.thumb_url.clone()
+            } else {
+                format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", track.id)
+            };
 
             if let Some(ref mut mpris) = self.mpris {
                 let _ = mpris.set_metadata(MediaMetadata {
                     title: Some(&track.title),
-                    artist: Some(&track.uploader),
+                    artist: Some(clean_artist),
                     album: Some("YouTube Music"),
-                    ..Default::default()
+                    cover_url: Some(&cover_url),
+                    duration: parse_mm_ss(&track.duration_str),
                 });
-                let _ = mpris.set_playback(MediaPlayback::Playing { progress: None });
+                let _ = mpris.set_playback(MediaPlayback::Playing {
+                    progress: Some(MediaPosition(Duration::ZERO)),
+                });
             }
+        }
+
+        self.trigger_prefetch(cookie_arg);
+    }
+
+    fn trigger_prefetch(&self, cookie_arg: Option<&str>) {
+        let mut upcoming_ids = Vec::new();
+        for offset in 1..=3 {
+            if let Some(next_track) = self.queue.get(self.queue_idx + offset) {
+                if next_track.kind == MediaKind::Song {
+                    upcoming_ids.push(next_track.id.clone());
+                }
+            }
+        }
+        if !upcoming_ids.is_empty() {
+            prefetch_upcoming_streams(upcoming_ids, cookie_arg.map(|s| s.to_string()));
         }
     }
 
-    /// Queries `(time_pos_secs, duration_secs)` from the running mpv IPC socket
-    fn query_progress(&self) -> Option<(f64, f64)> {
-        if self.mpv_child.is_none() {
-            return None;
-        }
+    fn query_progress(&mut self) -> Option<(f64, f64)> {
+        let track = self.current_track.clone()?;
         let pos = query_mpv_f64("time-pos")?;
         let dur = query_mpv_f64("duration")?;
         if dur > 0.0 {
-            Some((pos.max(0.0), dur))
+            let pos_clamped = pos.max(0.0);
+            if let Some(ref mut mpris) = self.mpris {
+                let clean_artist = track
+                    .uploader
+                    .strip_suffix(" - Topic")
+                    .unwrap_or(&track.uploader);
+                let cover_url = if !track.thumb_url.is_empty() {
+                    track.thumb_url.clone()
+                } else {
+                    format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", track.id)
+                };
+                let _ = mpris.set_metadata(MediaMetadata {
+                    title: Some(&track.title),
+                    artist: Some(clean_artist),
+                    album: Some("YouTube Music"),
+                    cover_url: Some(&cover_url),
+                    duration: Some(Duration::from_secs_f64(dur)),
+                });
+                let position = Some(MediaPosition(Duration::from_secs_f64(pos_clamped)));
+                let state = if self.is_paused {
+                    MediaPlayback::Paused { progress: position }
+                } else {
+                    MediaPlayback::Playing { progress: position }
+                };
+                let _ = mpris.set_playback(state);
+            }
+            Some((pos_clamped, dur))
         } else {
             None
         }
     }
 
-    /// Seeks to an exact position in seconds via mpv IPC
     fn seek_to(&self, seconds: f64) {
-        if self.mpv_child.is_none() {
+        if self.current_track.is_none() {
             return;
         }
         if let Ok(mut stream) = UnixStream::connect(MPV_SOCKET) {
             let _ = stream.set_write_timeout(Some(Duration::from_millis(30)));
-            let cmd = format!("{{\"command\": [\"seek\", {:.2}, \"absolute\"]}}\n", seconds.max(0.0));
+            let cmd = format!(
+                "{{\"command\": [\"seek\", {:.2}, \"absolute\"]}}\n",
+                seconds.max(0.0)
+            );
             let _ = stream.write_all(cmd.as_bytes());
         }
     }
@@ -135,7 +529,7 @@ impl PlayerState {
         track: TrackItem,
         cookie_arg: Option<&str>,
     ) -> Option<TrackItem> {
-        if self.queue.is_empty() || self.mpv_child.is_none() {
+        if self.queue.is_empty() || self.current_track.is_none() {
             self.queue = vec![track.clone()];
             self.queue_idx = 0;
             self.play_track(track.clone(), cookie_arg);
@@ -143,36 +537,53 @@ impl PlayerState {
         }
         let insert_pos = (self.queue_idx + 1).min(self.queue.len());
         self.queue.insert(insert_pos, track);
+        self.trigger_prefetch(cookie_arg);
         None
     }
 
     fn add_to_queue(&mut self, track: TrackItem, cookie_arg: Option<&str>) -> Option<TrackItem> {
-        if self.queue.is_empty() || self.mpv_child.is_none() {
+        if self.queue.is_empty() || self.current_track.is_none() {
             self.queue = vec![track.clone()];
             self.queue_idx = 0;
             self.play_track(track.clone(), cookie_arg);
             return Some(track);
         }
         self.queue.push(track);
+        self.trigger_prefetch(cookie_arg);
         None
     }
 
-    fn check_autoplay_next(&mut self, cookie_arg: Option<&str>) -> Option<TrackItem> {
-        let finished = if let Some(ref mut child) = self.mpv_child {
-            matches!(child.try_wait(), Ok(Some(_)))
-        } else {
-            false
-        };
+    fn on_background_track_arrived(&mut self, gen_id: u64, track: TrackItem) {
+        if track.kind != MediaKind::Song {
+            return;
+        }
+        match self.queue_source {
+            QueueSource::PlaylistSequential(g) if g == gen_id => {
+                self.queue.push(track);
+            }
+            QueueSource::PlaylistShuffled(g) if g == gen_id => {
+                let min_pos = (self.queue_idx + 1).min(self.queue.len());
+                let span = self.queue.len() - min_pos + 1;
+                let offset = random_usize() % span.max(1);
+                self.queue.insert(min_pos + offset, track);
+            }
+            _ => {}
+        }
+    }
 
-        if finished {
-            self.mpv_child = None;
+    fn check_autoplay_next(&mut self, cookie_arg: Option<&str>) -> Option<TrackItem> {
+        self.current_track.as_ref()?;
+        if self.started_at.elapsed() < Duration::from_secs(3) {
+            return None;
+        }
+        if query_mpv_bool("idle-active").unwrap_or(false) {
             return self.play_next(cookie_arg);
         }
         None
     }
 
     fn toggle_pause(&mut self) -> bool {
-        if self.mpv_child.is_none() {
+        if self.current_track.is_none() {
             return false;
         }
         self.is_paused = !self.is_paused;
@@ -223,14 +634,6 @@ impl PlayerState {
         }
         None
     }
-
-    fn stop_mpv(&mut self) {
-        if let Some(mut child) = self.mpv_child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        let _ = std::fs::remove_file(MPV_SOCKET);
-    }
 }
 
 fn query_mpv_f64(prop: &str) -> Option<f64> {
@@ -247,6 +650,22 @@ fn query_mpv_f64(prop: &str) -> Option<f64> {
 
     let val: serde_json::Value = serde_json::from_str(&line).ok()?;
     val.get("data")?.as_f64()
+}
+
+fn query_mpv_bool(prop: &str) -> Option<bool> {
+    let mut stream = UnixStream::connect(MPV_SOCKET).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(25)));
+
+    let cmd = format!("{{\"command\": [\"get_property\", \"{}\"]}}\n", prop);
+    stream.write_all(cmd.as_bytes()).ok()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+
+    let val: serde_json::Value = serde_json::from_str(&line).ok()?;
+    val.get("data")?.as_bool()
 }
 
 fn query_mpv_string(prop: &str) -> Option<String> {
@@ -268,6 +687,21 @@ fn query_mpv_string(prop: &str) -> Option<String> {
 fn format_mm_ss(secs: f64) -> String {
     let total = secs.max(0.0).round() as u64;
     format!("{}:{:02}", total / 60, total % 60)
+}
+
+fn parse_mm_ss(s: &str) -> Option<Duration> {
+    let mut parts = s.split(':');
+    let mins: u64 = parts.next()?.parse().ok()?;
+    let secs: u64 = parts.next()?.parse().ok()?;
+    Some(Duration::from_secs(mins * 60 + secs))
+}
+
+fn random_usize() -> usize {
+    let mut buf = [0u8; 4];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    }
+    u32::from_le_bytes(buf) as usize
 }
 
 fn shuffle_tracks(tracks: &mut [TrackItem]) {
@@ -324,9 +758,66 @@ fn get_browser_candidates() -> Vec<String> {
     list
 }
 
+fn extract_thumb_from_json(val: &serde_json::Value, id: &str) -> String {
+    // 1. For standard 11-char YouTube Video/Song IDs, ALWAYS use the guaranteed 320x180 JPEG!
+    // (Avoids broken .webp urls in yt-dlp search results!)
+    if id.len() == 11 && !id.starts_with("PL") && !id.starts_with("OL") {
+        return format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", id);
+    }
+
+    // 2. For Playlists/Albums, grab the playlist cover thumbnail from `thumbnails`
+    if let Some(arr) = val.get("thumbnails").and_then(|v| v.as_array()) {
+        // Iterate in reverse to get the actual playlist cover rather than channel avatar
+        for item in arr.iter().rev() {
+            if let Some(u) = item.get("url").and_then(|v| v.as_str()) {
+                if u.starts_with("http") && !u.contains("yt3.ggpht.com") {
+                    return u.to_string();
+                }
+            }
+        }
+        if let Some(first) = arr.first() {
+            if let Some(u) = first.get("url").and_then(|v| v.as_str()) {
+                if u.starts_with("http") {
+                    return u.to_string();
+                }
+            }
+        }
+    }
+
+    if let Some(t) = val.get("thumbnail").and_then(|v| v.as_str()) {
+        if t.starts_with("http") {
+            return t.to_string();
+        }
+    }
+
+    String::new()
+}
+
+/// Fallback: if a playlist's own thumbnail is empty (like Liked Music `LM` or `LL`),
+/// grab the thumbnail of the first song cached inside that playlist!
+fn fallback_playlist_thumb(playlist_url: &str, current_thumb: &str) -> String {
+    if !current_thumb.is_empty() {
+        return current_thumb.to_string();
+    }
+    if let Some(tracks) = load_cached_tracks(playlist_url) {
+        if let Some(first) = tracks.first() {
+            if first.id.len() == 11 {
+                return format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", first.id);
+            }
+            if !first.thumb_url.is_empty() {
+                return first.thumb_url.clone();
+            }
+        }
+    }
+    String::new()
+}
+
 fn fetch_user_playlists() -> Result<(String, Vec<PlaylistItem>), String> {
     let candidates = get_browser_candidates();
     let mut last_err = String::from("Session expired. Log into YouTube Music in your browser.");
+
+    let lm_url = "https://music.youtube.com/playlist?list=LM";
+    let ll_url = "https://www.youtube.com/playlist?list=LL";
 
     for browser_spec in &candidates {
         let output = Command::new("yt-dlp")
@@ -336,6 +827,8 @@ fn fetch_user_playlists() -> Result<(String, Vec<PlaylistItem>), String> {
                 "--no-warnings",
                 "--cookies-from-browser",
                 browser_spec,
+                "--cookies",
+                COOKIE_CACHE_FILE,
                 "https://www.youtube.com/feed/playlists",
             ])
             .output()
@@ -345,15 +838,19 @@ fn fetch_user_playlists() -> Result<(String, Vec<PlaylistItem>), String> {
         let mut playlists = vec![
             PlaylistItem {
                 title: "Liked Music (YTM)".to_string(),
-                url: "https://music.youtube.com/playlist?list=LM".to_string(),
+                url: lm_url.to_string(),
+                thumb_url: fallback_playlist_thumb(lm_url, ""),
+                is_album: false,
             },
             PlaylistItem {
                 title: "Liked Videos / Songs".to_string(),
-                url: "https://www.youtube.com/playlist?list=LL".to_string(),
+                url: ll_url.to_string(),
+                thumb_url: fallback_playlist_thumb(ll_url, ""),
+                is_album: false,
             },
         ];
 
-        let mut seen_urls = std::collections::HashSet::new();
+        let mut seen_urls = HashSet::new();
         seen_urls.insert("LM".to_string());
         seen_urls.insert("LL".to_string());
 
@@ -383,7 +880,11 @@ fn fetch_user_playlists() -> Result<(String, Vec<PlaylistItem>), String> {
                     continue;
                 }
 
-                let key = if !id.is_empty() { id.clone() } else { url.clone() };
+                let key = if !id.is_empty() {
+                    id.clone()
+                } else {
+                    url.clone()
+                };
                 if !seen_urls.insert(key) {
                     continue;
                 }
@@ -394,9 +895,15 @@ fn fetch_user_playlists() -> Result<(String, Vec<PlaylistItem>), String> {
                     format!("https://www.youtube.com/playlist?list={}", id)
                 };
 
+                let extracted = extract_thumb_from_json(&val, &id);
+                let thumb_url = fallback_playlist_thumb(&full_url, &extracted);
+                let is_album = id.starts_with("OLAK5uy_") || title.starts_with("Album - ");
+
                 playlists.push(PlaylistItem {
                     title,
                     url: full_url,
+                    thumb_url,
+                    is_album,
                 });
             }
         }
@@ -414,87 +921,432 @@ fn fetch_user_playlists() -> Result<(String, Vec<PlaylistItem>), String> {
     Err(last_err)
 }
 
-fn fetch_ytm_tracks(
-    browser_spec: Option<&str>,
-    query_or_url: &str,
-    is_search: bool,
-    search_limit: u32,
-) -> Result<Vec<TrackItem>, String> {
-    let target = if is_search {
-        format!("ytsearch{}:{}", search_limit.max(1), query_or_url)
+fn parse_track_json_line(line: &str) -> Option<TrackItem> {
+    let val = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let raw_id = val
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if raw_id.is_empty() {
+        return None;
+    }
+
+    let title = val
+        .get("title")
+        .or_else(|| val.get("album"))
+        .or_else(|| val.get("playlist_title"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown Track")
+        .trim()
+        .to_string();
+
+    if title == "[Deleted video]" || title == "[Private video]" {
+        return None;
+    }
+
+    let id = raw_id
+        .strip_prefix("VL")
+        .unwrap_or(&raw_id)
+        .to_string();
+
+    let raw_url = val
+        .get("url")
+        .or_else(|| val.get("webpage_url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let (kind, list_url) = if id.starts_with("OLAK5uy_") || id.starts_with("MPREb_") {
+        let u = if id.starts_with("MPREb_") && raw_url.starts_with("http") {
+            raw_url
+        } else {
+            format!("https://music.youtube.com/playlist?list={}", id)
+        };
+        (MediaKind::Album, u)
+    } else if id.starts_with("PL") || id.starts_with("RDCLAK5uy_") {
+        let u = format!("https://www.youtube.com/playlist?list={}", id);
+        (MediaKind::Playlist, u)
+    } else if id.len() == 11 {
+        (MediaKind::Song, String::new())
     } else {
-        query_or_url.to_string()
+        return None;
     };
 
-    let mut cmd = Command::new("yt-dlp");
-    cmd.args(["--flat-playlist", "--dump-json", "--no-warnings"]);
+    let raw_uploader = val
+        .get("uploader")
+        .or_else(|| val.get("channel"))
+        .or_else(|| val.get("artist"))
+        .or_else(|| val.get("playlist_uploader"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("YouTube Music");
 
-    if let Some(spec) = browser_spec {
-        if !spec.is_empty() && !is_search {
-            cmd.args(["--cookies-from-browser", spec]);
-        }
-    }
-    cmd.arg(&target);
+    let uploader = raw_uploader
+        .strip_suffix(" - Topic")
+        .unwrap_or(raw_uploader)
+        .trim()
+        .to_string();
 
-    let output = cmd
-        .output()
-        .map_err(|e| format!("yt-dlp error: {}", e))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut tracks = Vec::new();
-
-    for line in stdout.lines() {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-            let id = val
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let title = val
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown Track")
-                .to_string();
-            if id.is_empty()
-                || title == "[Deleted video]"
-                || title == "[Private video]"
-                || id.starts_with("PL")
-            {
-                continue;
-            }
-            let uploader = val
-                .get("uploader")
-                .or_else(|| val.get("channel"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("YouTube Music")
-                .to_string();
-
-            let dur_secs = val
-                .get("duration")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0) as u64;
-            let duration_str = if dur_secs > 0 {
+    let dur_secs = val.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0) as u64;
+    let duration_str = match kind {
+        MediaKind::Album => "ALBUM ->".to_string(),
+        MediaKind::Playlist => "PLAYLIST ->".to_string(),
+        MediaKind::Song => {
+            if dur_secs > 0 {
                 format!("{}:{:02}", dur_secs / 60, dur_secs % 60)
             } else {
                 String::new()
-            };
+            }
+        }
+    };
 
-            tracks.push(TrackItem {
-                id,
-                title,
-                uploader,
-                duration_str,
-            });
+    let thumb_url = extract_thumb_from_json(&val, &id);
+
+    Some(TrackItem {
+        id,
+        title,
+        uploader,
+        duration_str,
+        thumb_url,
+        kind,
+        list_url,
+    })
+}
+
+/// When `music.youtube.com/search#albums` returns an Album (`MPREb_` / `OLAK5uy_`) with
+/// `"Unknown Track"`, peeks at Track #1 of that album to grab the real Album Title, Artist & Cover Art!
+fn enrich_album_or_playlist_item(mut item: TrackItem) -> Option<TrackItem> {
+    if item.kind == MediaKind::Song || (item.title != "Unknown Track" && !item.thumb_url.is_empty()) {
+        return Some(item);
+    }
+
+    let output = Command::new("yt-dlp")
+        .args([
+            "--flat-playlist",
+            "--dump-json",
+            "--no-warnings",
+            "--playlist-end",
+            "1",
+            &item.list_url,
+        ])
+        .output()
+        .ok()?;
+
+    let first_line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()?
+        .to_string();
+    let val = serde_json::from_str::<serde_json::Value>(&first_line).ok()?;
+
+    // Grab the Album/Playlist title from `playlist_title` or `playlist`
+    if let Some(pl_title) = val
+        .get("playlist_title")
+        .or_else(|| val.get("playlist"))
+        .or_else(|| val.get("album"))
+        .and_then(|v| v.as_str())
+    {
+        let clean = pl_title
+            .strip_prefix("Album - ")
+            .unwrap_or(pl_title)
+            .trim();
+        if !clean.is_empty() {
+            item.title = clean.to_string();
         }
     }
 
-    if tracks.is_empty() && !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let first_line = stderr.lines().next().unwrap_or("Failed to load playlist");
-        return Err(first_line.to_string());
+    // Grab the Artist from Track #1's uploader/channel
+    if let Some(artist) = val
+        .get("uploader")
+        .or_else(|| val.get("channel"))
+        .or_else(|| val.get("playlist_uploader"))
+        .and_then(|v| v.as_str())
+    {
+        let clean_artist = artist.strip_suffix(" - Topic").unwrap_or(artist).trim();
+        if !clean_artist.is_empty() {
+            item.uploader = clean_artist.to_string();
+        }
     }
 
-    Ok(tracks)
+    // Grab the Album Cover Art from Track #1's 11-char video ID!
+    if let Some(first_vid_id) = val.get("id").and_then(|v| v.as_str()) {
+        if first_vid_id.len() == 11 {
+            item.thumb_url = format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", first_vid_id);
+        }
+    }
+
+    if item.title == "Unknown Track" {
+        None
+    } else {
+        Some(item)
+    }
+}
+
+
+
+
+
+
+
+fn music_cache_dir() -> std::path::PathBuf {
+    let mut path = glib::user_config_dir();
+    path.push("lily-dashboard");
+    path.push("music_cache");
+    let _ = std::fs::create_dir_all(&path);
+    path
+}
+
+fn playlist_cache_path(url: &str) -> std::path::PathBuf {
+    let safe_name: String = url
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    music_cache_dir().join(format!("{}.json", safe_name))
+}
+
+fn load_cached_tracks(url: &str) -> Option<Vec<TrackItem>> {
+    let data = std::fs::read_to_string(playlist_cache_path(url)).ok()?;
+    let tracks: Vec<TrackItem> = serde_json::from_str(&data).ok()?;
+    if tracks.is_empty() {
+        None
+    } else {
+        Some(tracks)
+    }
+}
+
+fn save_cached_tracks(url: &str, tracks: &[TrackItem]) {
+    if !tracks.is_empty() {
+        if let Ok(json) = serde_json::to_string(tracks) {
+            let _ = std::fs::write(playlist_cache_path(url), json);
+        }
+    }
+}
+
+fn run_ytdlp_chunk(
+    browser_spec: Option<&str>,
+    target: &str,
+    is_search: bool,
+    start_idx: Option<u32>,
+    end_idx: Option<u32>,
+    gen_id: u64,
+    active_gen: &Arc<AtomicU64>,
+    tx: &mpsc::Sender<WorkerMsg>,
+) -> Result<usize, String> {
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args(["--flat-playlist", "--dump-json", "--no-warnings"]);
+
+    if let Some(s) = start_idx {
+        cmd.args(["--playlist-start", &s.to_string()]);
+    }
+    if let Some(e) = end_idx {
+        cmd.args(["--playlist-end", &e.to_string()]);
+    }
+
+    if !is_search {
+        if std::path::Path::new(COOKIE_CACHE_FILE).exists() {
+            cmd.args(["--cookies", COOKIE_CACHE_FILE]);
+        } else if let Some(spec) = browser_spec {
+            if !spec.is_empty() {
+                cmd.args(["--cookies-from-browser", spec]);
+            }
+        }
+    }
+
+    cmd.arg(target);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().map_err(|e| format!("yt-dlp error: {}", e))?;
+    let mut count = 0;
+
+    if let Some(stdout) = child.stdout.take() {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if active_gen.load(Ordering::Relaxed) != gen_id {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(count);
+            }
+            if let Some(raw_track) = parse_track_json_line(&line) {
+                if let Some(track) = enrich_album_or_playlist_item(raw_track) {
+                    count += 1;
+                    let _ = tx.send(WorkerMsg::TrackStreamItem { gen_id, track });
+                }
+            }
+        }
+    }
+
+    let _ = child.wait();
+    Ok(count)
+}
+
+fn stream_ytm_tracks(
+    browser_spec: Option<String>,
+    title: String,
+    query_or_url: String,
+    is_search: bool,
+    search_limit: u32,
+    gen_id: u64,
+    active_gen: Arc<AtomicU64>,
+    tx: mpsc::Sender<WorkerMsg>,
+) {
+    let _ = tx.send(WorkerMsg::TrackStreamStart { gen_id, title });
+
+    let spec_ref = browser_spec.as_deref();
+
+    if is_search {
+        let encoded_q: String = query_or_url
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '+' })
+            .collect();
+
+        // 1. Search YouTube Music specifically for SONGS (no reaction videos!)
+        let ytm_songs_url = format!("https://music.youtube.com/search?q={}#songs", encoded_q);
+        let _ = run_ytdlp_chunk(
+            spec_ref,
+            &ytm_songs_url,
+            true,
+            Some(1),
+            Some(search_limit.max(1)),
+            gen_id,
+            &active_gen,
+            &tx,
+        );
+
+        // 2. Search YouTube Music for official ALBUMS (Pastel Blue cards)
+        if active_gen.load(Ordering::Relaxed) == gen_id {
+            let ytm_albums_url = format!("https://music.youtube.com/search?q={}#albums", encoded_q);
+            let _ = run_ytdlp_chunk(
+                spec_ref,
+                &ytm_albums_url,
+                true,
+                Some(1),
+                Some(4),
+                gen_id,
+                &active_gen,
+                &tx,
+            );
+        }
+
+        // 3. Search YouTube Music for featured PLAYLISTS (Pastel Orange cards)
+        if active_gen.load(Ordering::Relaxed) == gen_id {
+            let ytm_pls_url = format!("https://music.youtube.com/search?q={}#playlists", encoded_q);
+            let _ = run_ytdlp_chunk(
+                spec_ref,
+                &ytm_pls_url,
+                true,
+                Some(1),
+                Some(4),
+                gen_id,
+                &active_gen,
+                &tx,
+            );
+        }
+
+        if active_gen.load(Ordering::Relaxed) == gen_id {
+            let _ = tx.send(WorkerMsg::TrackStreamDone { gen_id });
+        }
+        return;
+    }
+
+    let target = query_or_url.clone();
+
+    if let Some(mut cached_tracks) = load_cached_tracks(&query_or_url) {
+        let mut known_ids: HashSet<String> = cached_tracks.iter().map(|t| t.id.clone()).collect();
+
+        for track in &cached_tracks {
+            if active_gen.load(Ordering::Relaxed) != gen_id {
+                return;
+            }
+            let _ = tx.send(WorkerMsg::TrackStreamItem {
+                gen_id,
+                track: track.clone(),
+            });
+        }
+
+        let (delta_tx, delta_rx) = mpsc::channel::<WorkerMsg>();
+        let _ = run_ytdlp_chunk(
+            spec_ref,
+            &target,
+            false,
+            Some(1),
+            Some(25),
+            gen_id,
+            &active_gen,
+            &delta_tx,
+        );
+
+        let mut new_tracks = Vec::new();
+        while let Ok(WorkerMsg::TrackStreamItem { track, .. }) = delta_rx.try_recv() {
+            if known_ids.insert(track.id.clone()) {
+                let _ = tx.send(WorkerMsg::TrackStreamItem {
+                    gen_id,
+                    track: track.clone(),
+                });
+                new_tracks.push(track);
+            }
+        }
+
+        if !new_tracks.is_empty() {
+            new_tracks.append(&mut cached_tracks);
+            save_cached_tracks(&query_or_url, &new_tracks);
+        }
+
+        if active_gen.load(Ordering::Relaxed) == gen_id {
+            let _ = tx.send(WorkerMsg::TrackStreamDone { gen_id });
+        }
+        return;
+    }
+
+    let (spy_tx, spy_rx) = mpsc::channel::<WorkerMsg>();
+    let first_res = run_ytdlp_chunk(
+        spec_ref,
+        &target,
+        false,
+        Some(1),
+        Some(50),
+        gen_id,
+        &active_gen,
+        &spy_tx,
+    );
+
+    let mut collected = Vec::new();
+    while let Ok(msg) = spy_rx.try_recv() {
+        if let WorkerMsg::TrackStreamItem { ref track, .. } = msg {
+            collected.push(track.clone());
+        }
+        let _ = tx.send(msg);
+    }
+
+    match first_res {
+        Ok(first_batch_count) => {
+            if first_batch_count >= 45 && active_gen.load(Ordering::Relaxed) == gen_id {
+                let _ = run_ytdlp_chunk(
+                    spec_ref,
+                    &target,
+                    false,
+                    Some(51),
+                    None,
+                    gen_id,
+                    &active_gen,
+                    &spy_tx,
+                );
+                while let Ok(msg) = spy_rx.try_recv() {
+                    if let WorkerMsg::TrackStreamItem { ref track, .. } = msg {
+                        collected.push(track.clone());
+                    }
+                    let _ = tx.send(msg);
+                }
+            }
+            if active_gen.load(Ordering::Relaxed) == gen_id {
+                save_cached_tracks(&query_or_url, &collected);
+                let _ = tx.send(WorkerMsg::TrackStreamDone { gen_id });
+            }
+        }
+        Err(error) => {
+            let _ = tx.send(WorkerMsg::TrackStreamError { gen_id, error });
+        }
+    }
 }
 
 pub fn build_music_ui() -> Box {
@@ -511,17 +1363,39 @@ pub fn build_music_ui() -> Box {
 
     let music_page = Box::builder()
         .orientation(Orientation::Vertical)
-        .spacing(8)
-        .margin_top(12)
-        .margin_bottom(12)
+        .spacing(6)
+        .margin_top(10)
+        .margin_bottom(10)
         .margin_start(12)
         .margin_end(12)
         .hexpand(true)
         .vexpand(true)
         .build();
 
+    // Top Navigation Bar: [ Home ] [ Playlists ]
+    let top_nav_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+
+    let home_nav_btn = Button::builder()
+        .label("Home")
+        .css_classes(vec!["plan-fmt-btn".to_string(), "active".to_string()])
+        .hexpand(true)
+        .build();
+
+    let playlists_nav_btn = Button::builder()
+        .label("Playlists")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .hexpand(true)
+        .build();
+
+    top_nav_row.append(&home_nav_btn);
+    top_nav_row.append(&playlists_nav_btn);
+
+    // Contextual Search Bar
     let search_entry = SearchEntry::builder()
-        .placeholder_text("Search songs...")
+        .placeholder_text("Search YouTube Music...")
         .css_classes(vec!["fav-search".to_string()])
         .build();
 
@@ -529,6 +1403,29 @@ pub fn build_music_ui() -> Box {
     nav_stack.set_hhomogeneous(false);
     nav_stack.set_hexpand(true);
     nav_stack.set_vexpand(true);
+
+    // --- PAGE 0: HOME SCREEN (Commonly Played Playlists & Songs) ---
+    let home_screen = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(6)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+
+    let home_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+
+    let home_content_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(6)
+        .build();
+
+    home_scroll.set_child(Some(&home_content_box));
+    home_screen.append(&home_scroll);
 
     // --- PAGE A: PLAYLISTS LIST SCREEN ---
     let playlists_screen = Box::builder()
@@ -576,7 +1473,7 @@ pub fn build_music_ui() -> Box {
     playlists_screen.append(&pl_header_row);
     playlists_screen.append(&pl_scroll);
 
-    // --- PAGE B: INSIDE A PLAYLIST / SEARCH RESULTS SCREEN ---
+    // --- PAGE B: INSIDE A PLAYLIST / ALBUM / GLOBAL SEARCH RESULTS ---
     let tracks_screen = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(6)
@@ -590,7 +1487,7 @@ pub fn build_music_ui() -> Box {
         .build();
 
     let back_to_pl_btn = Button::builder()
-        .label("<- Playlists")
+        .label("<- Back")
         .css_classes(vec!["plan-close-btn".to_string()])
         .build();
 
@@ -686,6 +1583,7 @@ pub fn build_music_ui() -> Box {
         .label("ACTIVE QUEUE")
         .halign(Align::Start)
         .hexpand(true)
+        .width_chars(1)
         .ellipsize(gtk4::pango::EllipsizeMode::End)
         .css_classes(vec!["fav-group-header".to_string()])
         .build();
@@ -716,11 +1614,12 @@ pub fn build_music_ui() -> Box {
     queue_screen.append(&q_top_row);
     queue_screen.append(&q_scroll);
 
+    nav_stack.add_named(&home_screen, Some("home"));
     nav_stack.add_named(&playlists_screen, Some("playlists"));
     nav_stack.add_named(&tracks_screen, Some("tracks"));
     nav_stack.add_named(&queue_screen, Some("queue"));
 
-    // --- BOTTOM NOW PLAYING DOCK (With Draggable Progress Seek Bar) ---
+    // --- BOTTOM NOW PLAYING DOCK ---
     let player_dock = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(4)
@@ -739,9 +1638,8 @@ pub fn build_music_ui() -> Box {
         .css_classes(vec!["plan-step".to_string()])
         .build();
 
-    // Mini viewport that clips long titles and lets us smoothly scroll them back & forth!
     let title_marquee_scroll = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::External) // Allows scrolling while hiding the scrollbar!
+        .hscrollbar_policy(PolicyType::External)
         .vscrollbar_policy(PolicyType::Never)
         .hexpand(true)
         .valign(Align::Center)
@@ -760,8 +1658,8 @@ pub fn build_music_ui() -> Box {
     // Smooth back-and-forth marquee animation for long song titles
     {
         let scroll_anim = title_marquee_scroll.clone();
-        let dir = Rc::new(Cell::new(1.0_f64)); // 1.0 = scrolling right, -1.0 = scrolling left
-        let pause_ticks = Rc::new(Cell::new(30_u32)); // Pause ~1.5s at each end
+        let dir = Rc::new(Cell::new(1.0_f64));
+        let pause_ticks = Rc::new(Cell::new(30_u32));
         let last_seen_title = Rc::new(RefCell::new(String::new()));
         let lbl_watch = now_playing_lbl.clone();
 
@@ -769,7 +1667,6 @@ pub fn build_music_ui() -> Box {
             let adj = scroll_anim.hadjustment();
             let cur_title = lbl_watch.text().to_string();
 
-            // Whenever the song changes, reset marquee to the start and pause for 1.5s
             if *last_seen_title.borrow() != cur_title {
                 *last_seen_title.borrow_mut() = cur_title;
                 adj.set_value(0.0);
@@ -780,7 +1677,6 @@ pub fn build_music_ui() -> Box {
 
             let max_scroll = (adj.upper() - adj.page_size()).max(0.0);
             if max_scroll <= 2.0 {
-                // Title fits completely; no scrolling needed
                 if adj.value() != 0.0 {
                     adj.set_value(0.0);
                 }
@@ -796,11 +1692,11 @@ pub fn build_music_ui() -> Box {
             if next_val >= max_scroll {
                 adj.set_value(max_scroll);
                 dir.set(-1.0);
-                pause_ticks.set(30); // Pause 1.5s at the right end
+                pause_ticks.set(30);
             } else if next_val <= 0.0 {
                 adj.set_value(0.0);
                 dir.set(1.0);
-                pause_ticks.set(35); // Pause ~1.75s at the left start
+                pause_ticks.set(35);
             } else {
                 adj.set_value(next_val);
             }
@@ -832,7 +1728,6 @@ pub fn build_music_ui() -> Box {
     meta_row.append(&now_artist_lbl);
     meta_row.append(&time_lbl);
 
-    // Draggable Progress / Seek Bar
     let seek_scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
     seek_scale.set_draw_value(false);
     seek_scale.set_hexpand(true);
@@ -870,6 +1765,7 @@ pub fn build_music_ui() -> Box {
     player_dock.append(&seek_scale);
     player_dock.append(&controls_row);
 
+    music_page.append(&top_nav_row);
     music_page.append(&search_entry);
     music_page.append(&nav_stack);
     music_page.append(&player_dock);
@@ -935,6 +1831,30 @@ pub fn build_music_ui() -> Box {
 
     // State
     let player = Rc::new(RefCell::new(PlayerState::new()));
+    let stats = Rc::new(RefCell::new(MusicStatsData::load()));
+    let active_browser = Rc::new(RefCell::new(String::new()));
+    let all_playlists: Rc<RefCell<Vec<PlaylistItem>>> = Rc::new(RefCell::new(Vec::new()));
+    let current_playlist_tracks: Rc<RefCell<Vec<TrackItem>>> = Rc::new(RefCell::new(Vec::new()));
+    let track_filter_query = Rc::new(RefCell::new(String::new()));
+    let pending_ui_tracks: Rc<RefCell<VecDeque<(u64, TrackItem, bool)>>> =
+        Rc::new(RefCell::new(VecDeque::new()));
+    let active_stream_gen = Arc::new(AtomicU64::new(0));
+    let current_view_title = Rc::new(RefCell::new(String::new()));
+    let is_stream_finished = Rc::new(Cell::new(false));
+    let prev_nav_page = Rc::new(RefCell::new("home".to_string()));
+    let search_limit = Rc::new(Cell::new(25u32));
+    let last_search_query = Rc::new(RefCell::new(String::new()));
+    let last_user_seek = Rc::new(Cell::new(Instant::now() - Duration::from_secs(10)));
+    let (tx, rx) = mpsc::channel::<WorkerMsg>();
+    let (mpris_tx, mpris_rx) = mpsc::channel::<MediaControlEvent>();
+
+    if let Some(ref mut mpris) = player.borrow_mut().mpris {
+        let _ = mpris.attach(move |event| {
+            let _ = mpris_tx.send(event);
+        });
+    }
+
+    // Left-click on scrolling title copies: `song | album | artist`
     title_marquee_scroll.set_tooltip_text(Some("Left-click to copy: song | album | artist"));
 
     let title_click = GestureClick::builder().button(1).build();
@@ -948,13 +1868,11 @@ pub fn build_music_ui() -> Box {
 
         let song = track.title.trim().to_string();
 
-        // Query the real Album tag from mpv's loaded YouTube Music metadata (fallback to "Single")
         let album = query_mpv_string("metadata/by-key/album")
             .or_else(|| query_mpv_string("metadata/by-key/Album"))
             .filter(|a| !a.is_empty())
             .unwrap_or_else(|| "Single".to_string());
 
-        // Prefer mpv's clean artist tag, or strip " - Topic" from the uploader name
         let raw_artist = query_mpv_string("metadata/by-key/artist")
             .or_else(|| query_mpv_string("metadata/by-key/Artist"))
             .filter(|a| !a.is_empty())
@@ -980,22 +1898,8 @@ pub fn build_music_ui() -> Box {
         });
     });
     title_marquee_scroll.add_controller(title_click);
-    let active_browser = Rc::new(RefCell::new(String::new()));
-    let current_playlist_tracks: Rc<RefCell<Vec<TrackItem>>> = Rc::new(RefCell::new(Vec::new()));
-    let prev_nav_page = Rc::new(RefCell::new("playlists".to_string()));
-    let search_limit = Rc::new(Cell::new(25u32));
-    let last_search_query = Rc::new(RefCell::new(String::new()));
-    let last_user_seek = Rc::new(Cell::new(Instant::now() - Duration::from_secs(10)));
-    let (tx, rx) = mpsc::channel::<WorkerMsg>();
-    let (mpris_tx, mpris_rx) = mpsc::channel::<MediaControlEvent>();
 
-    if let Some(ref mut mpris) = player.borrow_mut().mpris {
-        let _ = mpris.attach(move |event| {
-            let _ = mpris_tx.send(event);
-        });
-    }
-
-    // Wire up Draggable Seek Bar (`connect_change_value` ONLY fires on user mouse/key interaction!)
+    // Draggable Seek Bar
     let player_seek = player.clone();
     let last_seek_stamp = last_user_seek.clone();
     let time_lbl_seek = time_lbl.clone();
@@ -1004,7 +1908,6 @@ pub fn build_music_ui() -> Box {
         let target = new_val.clamp(0.0, max_dur);
         time_lbl_seek.set_label(&format!("{} / {}", format_mm_ss(target), format_mm_ss(max_dur)));
 
-        // Throttle IPC seek commands to once every 80ms while dragging smoothly
         if last_seek_stamp.get().elapsed() >= Duration::from_millis(80) {
             last_seek_stamp.set(Instant::now());
             player_seek.borrow().seek_to(target);
@@ -1012,7 +1915,9 @@ pub fn build_music_ui() -> Box {
         glib::Propagation::Proceed
     });
 
-    // Helper closure to refresh the visible Queue UI & "Queue (N)" badge
+    // Helper closure to refresh the visible Queue UI & "Queue (N)" badge with 35-item Virtualization
+    let q_win_start = Rc::new(Cell::new(0usize));
+
     let refresh_queue_ui: Rc<dyn Fn()> = {
         let q_box = queue_list_box.clone();
         let q_btn = queue_view_btn.clone();
@@ -1021,11 +1926,17 @@ pub fn build_music_ui() -> Box {
         let np_t_q = now_playing_lbl.clone();
         let np_a_q = now_artist_lbl.clone();
         let pp_q = play_pause_btn.clone();
+        let q_ws = q_win_start.clone();
+        let q_scroll_jump = q_scroll.clone();
 
         let refresh_rc: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
         let refresh_weak = refresh_rc.clone();
 
         let closure: Rc<dyn Fn()> = Rc::new(move || {
+            let cur_idx = player_q.borrow().queue_idx;
+            let desired_start = cur_idx.saturating_sub(4);
+            q_ws.set(desired_start);
+
             render_queue_view(
                 &q_box,
                 &q_btn,
@@ -1035,13 +1946,460 @@ pub fn build_music_ui() -> Box {
                 &np_a_q,
                 &pp_q,
                 &refresh_weak,
+                desired_start,
             );
+
+            let target_y = (cur_idx.saturating_sub(2) as f64) * 56.0;
+            let adj = q_scroll_jump.vadjustment();
+            glib::idle_add_local_once(move || {
+                adj.set_value(target_y);
+            });
         });
         *refresh_rc.borrow_mut() = Some(closure.clone());
+
+        let q_vadj = q_scroll.vadjustment();
+        let q_ws_scroll = q_win_start.clone();
+        let q_box_s = queue_list_box.clone();
+        let q_btn_s = queue_view_btn.clone();
+        let player_s = player.clone();
+        let br_s = active_browser.clone();
+        let np_t_s = now_playing_lbl.clone();
+        let np_a_s = now_artist_lbl.clone();
+        let pp_s = play_pause_btn.clone();
+        let refresh_s = refresh_rc.clone();
+
+        q_vadj.connect_value_changed(move |adj| {
+            let scroll_y = adj.value().max(0.0) as usize;
+            let approx_first = scroll_y / 56;
+            let desired = approx_first.saturating_sub(8);
+            let current = q_ws_scroll.get();
+
+            if desired.abs_diff(current) >= 6 || (desired == 0 && current != 0) {
+                q_ws_scroll.set(desired);
+                render_queue_view(
+                    &q_box_s,
+                    &q_btn_s,
+                    &player_s,
+                    &br_s,
+                    &np_t_s,
+                    &np_a_s,
+                    &pp_s,
+                    &refresh_s,
+                    desired,
+                );
+            }
+        });
+
         closure
     };
 
-    // Toggle Queue screen when clicking "Queue (N)"
+    // Helper closure to open any Playlist or Album URL in the Tracks screen
+    let open_playlist_or_album: Rc<dyn Fn(PlaylistItem)> = {
+        let nav_o = nav_stack.clone();
+        let home_btn_o = home_nav_btn.clone();
+        let pl_btn_o = playlists_nav_btn.clone();
+        let search_o = search_entry.clone();
+        let filter_o = track_filter_query.clone();
+        let gen_o = active_stream_gen.clone();
+        let br_o = active_browser.clone();
+        let tx_o = tx.clone();
+        let stats_o = stats.clone();
+
+        Rc::new(move |pl: PlaylistItem| {
+            stats_o.borrow_mut().record_playlist(pl.clone());
+            *filter_o.borrow_mut() = String::new();
+            search_o.set_text("");
+            search_o.set_placeholder_text(Some("Filter songs in this list..."));
+            home_btn_o.remove_css_class("active");
+            pl_btn_o.add_css_class("active");
+
+            nav_o.set_visible_child_name("tracks");
+            let new_gen = gen_o.fetch_add(1, Ordering::Relaxed) + 1;
+            let br = br_o.borrow().clone();
+            let tx_w = tx_o.clone();
+            let gen_arc = gen_o.clone();
+            let title_owned = pl.title.to_uppercase();
+            let url_owned = pl.url.clone();
+
+            std::thread::spawn(move || {
+                let spec = if br.is_empty() { None } else { Some(br) };
+                stream_ytm_tracks(
+                    spec,
+                    title_owned,
+                    url_owned,
+                    false,
+                    50,
+                    new_gen,
+                    gen_arc,
+                    tx_w,
+                );
+            });
+        })
+    };
+
+    // Helper closure to refresh the Home View (Top Playlists + Top Songs)
+    let refresh_home_ui: Rc<dyn Fn()> = {
+        let h_box = home_content_box.clone();
+        let stats_h = stats.clone();
+        let all_pl_h = all_playlists.clone();
+        let open_pl_h = open_playlist_or_album.clone();
+        let player_h = player.clone();
+        let br_h = active_browser.clone();
+        let np_t_h = now_playing_lbl.clone();
+        let np_a_h = now_artist_lbl.clone();
+        let pp_h = play_pause_btn.clone();
+        let refresh_q_h = refresh_queue_ui.clone();
+
+        Rc::new(move || {
+            render_home_view(
+                &h_box,
+                &stats_h,
+                &all_pl_h.borrow(),
+                &open_pl_h,
+                &player_h,
+                &br_h,
+                &np_t_h,
+                &np_a_h,
+                &pp_h,
+                &refresh_q_h,
+            );
+        })
+    };
+
+    // --- 0.01s (10ms) CASCADING SONG LOADER + SLIDING-WINDOW VIRTUALIZATION ---
+    let render_virtual_window: Rc<dyn Fn(usize)>;
+    {
+        const ROW_HEIGHT_PX: i32 = 56;
+        const WINDOW_SIZE: usize = 35;
+
+        let pending_pop = pending_ui_tracks.clone();
+        let cur_tracks_pop = current_playlist_tracks.clone();
+        let tr_box_pop = track_list_box.clone();
+        let tr_lbl_pop = active_pl_title_lbl.clone();
+        let view_title_pop = current_view_title.clone();
+        let stream_done_pop = is_stream_finished.clone();
+        let gen_pop = active_stream_gen.clone();
+        let player_pop = player.clone();
+        let stats_pop = stats.clone();
+        let br_pop = active_browser.clone();
+        let np_t_pop = now_playing_lbl.clone();
+        let np_a_pop = now_artist_lbl.clone();
+        let pp_pop = play_pause_btn.clone();
+        let refresh_q_pop = refresh_queue_ui.clone();
+        let open_pl_pop = open_playlist_or_album.clone();
+        let q_btn_pop = queue_view_btn.clone();
+        let filter_pop = track_filter_query.clone();
+
+        let win_start = Rc::new(Cell::new(0usize));
+        let win_end = Rc::new(Cell::new(0usize));
+        let last_gen_seen = Rc::new(Cell::new(0u64));
+
+        render_virtual_window = {
+            let tr_box_v = track_list_box.clone();
+            let cur_tracks_v = current_playlist_tracks.clone();
+            let filter_v = track_filter_query.clone();
+            let view_title_v = current_view_title.clone();
+            let gen_v = active_stream_gen.clone();
+            let player_v = player.clone();
+            let stats_v = stats.clone();
+            let br_v = active_browser.clone();
+            let np_t_v = now_playing_lbl.clone();
+            let np_a_v = now_artist_lbl.clone();
+            let pp_v = play_pause_btn.clone();
+            let refresh_q_v = refresh_queue_ui.clone();
+            let open_pl_v = open_playlist_or_album.clone();
+            let ws_v = win_start.clone();
+            let we_v = win_end.clone();
+
+            Rc::new(move |requested_start: usize| {
+                let all_snapshot = cur_tracks_v.borrow();
+                let fq = filter_v.borrow().clone();
+
+                let filtered: Vec<(usize, TrackItem)> = all_snapshot
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| {
+                        fq.is_empty()
+                            || t.title.to_lowercase().contains(&fq)
+                            || t.uploader.to_lowercase().contains(&fq)
+                    })
+                    .map(|(i, t)| (i, t.clone()))
+                    .collect();
+
+                let total = filtered.len();
+                while let Some(child) = tr_box_v.first_child() {
+                    tr_box_v.remove(&child);
+                }
+
+                if total == 0 {
+                    return;
+                }
+
+                let max_start = total.saturating_sub(WINDOW_SIZE);
+                let start = requested_start.min(max_start);
+                let end = (start + WINDOW_SIZE).min(total);
+
+                ws_v.set(start);
+                we_v.set(end);
+
+                if start > 0 {
+                    let top_spacer = Box::builder()
+                        .height_request((start as i32) * ROW_HEIGHT_PX)
+                        .build();
+                    tr_box_v.append(&top_spacer);
+                }
+
+                let is_search = view_title_v.borrow().starts_with("SEARCH:");
+                let cur_gen = gen_v.load(Ordering::Relaxed);
+
+                for (orig_idx, track) in filtered.into_iter().skip(start).take(end - start) {
+                    append_single_track_row(
+                        &tr_box_v,
+                        orig_idx,
+                        cur_gen,
+                        track,
+                        is_search,
+                        &cur_tracks_v,
+                        &player_v,
+                        &stats_v,
+                        &br_v,
+                        &np_t_v,
+                        &np_a_v,
+                        &pp_v,
+                        &refresh_q_v,
+                        &open_pl_v,
+                    );
+                }
+
+                let remaining_below = total.saturating_sub(end);
+                if remaining_below > 0 {
+                    let bottom_spacer = Box::builder()
+                        .height_request((remaining_below as i32) * ROW_HEIGHT_PX)
+                        .build();
+                    tr_box_v.append(&bottom_spacer);
+                }
+            })
+        };
+
+        let ws_timer = win_start.clone();
+        let we_timer = win_end.clone();
+        let last_gen_timer = last_gen_seen.clone();
+        let render_win_timer = render_virtual_window.clone();
+
+        glib::timeout_add_local(Duration::from_millis(10), move || {
+            let mut batch_loop = 0;
+            let mut added_beyond_window = false;
+
+            loop {
+                let next_item = pending_pop.borrow_mut().pop_front();
+                let Some((item_gen, track, is_search)) = next_item else {
+                    break;
+                };
+
+                let current_gen = gen_pop.load(Ordering::Relaxed);
+                if item_gen != current_gen {
+                    continue;
+                }
+
+                if last_gen_timer.get() != current_gen {
+                    last_gen_timer.set(current_gen);
+                    ws_timer.set(0);
+                    we_timer.set(0);
+                }
+
+                let idx = {
+                    let mut list = cur_tracks_pop.borrow_mut();
+                    let idx = list.len();
+                    list.push(track.clone());
+                    idx
+                };
+
+                let fq = filter_pop.borrow().clone();
+                if idx < WINDOW_SIZE && ws_timer.get() == 0 && fq.is_empty() {
+                    we_timer.set(idx + 1);
+                    append_single_track_row(
+                        &tr_box_pop,
+                        idx,
+                        item_gen,
+                        track.clone(),
+                        is_search,
+                        &cur_tracks_pop,
+                        &player_pop,
+                        &stats_pop,
+                        &br_pop,
+                        &np_t_pop,
+                        &np_a_pop,
+                        &pp_pop,
+                        &refresh_q_pop,
+                        &open_pl_pop,
+                    );
+                } else {
+                    added_beyond_window = true;
+                }
+
+                let new_q_len = {
+                    let mut p = player_pop.borrow_mut();
+                    let before_len = p.queue.len();
+                    p.on_background_track_arrived(item_gen, track);
+                    if p.queue.len() != before_len {
+                        Some(p.queue.len())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(q_len) = new_q_len {
+                    q_btn_pop.set_label(&format!("Queue ({})", q_len));
+                }
+
+                let total_loaded = idx + 1;
+                let base_title = view_title_pop.borrow().clone();
+                let pending_empty = pending_pop.borrow().is_empty();
+
+                if stream_done_pop.get() && pending_empty {
+                    tr_lbl_pop.set_label(&format!("{} ({})", base_title, total_loaded));
+                } else {
+                    tr_lbl_pop.set_label(&format!("{} ({}...)", base_title, total_loaded));
+                }
+
+                if idx < WINDOW_SIZE {
+                    break;
+                }
+                batch_loop += 1;
+                if batch_loop >= 35 {
+                    break;
+                }
+            }
+
+            if added_beyond_window && pending_pop.borrow().is_empty() {
+                render_win_timer(ws_timer.get());
+            }
+
+            glib::ControlFlow::Continue
+        });
+
+        let vadj = tr_scroll.vadjustment();
+        let ws_scroll = win_start.clone();
+        let render_win_scroll = render_virtual_window.clone();
+
+        vadj.connect_value_changed(move |adj| {
+            let scroll_y = adj.value().max(0.0) as usize;
+            let approx_first_visible = scroll_y / (ROW_HEIGHT_PX as usize);
+            let desired_start = approx_first_visible.saturating_sub(8);
+            let current_start = ws_scroll.get();
+
+            if desired_start.abs_diff(current_start) >= 6
+                || (desired_start == 0 && current_start != 0)
+            {
+                render_win_scroll(desired_start);
+            }
+        });
+    }
+
+    // Wire up Top Navigation Buttons: [ Home ] and [ Playlists ]
+    {
+        let nav_h = nav_stack.clone();
+        let home_btn = home_nav_btn.clone();
+        let pl_btn = playlists_nav_btn.clone();
+        let search_h = search_entry.clone();
+        let refresh_h = refresh_home_ui.clone();
+        home_nav_btn.connect_clicked(move |_| {
+            home_btn.add_css_class("active");
+            pl_btn.remove_css_class("active");
+            search_h.set_text("");
+            search_h.set_placeholder_text(Some("Search YouTube Music..."));
+            refresh_h();
+            nav_h.set_visible_child_name("home");
+        });
+    }
+    {
+        let nav_p = nav_stack.clone();
+        let home_btn = home_nav_btn.clone();
+        let pl_btn = playlists_nav_btn.clone();
+        let search_p = search_entry.clone();
+        let pl_box_p = playlists_box.clone();
+        let all_pl_p = all_playlists.clone();
+        let open_pl_p = open_playlist_or_album.clone();
+        playlists_nav_btn.connect_clicked(move |_| {
+            pl_btn.add_css_class("active");
+            home_btn.remove_css_class("active");
+            search_p.set_text("");
+            search_p.set_placeholder_text(Some("Filter your playlists..."));
+            render_playlists_list(&pl_box_p, &all_pl_p.borrow(), "", &open_pl_p);
+            nav_p.set_visible_child_name("playlists");
+        });
+    }
+
+    // CONTEXTUAL SEARCH BAR:
+    // 1. Live-filters when in "playlists" view or inside a specific playlist ("tracks" view)
+    {
+        let nav_chg = nav_stack.clone();
+        let pl_box_chg = playlists_box.clone();
+        let all_pl_chg = all_playlists.clone();
+        let open_pl_chg = open_playlist_or_album.clone();
+        let view_title_chg = current_view_title.clone();
+        let filter_chg = track_filter_query.clone();
+        let render_win_chg = render_virtual_window.clone();
+
+        search_entry.connect_search_changed(move |entry| {
+            let q = entry.text().trim().to_lowercase();
+            let page = nav_chg
+                .visible_child_name()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "home".to_string());
+
+            if page == "playlists" {
+                render_playlists_list(&pl_box_chg, &all_pl_chg.borrow(), &q, &open_pl_chg);
+            } else if page == "tracks" && !view_title_chg.borrow().starts_with("SEARCH:") {
+                *filter_chg.borrow_mut() = q;
+                render_win_chg(0);
+            }
+        });
+    }
+
+    // 2. Pressing Enter in "home" (or in global search) searches all of YouTube Music!
+    {
+        let tx_search = tx.clone();
+        let br_search = active_browser.clone();
+        let nav_search = nav_stack.clone();
+        let view_title_s = current_view_title.clone();
+        let filter_s = track_filter_query.clone();
+        let limit_cell_search = search_limit.clone();
+        let last_q_search = last_search_query.clone();
+        let gen_search = active_stream_gen.clone();
+
+        search_entry.connect_activate(move |entry| {
+            let q = entry.text().trim().to_string();
+            if q.is_empty() {
+                return;
+            }
+            let page = nav_search
+                .visible_child_name()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "home".to_string());
+
+            // Only run global YouTube Music search if we are on "home" or already on a "SEARCH:" view
+            if page == "home"
+                || (page == "tracks" && view_title_s.borrow().starts_with("SEARCH:"))
+            {
+                *filter_s.borrow_mut() = String::new();
+                *last_q_search.borrow_mut() = q.clone();
+                let max_n = limit_cell_search.get();
+                nav_search.set_visible_child_name("tracks");
+
+                let new_gen = gen_search.fetch_add(1, Ordering::Relaxed) + 1;
+                let tx_w = tx_search.clone();
+                let br = br_search.borrow().clone();
+                let gen_arc = gen_search.clone();
+                let title_str = format!("SEARCH: {}", q.to_uppercase());
+                std::thread::spawn(move || {
+                    let spec = if br.is_empty() { None } else { Some(br) };
+                    stream_ytm_tracks(spec, title_str, q, true, max_n, new_gen, gen_arc, tx_w);
+                });
+            }
+        });
+    }
+
+    // Toggle Queue screen
     let nav_q_btn = nav_stack.clone();
     let prev_nav_q = prev_nav_page.clone();
     let refresh_on_open_q = refresh_queue_ui.clone();
@@ -1049,7 +2407,7 @@ pub fn build_music_ui() -> Box {
         let cur = nav_q_btn
             .visible_child_name()
             .map(|s| s.to_string())
-            .unwrap_or_else(|| "playlists".to_string());
+            .unwrap_or_else(|| "home".to_string());
         if cur == "queue" {
             let target = prev_nav_q.borrow().clone();
             nav_q_btn.set_visible_child_name(&target);
@@ -1072,6 +2430,7 @@ pub fn build_music_ui() -> Box {
     clear_q_btn.connect_clicked(move |_| {
         {
             let mut p = player_clear.borrow_mut();
+            p.queue_source = QueueSource::Manual;
             if let Some(cur) = p.current_track.clone() {
                 if p.mpv_child.is_some() {
                     p.queue = vec![cur];
@@ -1118,6 +2477,7 @@ pub fn build_music_ui() -> Box {
     let last_q_save = last_search_query.clone();
     let tx_limit = tx.clone();
     let br_limit = active_browser.clone();
+    let gen_limit = active_stream_gen.clone();
 
     let commit_limit = Rc::new(move || {
         if let Ok(parsed) = entry_save.text().trim().parse::<u32>() {
@@ -1126,22 +2486,23 @@ pub fn build_music_ui() -> Box {
 
             let q = last_q_save.borrow().clone();
             if !q.is_empty() {
-                hdr_lbl_save.set_label(&format!(
-                    "SEARCHING '{}' ({})...",
-                    q.to_uppercase(),
-                    clamped
-                ));
+                let new_gen = gen_limit.fetch_add(1, Ordering::Relaxed) + 1;
                 let tx_w = tx_limit.clone();
                 let br = br_limit.borrow().clone();
+                let gen_arc = gen_limit.clone();
+                let title_str = format!("SEARCH: {}", q.to_uppercase());
                 std::thread::spawn(move || {
-                    let spec = if br.is_empty() {
-                        None
-                    } else {
-                        Some(br.as_str())
-                    };
-                    let res = fetch_ytm_tracks(spec, &q, true, clamped)
-                        .map(|t| (format!("SEARCH: {}", q), t));
-                    let _ = tx_w.send(WorkerMsg::PlaylistTracksLoaded(res));
+                    let spec = if br.is_empty() { None } else { Some(br) };
+                    stream_ytm_tracks(
+                        spec,
+                        title_str,
+                        q,
+                        true,
+                        clamped,
+                        new_gen,
+                        gen_arc,
+                        tx_w,
+                    );
                 });
             }
         }
@@ -1159,10 +2520,8 @@ pub fn build_music_ui() -> Box {
         let tx_pl = tx.clone();
         let pl_lbl = pl_header_lbl.clone();
         let v_stack = view_stack.clone();
-        let n_stack = nav_stack.clone();
         Rc::new(move || {
             v_stack.set_visible_child_name("music");
-            n_stack.set_visible_child_name("playlists");
             pl_lbl.set_label("LOADING PLAYLISTS...");
             let tx_w = tx_pl.clone();
             std::thread::spawn(move || {
@@ -1172,6 +2531,8 @@ pub fn build_music_ui() -> Box {
         })
     };
 
+    refresh_home_ui();
+    nav_stack.set_visible_child_name("home");
     load_playlists_action();
 
     let retry_pl = load_playlists_action.clone();
@@ -1181,24 +2542,52 @@ pub fn build_music_ui() -> Box {
     reload_pl_btn.connect_clicked(move |_| reload_pl());
 
     let nav_back = nav_stack.clone();
+    let search_back = search_entry.clone();
+    let filter_back = track_filter_query.clone();
+    let view_title_back = current_view_title.clone();
+    let home_btn_back = home_nav_btn.clone();
+    let pl_btn_back = playlists_nav_btn.clone();
+    let refresh_h_back = refresh_home_ui.clone();
     back_to_pl_btn.connect_clicked(move |_| {
-        nav_back.set_visible_child_name("playlists");
+        *filter_back.borrow_mut() = String::new();
+        search_back.set_text("");
+        if view_title_back.borrow().starts_with("SEARCH:") {
+            home_btn_back.add_css_class("active");
+            pl_btn_back.remove_css_class("active");
+            search_back.set_placeholder_text(Some("Search YouTube Music..."));
+            refresh_h_back();
+            nav_back.set_visible_child_name("home");
+        } else {
+            pl_btn_back.add_css_class("active");
+            home_btn_back.remove_css_class("active");
+            search_back.set_placeholder_text(Some("Filter your playlists..."));
+            nav_back.set_visible_child_name("playlists");
+        }
     });
 
+    // Shuffle Play button
     let tracks_for_shuffle = current_playlist_tracks.clone();
     let player_shuffle = player.clone();
+    let stats_shuffle = stats.clone();
     let br_shuffle = active_browser.clone();
+    let gen_shuffle = active_stream_gen.clone();
     let np_t_shuf = now_playing_lbl.clone();
     let np_a_shuf = now_artist_lbl.clone();
     let pp_shuf = play_pause_btn.clone();
     let refresh_q_shuf = refresh_queue_ui.clone();
     shuffle_btn.connect_clicked(move |_| {
-        let mut list = tracks_for_shuffle.borrow().clone();
+        let mut list: Vec<TrackItem> = tracks_for_shuffle
+            .borrow()
+            .iter()
+            .filter(|t| t.kind == MediaKind::Song)
+            .cloned()
+            .collect();
         if list.is_empty() {
             return;
         }
         shuffle_tracks(&mut list);
         let first = list[0].clone();
+        stats_shuffle.borrow_mut().record_song(first.clone());
         np_t_shuf.set_label(&first.title);
         np_a_shuf.set_label(&first.uploader);
         pp_shuf.set_label("Pause");
@@ -1210,44 +2599,18 @@ pub fn build_music_ui() -> Box {
             Some(br.as_str())
         };
 
+        let cur_gen = gen_shuffle.load(Ordering::Relaxed);
         {
             let mut p = player_shuffle.borrow_mut();
             p.queue = list;
             p.queue_idx = 0;
+            p.queue_source = QueueSource::PlaylistShuffled(cur_gen);
             p.play_track(first, spec);
         }
         refresh_q_shuf();
     });
 
-    let tx_search = tx.clone();
-    let br_search = active_browser.clone();
-    let nav_search = nav_stack.clone();
-    let title_search = active_pl_title_lbl.clone();
-    let limit_cell_search = search_limit.clone();
-    let last_q_search = last_search_query.clone();
-    search_entry.connect_activate(move |entry| {
-        let q = entry.text().trim().to_string();
-        if q.is_empty() {
-            return;
-        }
-        *last_q_search.borrow_mut() = q.clone();
-        let max_n = limit_cell_search.get();
-        nav_search.set_visible_child_name("tracks");
-        title_search.set_label(&format!("SEARCHING '{}' ({})...", q.to_uppercase(), max_n));
-        let tx_w = tx_search.clone();
-        let br = br_search.borrow().clone();
-        std::thread::spawn(move || {
-            let spec = if br.is_empty() {
-                None
-            } else {
-                Some(br.as_str())
-            };
-            let res =
-                fetch_ytm_tracks(spec, &q, true, max_n).map(|t| (format!("SEARCH: {}", q), t));
-            let _ = tx_w.send(WorkerMsg::PlaylistTracksLoaded(res));
-        });
-    });
-
+    // Bottom Player Controls
     let player_pp = player.clone();
     let pp_btn_clone = play_pause_btn.clone();
     play_pause_btn.connect_clicked(move |_| {
@@ -1299,7 +2662,7 @@ pub fn build_music_ui() -> Box {
         }
     });
 
-    // Main loop poller (Autoplay + Progress Bar + Worker Messages + MPRIS)
+    // Main loop poller
     let v_stack_poll = view_stack.clone();
     let n_stack_poll = nav_stack.clone();
     let pl_box_poll = playlists_box.clone();
@@ -1308,7 +2671,12 @@ pub fn build_music_ui() -> Box {
     let tr_lbl_poll = active_pl_title_lbl.clone();
     let err_detail_poll = err_detail_lbl.clone();
     let browser_poll = active_browser.clone();
+    let all_pl_poll = all_playlists.clone();
     let cur_tracks_poll = current_playlist_tracks.clone();
+    let pending_poll = pending_ui_tracks.clone();
+    let view_title_poll = current_view_title.clone();
+    let stream_done_poll = is_stream_finished.clone();
+    let gen_poll = active_stream_gen.clone();
     let player_poll = player.clone();
     let np_title_poll = now_playing_lbl.clone();
     let np_artist_poll = now_artist_lbl.clone();
@@ -1316,11 +2684,12 @@ pub fn build_music_ui() -> Box {
     let seek_poll = seek_scale.clone();
     let time_lbl_poll = time_lbl.clone();
     let last_seek_poll = last_user_seek.clone();
-    let tx_for_pl_click = tx.clone();
+    let open_pl_poll = open_playlist_or_album.clone();
+    let refresh_h_poll = refresh_home_ui.clone();
     let refresh_q_poll = refresh_queue_ui.clone();
 
-    glib::timeout_add_local(Duration::from_millis(200), move || {
-        // 1. Check autoplay if current song finished
+    glib::timeout_add_local(Duration::from_millis(150), move || {
+        // 1. Check autoplay
         {
             let br = browser_poll.borrow().clone();
             let spec = if br.is_empty() {
@@ -1338,9 +2707,10 @@ pub fn build_music_ui() -> Box {
             }
         }
 
-        // 2. Update Progress Slider & Timestamp (unless user dragged it in the last 500ms)
+        // 2. Update Progress Slider & Timestamp
         if last_seek_poll.get().elapsed() >= Duration::from_millis(500) {
-            if let Some((pos, dur)) = player_poll.borrow().query_progress() {
+            let prog = player_poll.borrow_mut().query_progress();
+            if let Some((pos, dur)) = prog {
                 seek_poll.set_range(0.0, dur.max(1.0));
                 seek_poll.set_value(pos);
                 time_lbl_poll.set_label(&format!("{} / {}", format_mm_ss(pos), format_mm_ss(dur)));
@@ -1352,46 +2722,53 @@ pub fn build_music_ui() -> Box {
             match msg {
                 WorkerMsg::PlaylistsLoaded(Ok((browser, playlists))) => {
                     *browser_poll.borrow_mut() = browser;
+                    *all_pl_poll.borrow_mut() = playlists.clone();
                     v_stack_poll.set_visible_child_name("music");
-                    n_stack_poll.set_visible_child_name("playlists");
                     pl_lbl_poll.set_label(&format!("YOUR PLAYLISTS ({})", playlists.len()));
 
-                    render_playlists_list(
-                        &pl_box_poll,
-                        playlists,
-                        &n_stack_poll,
-                        &tr_lbl_poll,
-                        &tr_box_poll,
-                        &browser_poll,
-                        &tx_for_pl_click,
-                    );
+                    render_playlists_list(&pl_box_poll, &playlists, "", &open_pl_poll);
+                    refresh_h_poll();
                 }
                 WorkerMsg::PlaylistsLoaded(Err(e)) => {
                     err_detail_poll.set_label(&e);
                     v_stack_poll.set_visible_child_name("error");
                 }
-                WorkerMsg::PlaylistTracksLoaded(Ok((pl_title, tracks))) => {
-                    let is_search_result = pl_title.starts_with("SEARCH:");
-                    v_stack_poll.set_visible_child_name("music");
-                    n_stack_poll.set_visible_child_name("tracks");
-                    tr_lbl_poll
-                        .set_label(&format!("{} ({})", pl_title.to_uppercase(), tracks.len()));
-                    *cur_tracks_poll.borrow_mut() = tracks.clone();
-
-                    render_track_list(
-                        &tr_box_poll,
-                        tracks,
-                        is_search_result,
-                        &player_poll,
-                        &browser_poll,
-                        &np_title_poll,
-                        &np_artist_poll,
-                        &pp_poll,
-                        &refresh_q_poll,
-                    );
+                WorkerMsg::TrackStreamStart { gen_id, title } => {
+                    if gen_id == gen_poll.load(Ordering::Relaxed) {
+                        while let Some(child) = tr_box_poll.first_child() {
+                            tr_box_poll.remove(&child);
+                        }
+                        cur_tracks_poll.borrow_mut().clear();
+                        pending_poll.borrow_mut().clear();
+                        *view_title_poll.borrow_mut() = title.clone();
+                        stream_done_poll.set(false);
+                        v_stack_poll.set_visible_child_name("music");
+                        n_stack_poll.set_visible_child_name("tracks");
+                        tr_lbl_poll.set_label(&format!("LOADING {}...", title));
+                    }
                 }
-                WorkerMsg::PlaylistTracksLoaded(Err(e)) => {
-                    tr_lbl_poll.set_label(&format!("ERROR: {}", e));
+                WorkerMsg::TrackStreamItem { gen_id, track } => {
+                    if gen_id == gen_poll.load(Ordering::Relaxed) {
+                        let is_search = view_title_poll.borrow().starts_with("SEARCH:");
+                        pending_poll
+                            .borrow_mut()
+                            .push_back((gen_id, track, is_search));
+                    }
+                }
+                WorkerMsg::TrackStreamDone { gen_id } => {
+                    if gen_id == gen_poll.load(Ordering::Relaxed) {
+                        stream_done_poll.set(true);
+                        if pending_poll.borrow().is_empty() {
+                            let count = cur_tracks_poll.borrow().len();
+                            let title = view_title_poll.borrow().clone();
+                            tr_lbl_poll.set_label(&format!("{} ({})", title, count));
+                        }
+                    }
+                }
+                WorkerMsg::TrackStreamError { gen_id, error } => {
+                    if gen_id == gen_poll.load(Ordering::Relaxed) {
+                        tr_lbl_poll.set_label(&format!("ERROR: {}", error));
+                    }
                 }
             }
         }
@@ -1427,6 +2804,19 @@ pub fn build_music_ui() -> Box {
                         refresh_q_poll();
                     }
                 }
+                MediaControlEvent::SetPosition(MediaPosition(pos)) => {
+                    player_poll.borrow().seek_to(pos.as_secs_f64());
+                }
+                MediaControlEvent::SeekBy(direction, delta) => {
+                    let prog = player_poll.borrow_mut().query_progress();
+                    if let Some((cur_pos, _)) = prog {
+                        let offset = match direction {
+                            souvlaki::SeekDirection::Forward => delta.as_secs_f64(),
+                            souvlaki::SeekDirection::Backward => -delta.as_secs_f64(),
+                        };
+                        player_poll.borrow().seek_to((cur_pos + offset).max(0.0));
+                    }
+                }
                 _ => {}
             }
         }
@@ -1437,34 +2827,180 @@ pub fn build_music_ui() -> Box {
     root
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_home_view(
+    container: &Box,
+    stats_rc: &Rc<RefCell<MusicStatsData>>,
+    all_playlists: &[PlaylistItem],
+    open_playlist_cb: &Rc<dyn Fn(PlaylistItem)>,
+    player: &Rc<RefCell<PlayerState>>,
+    browser_rc: &Rc<RefCell<String>>,
+    np_title: &Label,
+    np_artist: &Label,
+    pp_btn: &Button,
+    refresh_queue_ui: &Rc<dyn Fn()>,
+) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+
+    let (top_pls, top_songs) = {
+        let st = stats_rc.borrow();
+        (st.top_playlists(5), st.top_songs(12))
+    };
+
+    let pl_hdr = Label::builder()
+        .label("COMMONLY PLAYED PLAYLISTS")
+        .halign(Align::Start)
+        .width_chars(1)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .css_classes(vec!["fav-group-header".to_string()])
+        .build();
+    container.append(&pl_hdr);
+
+    // If no playlist play history yet, show the first 3 playlists from library
+    let pls_to_show: Vec<PlaylistItem> = if !top_pls.is_empty() {
+        top_pls.into_iter().map(|(_, p)| p).collect()
+    } else {
+        all_playlists.iter().take(3).cloned().collect()
+    };
+
+    if pls_to_show.is_empty() {
+        let loading_lbl = Label::builder()
+            .label("Loading your playlists...")
+            .halign(Align::Start)
+            .css_classes(vec!["fav-score-badge".to_string()])
+            .build();
+        container.append(&loading_lbl);
+    } else {
+        for pl in pls_to_show {
+            let card_class = if pl.is_album {
+                "music-item-album"
+            } else {
+                "music-item-playlist"
+            };
+
+            let btn = Button::builder()
+                .css_classes(vec![card_class.to_string()])
+                .hexpand(true)
+                .build();
+
+            let row = Box::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(8)
+                .build();
+
+            let art = build_album_art_widget(&pl.url, &pl.thumb_url);
+            row.append(&art);
+
+            let title_lbl = Label::builder()
+                .label(&pl.title)
+                .halign(Align::Start)
+                .hexpand(true)
+                .width_chars(1)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .build();
+
+            let arrow = Label::builder()
+                .label("->")
+                .css_classes(vec!["fav-score-badge".to_string()])
+                .build();
+
+            row.append(&title_lbl);
+            row.append(&arrow);
+            btn.set_child(Some(&row));
+
+            let cb = open_playlist_cb.clone();
+            let pl_clone = pl.clone();
+            btn.connect_clicked(move |_| {
+                cb(pl_clone.clone());
+            });
+
+            container.append(&btn);
+        }
+    }
+
+    let songs_hdr = Label::builder()
+        .label("COMMONLY PLAYED SONGS")
+        .halign(Align::Start)
+        .width_chars(1)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .margin_top(6)
+        .css_classes(vec!["fav-group-header".to_string()])
+        .build();
+    container.append(&songs_hdr);
+
+    if top_songs.is_empty() {
+        let empty_s = Label::builder()
+            .label("Play songs or search above\nto build your top tracks!")
+            .halign(Align::Start)
+            .css_classes(vec!["fav-score-badge".to_string()])
+            .build();
+        container.append(&empty_s);
+    } else {
+        let dummy_tracks: Rc<RefCell<Vec<TrackItem>>> = Rc::new(RefCell::new(
+            top_songs.iter().map(|(_, t)| t.clone()).collect(),
+        ));
+        for (idx, (_, track)) in top_songs.into_iter().enumerate() {
+            append_single_track_row(
+                container,
+                idx,
+                0,
+                track,
+                true,
+                &dummy_tracks,
+                player,
+                stats_rc,
+                browser_rc,
+                np_title,
+                np_artist,
+                pp_btn,
+                refresh_queue_ui,
+                open_playlist_cb,
+            );
+        }
+    }
+}
+
 fn render_playlists_list(
     container: &Box,
-    playlists: Vec<PlaylistItem>,
-    nav_stack: &Stack,
-    tr_header_lbl: &Label,
-    tr_box: &Box,
-    browser_rc: &Rc<RefCell<String>>,
-    tx: &mpsc::Sender<WorkerMsg>,
+    playlists: &[PlaylistItem],
+    filter_query: &str,
+    open_playlist_cb: &Rc<dyn Fn(PlaylistItem)>,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
 
     for pl in playlists {
+        if !filter_query.is_empty() && !pl.title.to_lowercase().contains(filter_query) {
+            continue;
+        }
+
+        let card_class = if pl.is_album {
+            "music-item-album"
+        } else {
+            "music-item-playlist"
+        };
+
         let btn = Button::builder()
-            .css_classes(vec!["fav-item-btn".to_string()])
+            .css_classes(vec![card_class.to_string()])
             .hexpand(true)
             .build();
 
         let row = Box::builder()
             .orientation(Orientation::Horizontal)
-            .spacing(6)
+            .spacing(8)
             .build();
+
+        let art = build_album_art_widget(&pl.url, &pl.thumb_url);
+        row.append(&art);
 
         let title_lbl = Label::builder()
             .label(&pl.title)
             .halign(Align::Start)
             .hexpand(true)
+            .width_chars(1)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
             .build();
 
@@ -1477,145 +3013,166 @@ fn render_playlists_list(
         row.append(&arrow);
         btn.set_child(Some(&row));
 
-        let nav_click = nav_stack.clone();
-        let hdr_click = tr_header_lbl.clone();
-        let tr_box_click = tr_box.clone();
-        let br_click = browser_rc.clone();
-        let tx_click = tx.clone();
-        let pl_title = pl.title.clone();
-        let pl_url = pl.url.clone();
-
+        let cb = open_playlist_cb.clone();
+        let pl_clone = pl.clone();
         btn.connect_clicked(move |_| {
-            while let Some(child) = tr_box_click.first_child() {
-                tr_box_click.remove(&child);
-            }
-            nav_click.set_visible_child_name("tracks");
-            hdr_click.set_label(&format!("LOADING {}...", pl_title.to_uppercase()));
-
-            let br = br_click.borrow().clone();
-            let tx_w = tx_click.clone();
-            let title_owned = pl_title.clone();
-            let url_owned = pl_url.clone();
-
-            std::thread::spawn(move || {
-                let spec = if br.is_empty() {
-                    None
-                } else {
-                    Some(br.as_str())
-                };
-                let res = fetch_ytm_tracks(spec, &url_owned, false, 25).map(|t| (title_owned, t));
-                let _ = tx_w.send(WorkerMsg::PlaylistTracksLoaded(res));
-            });
+            cb(pl_clone.clone());
         });
 
         container.append(&btn);
     }
 }
 
-fn render_track_list(
+#[allow(clippy::too_many_arguments)]
+fn append_single_track_row(
     container: &Box,
-    tracks: Vec<TrackItem>,
+    idx: usize,
+    stream_gen: u64,
+    track: TrackItem,
     is_search_result: bool,
+    current_playlist_tracks: &Rc<RefCell<Vec<TrackItem>>>,
     player: &Rc<RefCell<PlayerState>>,
+    stats_rc: &Rc<RefCell<MusicStatsData>>,
     browser_rc: &Rc<RefCell<String>>,
     np_title: &Label,
     np_artist: &Label,
     pp_btn: &Button,
     refresh_queue_ui: &Rc<dyn Fn()>,
+    open_playlist_cb: &Rc<dyn Fn(PlaylistItem)>,
 ) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
+    let row_box = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .build();
 
-    for (idx, track) in tracks.iter().enumerate() {
-        let row_box = Box::builder()
-            .orientation(Orientation::Horizontal)
-            .build();
+    // Color-code by MediaKind: Pink = Song, Blue = Album, Orange = Playlist!
+    let card_class = match track.kind {
+        MediaKind::Song => "fav-item-btn",
+        MediaKind::Album => "music-item-album",
+        MediaKind::Playlist => "music-item-playlist",
+    };
 
-        let btn = Button::builder()
-            .css_classes(vec!["fav-item-btn".to_string()])
-            .hexpand(true)
-            .tooltip_text("Left-click to play | Right-click for Play Next / Add to Queue")
-            .build();
+    let btn = Button::builder()
+        .css_classes(vec![card_class.to_string()])
+        .hexpand(true)
+        .tooltip_text(match track.kind {
+            MediaKind::Song => "Left-click to play | Right-click for Play Next / Add to Queue",
+            MediaKind::Album => "Left-click to open Album",
+            MediaKind::Playlist => "Left-click to open Playlist",
+        })
+        .build();
 
-        let col = Box::builder()
-            .orientation(Orientation::Vertical)
-            .spacing(2)
-            .build();
+    let outer_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .build();
 
-        let top_row = Box::builder()
-            .orientation(Orientation::Horizontal)
-            .spacing(6)
-            .build();
+    let thumb = if !track.thumb_url.is_empty() {
+        track.thumb_url.clone()
+    } else if track.id.len() == 11 {
+        format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", track.id)
+    } else {
+        String::new()
+    };
+    let art = build_album_art_widget(&track.id, &thumb);
+    outer_row.append(&art);
 
-        let title_lbl = Label::builder()
-            .label(&track.title)
-            .halign(Align::Start)
-            .hexpand(true)
-            .ellipsize(gtk4::pango::EllipsizeMode::End)
-            .build();
+    let col = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(2)
+        .hexpand(true)
+        .build();
 
-        let dur_lbl = Label::builder()
-            .label(&track.duration_str)
-            .css_classes(vec!["fav-score-badge".to_string()])
-            .halign(Align::End)
-            .build();
+    let top_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
 
-        top_row.append(&title_lbl);
-        top_row.append(&dur_lbl);
+    let title_lbl = Label::builder()
+        .label(&track.title)
+        .halign(Align::Start)
+        .hexpand(true)
+        .width_chars(1)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .build();
 
-        let artist_lbl = Label::builder()
-            .label(&track.uploader)
-            .halign(Align::Start)
-            .ellipsize(gtk4::pango::EllipsizeMode::End)
-            .css_classes(vec!["fav-score-badge".to_string()])
-            .build();
+    let dur_lbl = Label::builder()
+        .label(&track.duration_str)
+        .css_classes(vec!["fav-score-badge".to_string()])
+        .halign(Align::End)
+        .build();
 
-        col.append(&top_row);
-        col.append(&artist_lbl);
-        btn.set_child(Some(&col));
+    top_row.append(&title_lbl);
+    top_row.append(&dur_lbl);
 
-        let track_clone = track.clone();
-        let all_tracks = tracks.clone();
-        let player_click = player.clone();
-        let br_click = browser_rc.clone();
-        let title_ui = np_title.clone();
-        let artist_ui = np_artist.clone();
-        let pp_ui = pp_btn.clone();
-        let refresh_q_click = refresh_queue_ui.clone();
+    let artist_lbl = Label::builder()
+        .label(&track.uploader)
+        .halign(Align::Start)
+        .width_chars(1)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .css_classes(vec!["fav-score-badge".to_string()])
+        .build();
 
-        btn.connect_clicked(move |_| {
-            title_ui.set_label(&track_clone.title);
-            artist_ui.set_label(&track_clone.uploader);
-            pp_ui.set_label("Pause");
+    col.append(&top_row);
+    col.append(&artist_lbl);
+    outer_row.append(&col);
+    btn.set_child(Some(&outer_row));
 
-            let br = br_click.borrow().clone();
-            let spec = if br.is_empty() {
-                None
-            } else {
-                Some(br.as_str())
-            };
+    let track_clone = track.clone();
+    let tracks_rc_click = current_playlist_tracks.clone();
+    let player_click = player.clone();
+    let stats_click = stats_rc.clone();
+    let br_click = browser_rc.clone();
+    let title_ui = np_title.clone();
+    let artist_ui = np_artist.clone();
+    let pp_ui = pp_btn.clone();
+    let refresh_q_click = refresh_queue_ui.clone();
+    let open_pl_click = open_playlist_cb.clone();
 
-            {
-                let mut p = player_click.borrow_mut();
-                if is_search_result {
-                    if p.queue.is_empty() {
-                        p.queue = vec![track_clone.clone()];
-                        p.queue_idx = 0;
-                    } else {
-                        let insert_pos = (p.queue_idx + 1).min(p.queue.len());
-                        p.queue.insert(insert_pos, track_clone.clone());
-                        p.queue_idx = insert_pos;
-                    }
+    btn.connect_clicked(move |_| {
+        if track_clone.kind != MediaKind::Song && !track_clone.list_url.is_empty() {
+            open_pl_click(PlaylistItem {
+                title: track_clone.title.clone(),
+                url: track_clone.list_url.clone(),
+                thumb_url: track_clone.thumb_url.clone(),
+                is_album: track_clone.kind == MediaKind::Album,
+            });
+            return;
+        }
+
+        stats_click.borrow_mut().record_song(track_clone.clone());
+        title_ui.set_label(&track_clone.title);
+        artist_ui.set_label(&track_clone.uploader);
+        pp_ui.set_label("Pause");
+
+        let br = br_click.borrow().clone();
+        let spec = if br.is_empty() {
+            None
+        } else {
+            Some(br.as_str())
+        };
+
+        {
+            let mut p = player_click.borrow_mut();
+            if is_search_result {
+                if p.queue.is_empty() {
+                    p.queue = vec![track_clone.clone()];
+                    p.queue_idx = 0;
                 } else {
-                    p.queue = all_tracks.clone();
-                    p.queue_idx = idx;
+                    let insert_pos = (p.queue_idx + 1).min(p.queue.len());
+                    p.queue.insert(insert_pos, track_clone.clone());
+                    p.queue_idx = insert_pos;
                 }
-                p.play_track(track_clone.clone(), spec);
+            } else {
+                p.queue = tracks_rc_click.borrow().clone();
+                p.queue_idx = idx.min(p.queue.len().saturating_sub(1));
+                p.queue_source = QueueSource::PlaylistSequential(stream_gen);
             }
-            refresh_q_click();
-        });
+            p.play_track(track_clone.clone(), spec);
+        }
+        refresh_q_click();
+    });
 
+    if track.kind == MediaKind::Song {
         let popover = Popover::builder()
             .css_classes(vec!["fav-popover".to_string()])
             .autohide(true)
@@ -1721,12 +3278,13 @@ fn render_track_list(
                 dur_reset.set_label(&orig);
             });
         });
-
-        row_box.append(&btn);
-        container.append(&row_box);
     }
+
+    row_box.append(&btn);
+    container.append(&row_box);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_queue_view(
     container: &Box,
     queue_btn: &Button,
@@ -1736,7 +3294,11 @@ fn render_queue_view(
     np_artist: &Label,
     pp_btn: &Button,
     refresh_self: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    requested_start: usize,
 ) {
+    const ROW_HEIGHT_PX: i32 = 56;
+    const WINDOW_SIZE: usize = 35;
+
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
@@ -1746,7 +3308,8 @@ fn render_queue_view(
         (p.queue.clone(), p.queue_idx)
     };
 
-    queue_btn.set_label(&format!("Queue ({})", queue_items.len()));
+    let total = queue_items.len();
+    queue_btn.set_label(&format!("Queue ({})", total));
 
     if queue_items.is_empty() {
         let empty = Label::builder()
@@ -1759,9 +3322,24 @@ fn render_queue_view(
         return;
     }
 
-    for (idx, track) in queue_items.into_iter().enumerate() {
-        let is_current = idx == current_idx;
+    let max_start = total.saturating_sub(WINDOW_SIZE);
+    let start_show = requested_start.min(max_start);
+    let end_show = (start_show + WINDOW_SIZE).min(total);
 
+    if start_show > 0 {
+        let top_spacer = Box::builder()
+            .height_request((start_show as i32) * ROW_HEIGHT_PX)
+            .build();
+        container.append(&top_spacer);
+    }
+
+    for (idx, track) in queue_items
+        .into_iter()
+        .enumerate()
+        .skip(start_show)
+        .take(end_show - start_show)
+    {
+        let is_current = idx == current_idx;
         let row = Box::builder()
             .orientation(Orientation::Horizontal)
             .spacing(4)
@@ -1777,9 +3355,25 @@ fn render_queue_view(
             .hexpand(true)
             .build();
 
+        let outer_row = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(8)
+            .build();
+
+        let thumb = if !track.thumb_url.is_empty() {
+            track.thumb_url.clone()
+        } else if track.id.len() == 11 {
+            format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", track.id)
+        } else {
+            String::new()
+        };
+        let art = build_album_art_widget(&track.id, &thumb);
+        outer_row.append(&art);
+
         let col = Box::builder()
             .orientation(Orientation::Vertical)
             .spacing(2)
+            .hexpand(true)
             .build();
 
         let top_row = Box::builder()
@@ -1792,6 +3386,7 @@ fn render_queue_view(
             .label(&format!("{}{}", prefix, track.title))
             .halign(Align::Start)
             .hexpand(true)
+            .width_chars(1)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
             .build();
 
@@ -1806,13 +3401,15 @@ fn render_queue_view(
         let artist_lbl = Label::builder()
             .label(&track.uploader)
             .halign(Align::Start)
+            .width_chars(1)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
             .css_classes(vec!["fav-score-badge".to_string()])
             .build();
 
         col.append(&top_row);
         col.append(&artist_lbl);
-        btn.set_child(Some(&col));
+        outer_row.append(&col);
+        btn.set_child(Some(&outer_row));
 
         let player_jump = player.clone();
         let br_jump = browser_rc.clone();
@@ -1868,5 +3465,13 @@ fn render_queue_view(
         row.append(&btn);
         row.append(&del_btn);
         container.append(&row);
+    }
+
+    let remaining_below = total.saturating_sub(end_show);
+    if remaining_below > 0 {
+        let bottom_spacer = Box::builder()
+            .height_request((remaining_below as i32) * ROW_HEIGHT_PX)
+            .build();
+        container.append(&bottom_spacer);
     }
 }

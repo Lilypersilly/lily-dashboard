@@ -388,6 +388,43 @@ fn load_css() {
             min-height: 12px;
             margin: -4px 0px;
         }
+        /* --- PASTEL COLOR-CODED MUSIC WIDGETS --- */
+        /* Songs = Pastel Pink (.fav-item-btn) */
+
+        /* Albums = Pastel Blue */
+        .music-item-album {
+            background-color: #d0e8ff;
+            border: 1px solid #75b8e9;
+            border-radius: 10px;
+            padding: 6px 10px;
+            transition: background-color 0.15s ease;
+        }
+
+        .music-item-album:hover {
+            background-color: #add6ff;
+        }
+
+        /* Playlists = Pastel Orange / Peach */
+        .music-item-playlist {
+            background-color: #ffe0c2;
+            border: 1px solid #e9a275;
+            border-radius: 10px;
+            padding: 6px 10px;
+            transition: background-color 0.15s ease;
+        }
+
+        .music-item-playlist:hover {
+            background-color: #ffcaa0;
+        }
+
+        /* Fixed 36x36 Album Art Frame */
+        .music-art-frame {
+            background-color: #f8d4ff;
+            border: 1px solid #e975ca;
+            border-radius: 6px;
+            min-width: 36px;
+            min-height: 36px;
+        }
         ",
     );
 
