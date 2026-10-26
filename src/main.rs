@@ -4,6 +4,7 @@ mod passwords;
 mod music;
 mod plans;
 mod session;
+mod drive;
 
 use gtk4::cairo::{RectangleInt, Region};
 use gtk4::prelude::*;
@@ -388,6 +389,18 @@ fn load_css() {
             min-height: 12px;
             margin: -4px 0px;
         }
+
+        progressbar.drive-progress > trough {
+            background-color: #ffc2ff;
+            border: 1px solid #e975ca;
+            border-radius: 6px;
+            min-height: 14px;
+        }
+
+        progressbar.drive-progress > trough > progress {
+            background-color: #bf40a1;
+            border-radius: 5px;
+        }
         /* --- PASTEL COLOR-CODED MUSIC WIDGETS --- */
         /* Songs = Pastel Pink (.fav-item-btn) */
 
@@ -645,6 +658,9 @@ fn build_ui(app: &Application) -> Button {
 
     let passwords_ui = passwords::build_passwords_ui(popover_guard.clone());
     stack.add_titled(&passwords_ui, Some("passwords"), "Passwords");
+
+    let drive_ui = drive::build_drive_ui();
+    stack.add_titled(&drive_ui, Some("drive"), "Drive");
 
     let detail_tab = plans_ui.detail_view.clone();
     let win_tab = window.clone();

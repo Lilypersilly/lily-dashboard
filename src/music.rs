@@ -226,34 +226,37 @@ fn hash_key(s: &str) -> String {
     format!("{:016x}", hash)
 }
 
-/// Loads an image file, crops off YouTube's 16:9 left/right pillarbox bars to keep
-/// only the 1:1 center square of album art, and scales it to an exact 36x36 Texture!
-fn set_cropped_square_art(img: &Image, path: &std::path::Path) {
-    use gtk4::gdk;
+thread_local! {
+    static TEXTURE_RAM_CACHE: RefCell<HashMap<String, gtk4::gdk::Texture>> = RefCell::new(HashMap::new());
+}
+
+/// Decodes, center-crops, and scales the JPEG to 36x36 on a background thread,
+/// returning `(glib::Bytes, has_alpha, rowstride)` which ARE `Send + Sync`!
+fn decode_and_crop_bytes(path: &std::path::Path) -> Option<(glib::Bytes, bool, usize)> {
     use gtk4::gdk_pixbuf::{InterpType, Pixbuf};
 
-    let Ok(pixbuf) = Pixbuf::from_file(path) else {
-        return;
-    };
+    let pixbuf = Pixbuf::from_file(path).ok()?;
     let w = pixbuf.width();
     let h = pixbuf.height();
     if w <= 0 || h <= 0 {
-        return;
+        return None;
     }
 
-    // Crop out the dead-center 1:1 square (removes YouTube's left/right dark bars!)
     let side = w.min(h);
     let offset_x = (w - side) / 2;
     let offset_y = (h - side) / 2;
 
     let square = pixbuf.new_subpixbuf(offset_x, offset_y, side, side);
-    if let Some(scaled) = square.scale_simple(36, 36, InterpType::Bilinear) {
-        let texture = gdk::Texture::for_pixbuf(&scaled);
-        img.set_paintable(Some(&texture));
-    }
+    let scaled = square.scale_simple(36, 36, InterpType::Bilinear)?;
+    let bytes = scaled.read_pixel_bytes();
+    let has_alpha = scaled.has_alpha();
+    let rowstride = scaled.rowstride() as usize;
+
+    Some((bytes, has_alpha, rowstride))
 }
 
-/// Builds a strictly uniform 36x36 square Album Art widget in `/tmp` RAM disk!
+/// Builds a strictly uniform 36x36 square Album Art widget.
+/// Text and scrolling are prioritized 100%; images decode & crop in the background!
 fn build_album_art_widget(key: &str, thumb_url: &str) -> Box {
     let frame = Box::builder()
         .css_classes(vec!["music-art-frame".to_string()])
@@ -275,47 +278,66 @@ fn build_album_art_widget(key: &str, thumb_url: &str) -> Box {
         .build();
     frame.append(&img);
 
-    let _ = std::fs::create_dir_all(THUMB_RAM_DIR);
-    let cache_file = std::path::PathBuf::from(THUMB_RAM_DIR)
-        .join(format!("{}.jpg", hash_key(&format!("{}|{}", key, thumb_url))));
+    let cache_hash = hash_key(&format!("{}|{}", key, thumb_url));
 
-    if cache_file.exists() {
-        set_cropped_square_art(&img, &cache_file);
+    // 1. Instant RAM Texture hit (0.00ms, zero disk or CPU decoding!)
+    let cached_tex = TEXTURE_RAM_CACHE.with(|cache| cache.borrow().get(&cache_hash).cloned());
+    if let Some(tex) = cached_tex {
+        img.set_paintable(Some(&tex));
         return frame;
     }
 
+    // 2. Otherwise, download (if needed) + decode + crop to raw 36x36 bytes on a background thread!
+    let _ = std::fs::create_dir_all(THUMB_RAM_DIR);
+    let cache_file = std::path::PathBuf::from(THUMB_RAM_DIR).join(format!("{}.jpg", cache_hash));
     let url_owned = thumb_url.to_string();
-    let path_owned = cache_file.clone();
-    let (tx, rx) = mpsc::channel::<bool>();
+    let (tx, rx) = mpsc::channel::<Option<(glib::Bytes, bool, usize)>>();
 
     std::thread::spawn(move || {
-        let status = Command::new("curl")
-            .args([
-                "-sL",
-                "--max-time",
-                "5",
-                "-o",
-                &path_owned.to_string_lossy(),
-                &url_owned,
-            ])
-            .status();
-        let ok = status.map(|s| s.success()).unwrap_or(false) && path_owned.exists();
-        let _ = tx.send(ok);
+        if !cache_file.exists() {
+            let _ = Command::new("curl")
+                .args([
+                    "-sL",
+                    "--max-time",
+                    "5",
+                    "-o",
+                    &cache_file.to_string_lossy(),
+                    &url_owned,
+                ])
+                .status();
+        }
+        let cropped = if cache_file.exists() {
+            decode_and_crop_bytes(&cache_file)
+        } else {
+            None
+        };
+        let _ = tx.send(cropped);
     });
 
     let img_weak = img.downgrade();
     let mut ticks = 0u8;
-    glib::timeout_add_local(Duration::from_millis(80), move || {
+    glib::timeout_add_local(Duration::from_millis(45), move || {
         ticks += 1;
-        if let Ok(ok) = rx.try_recv() {
-            if ok {
+        if let Ok(res_opt) = rx.try_recv() {
+            if let Some((bytes, has_alpha, rowstride)) = res_opt {
+                let fmt = if has_alpha {
+                    gtk4::gdk::MemoryFormat::R8g8b8a8
+                } else {
+                    gtk4::gdk::MemoryFormat::R8g8b8
+                };
+                let mem_tex = gtk4::gdk::MemoryTexture::new(36, 36, fmt, &bytes, rowstride);
+                let texture: gtk4::gdk::Texture = mem_tex.upcast();
+
+                TEXTURE_RAM_CACHE.with(|cache| {
+                    cache.borrow_mut().insert(cache_hash.clone(), texture.clone());
+                });
                 if let Some(i) = img_weak.upgrade() {
-                    set_cropped_square_art(&i, &cache_file);
+                    i.set_paintable(Some(&texture));
                 }
             }
             return glib::ControlFlow::Break;
         }
-        if ticks > 70 {
+        if ticks > 120 {
             return glib::ControlFlow::Break;
         }
         glib::ControlFlow::Continue
@@ -2066,10 +2088,10 @@ pub fn build_music_ui() -> Box {
         })
     };
 
-    // --- 0.01s (10ms) CASCADING SONG LOADER + SLIDING-WINDOW VIRTUALIZATION ---
+    // --- 0.01s (10ms) CASCADING SONG LOADER + CATCH-UP SLIDING-WINDOW VIRTUALIZATION ---
     let render_virtual_window: Rc<dyn Fn(usize)>;
     {
-        const ROW_HEIGHT_PX: i32 = 56;
+        const ROW_HEIGHT_PX: i32 = 60;
         const WINDOW_SIZE: usize = 35;
 
         let pending_pop = pending_ui_tracks.clone();
@@ -2094,22 +2116,21 @@ pub fn build_music_ui() -> Box {
         let win_end = Rc::new(Cell::new(0usize));
         let last_gen_seen = Rc::new(Cell::new(0u64));
 
+        // Queue of `(orig_idx, TrackItem)` waiting to cascade down from the top of the sliding window!
+        let scroll_cascade_queue: Rc<RefCell<VecDeque<(usize, TrackItem)>>> =
+            Rc::new(RefCell::new(VecDeque::new()));
+        let bottom_spacer_ref: Rc<RefCell<Option<Box>>> = Rc::new(RefCell::new(None));
+        let total_filtered_count = Rc::new(Cell::new(0usize));
+
         render_virtual_window = {
             let tr_box_v = track_list_box.clone();
             let cur_tracks_v = current_playlist_tracks.clone();
             let filter_v = track_filter_query.clone();
-            let view_title_v = current_view_title.clone();
-            let gen_v = active_stream_gen.clone();
-            let player_v = player.clone();
-            let stats_v = stats.clone();
-            let br_v = active_browser.clone();
-            let np_t_v = now_playing_lbl.clone();
-            let np_a_v = now_artist_lbl.clone();
-            let pp_v = play_pause_btn.clone();
-            let refresh_q_v = refresh_queue_ui.clone();
-            let open_pl_v = open_playlist_or_album.clone();
             let ws_v = win_start.clone();
             let we_v = win_end.clone();
+            let cascade_q_v = scroll_cascade_queue.clone();
+            let b_spacer_v = bottom_spacer_ref.clone();
+            let total_cnt_v = total_filtered_count.clone();
 
             Rc::new(move |requested_start: usize| {
                 let all_snapshot = cur_tracks_v.borrow();
@@ -2127,11 +2148,15 @@ pub fn build_music_ui() -> Box {
                     .collect();
 
                 let total = filtered.len();
+                total_cnt_v.set(total);
+                cascade_q_v.borrow_mut().clear();
+
                 while let Some(child) = tr_box_v.first_child() {
                     tr_box_v.remove(&child);
                 }
 
                 if total == 0 {
+                    *b_spacer_v.borrow_mut() = None;
                     return;
                 }
 
@@ -2140,8 +2165,9 @@ pub fn build_music_ui() -> Box {
                 let end = (start + WINDOW_SIZE).min(total);
 
                 ws_v.set(start);
-                we_v.set(end);
+                we_v.set(start); // Will tick up from `start` to `end` as cards cascade in!
 
+                // 1. Top Spacer sits above `start`
                 if start > 0 {
                     let top_spacer = Box::builder()
                         .height_request((start as i32) * ROW_HEIGHT_PX)
@@ -2149,34 +2175,18 @@ pub fn build_music_ui() -> Box {
                     tr_box_v.append(&top_spacer);
                 }
 
-                let is_search = view_title_v.borrow().starts_with("SEARCH:");
-                let cur_gen = gen_v.load(Ordering::Relaxed);
+                // 2. Bottom Spacer initially holds the full height from `start` to `total`
+                // and shrinks by 56px each time a card cascades in above it!
+                let bottom_spacer = Box::builder()
+                    .height_request(((total - start) as i32) * ROW_HEIGHT_PX)
+                    .build();
+                tr_box_v.append(&bottom_spacer);
+                *b_spacer_v.borrow_mut() = Some(bottom_spacer);
 
-                for (orig_idx, track) in filtered.into_iter().skip(start).take(end - start) {
-                    append_single_track_row(
-                        &tr_box_v,
-                        orig_idx,
-                        cur_gen,
-                        track,
-                        is_search,
-                        &cur_tracks_v,
-                        &player_v,
-                        &stats_v,
-                        &br_v,
-                        &np_t_v,
-                        &np_a_v,
-                        &pp_v,
-                        &refresh_q_v,
-                        &open_pl_v,
-                    );
-                }
-
-                let remaining_below = total.saturating_sub(end);
-                if remaining_below > 0 {
-                    let bottom_spacer = Box::builder()
-                        .height_request((remaining_below as i32) * ROW_HEIGHT_PX)
-                        .build();
-                    tr_box_v.append(&bottom_spacer);
+                // 3. Queue the 35 items in `[start..end)` to cascade down from the top of the window!
+                let mut q = cascade_q_v.borrow_mut();
+                for item in filtered.into_iter().skip(start).take(end - start) {
+                    q.push_back(item);
                 }
             })
         };
@@ -2184,9 +2194,54 @@ pub fn build_music_ui() -> Box {
         let ws_timer = win_start.clone();
         let we_timer = win_end.clone();
         let last_gen_timer = last_gen_seen.clone();
-        let render_win_timer = render_virtual_window.clone();
+        let cascade_q_timer = scroll_cascade_queue.clone();
+        let b_spacer_timer = bottom_spacer_ref.clone();
+        let total_cnt_timer = total_filtered_count.clone();
 
         glib::timeout_add_local(Duration::from_millis(10), move || {
+            // A. First, pop 1 item from `scroll_cascade_queue` if the user scrolled to a new window!
+            // This creates the cute cascading "catch-up" effect from the top of the sliding window!
+            let next_scroll_card = cascade_q_timer.borrow_mut().pop_front();
+            if let Some((orig_idx, track)) = next_scroll_card {
+                let is_search = view_title_pop.borrow().starts_with("SEARCH:");
+                let cur_gen = gen_pop.load(Ordering::Relaxed);
+
+                // Remove the bottom spacer temporarily, append the card, then re-append the shrunk bottom spacer!
+                if let Some(ref spacer) = *b_spacer_timer.borrow() {
+                    tr_box_pop.remove(spacer);
+                }
+
+                append_single_track_row(
+                    &tr_box_pop,
+                    orig_idx,
+                    cur_gen,
+                    track,
+                    is_search,
+                    &cur_tracks_pop,
+                    &player_pop,
+                    &stats_pop,
+                    &br_pop,
+                    &np_t_pop,
+                    &np_a_pop,
+                    &pp_pop,
+                    &refresh_q_pop,
+                    &open_pl_pop,
+                );
+
+                let new_end = we_timer.get() + 1;
+                we_timer.set(new_end);
+
+                let total = total_cnt_timer.get();
+                let remaining_below = total.saturating_sub(new_end);
+                if remaining_below > 0 {
+                    if let Some(ref spacer) = *b_spacer_timer.borrow() {
+                        spacer.set_height_request((remaining_below as i32) * ROW_HEIGHT_PX);
+                        tr_box_pop.append(spacer);
+                    }
+                }
+            }
+
+            // B. Process incoming background stream tracks
             let mut batch_loop = 0;
             let mut added_beyond_window = false;
 
@@ -2205,6 +2260,8 @@ pub fn build_music_ui() -> Box {
                     last_gen_timer.set(current_gen);
                     ws_timer.set(0);
                     we_timer.set(0);
+                    cascade_q_timer.borrow_mut().clear();
+                    *b_spacer_timer.borrow_mut() = None;
                 }
 
                 let idx = {
@@ -2271,26 +2328,50 @@ pub fn build_music_ui() -> Box {
             }
 
             if added_beyond_window && pending_pop.borrow().is_empty() {
-                render_win_timer(ws_timer.get());
+                let total = cur_tracks_pop.borrow().len();
+                total_cnt_timer.set(total);
+                let remaining = total.saturating_sub(we_timer.get());
+                if remaining > 0 && b_spacer_timer.borrow().is_none() {
+                    let spacer = Box::builder()
+                        .height_request((remaining as i32) * ROW_HEIGHT_PX)
+                        .build();
+                    tr_box_pop.append(&spacer);
+                    *b_spacer_timer.borrow_mut() = Some(spacer);
+                }
             }
 
             glib::ControlFlow::Continue
         });
 
+        // Debounced Scroll Handler:
+        // Lets you flick/scroll as fast as you want with 0 lag, and 60ms after your scroll
+        // moves into a new region, triggers the top-down cascading catch-up!
         let vadj = tr_scroll.vadjustment();
         let ws_scroll = win_start.clone();
         let render_win_scroll = render_virtual_window.clone();
+        let scroll_seq = Rc::new(Cell::new(0u32));
 
         vadj.connect_value_changed(move |adj| {
             let scroll_y = adj.value().max(0.0) as usize;
             let approx_first_visible = scroll_y / (ROW_HEIGHT_PX as usize);
-            let desired_start = approx_first_visible.saturating_sub(8);
+            let desired_start = approx_first_visible.saturating_sub(6);
             let current_start = ws_scroll.get();
 
-            if desired_start.abs_diff(current_start) >= 6
+            if desired_start.abs_diff(current_start) >= 8
                 || (desired_start == 0 && current_start != 0)
             {
-                render_win_scroll(desired_start);
+                let seq = scroll_seq.get().wrapping_add(1);
+                scroll_seq.set(seq);
+                let seq_check = scroll_seq.clone();
+                let render_cb = render_win_scroll.clone();
+
+                // Wait 55ms so fast scroll-wheel flicks never get interrupted mid-spin,
+                // then cascade the cards down from the top of the new window to catch up!
+                glib::timeout_add_local_once(Duration::from_millis(55), move || {
+                    if seq_check.get() == seq {
+                        render_cb(desired_start);
+                    }
+                });
             }
         });
     }

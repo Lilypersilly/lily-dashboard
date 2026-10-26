@@ -372,6 +372,7 @@ fn populate_app_list(
                     .args(["dispatch", &lua_dispatch])
                     .spawn();
             });
+            ws_row.append(&ws_btn);
         }
 
         menu_box.append(&pin_btn);
