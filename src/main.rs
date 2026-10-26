@@ -56,19 +56,16 @@ fn load_css() {
         window {
             background-color: transparent;
         }
-        
-        .drawer-container {
-            transform: translateX(-402px);
-            transition: transform 0.35s cubic-bezier(0.25, 0.8, 0.25, 1);
-        }
 
         .drawer-container {
-            transform: translateX(-406px);
+            transform: translateX(-415px);
             transition: transform 0.35s cubic-bezier(0.25, 0.8, 0.25, 1);
+            opacity: 0.8;
         }
 
         .drawer-container.open {
             transform: translateX(0px);
+            opacity: 0.8;
         }
 
         .dash-box {
@@ -79,31 +76,141 @@ fn load_css() {
             border-bottom-right-radius: 16px;
             min-width: 398px;
         }
-
-        .drawer-container.open .dash-box {
-            opacity: 1;
-        }
         
         .sidebar-column {
-            background-color: #f8d4ff;
-            border-right: 2px solid #ef96d9;
+            background-color: #fbe6ff; /* Slightly lighter for the sidebar */
+            border-right: 1px solid #e975ca; /* Thinner separator line */
         }
 
+        /* --- SIDEBAR NAVIGATION --- */
         stacksidebar {
             background-color: transparent;
-            border-right: none;
+        }
+        
+        stacksidebar list {
+            background-color: transparent;
+        }
+
+        stacksidebar row {
+            padding: 8px 10px;
+            border-radius: 12px;
+            margin: 2px 4px;
+            transition: background-color 0.2s ease, color 0.2s ease;
+        }
+
+        stacksidebar row:hover {
+            background-color: rgba(233, 117, 202, 0.15);
+        }
+
+        stacksidebar row:checked, stacksidebar row.selected {
+            background-color: rgba(0, 0, 0, 0.06); /* Soft translucent overlay like the mockup! */
+        }
+
+        stacksidebar label {
+            color: #6a5e6a; /* Muted text when unselected */
+            font-family: 'Josefin Sans', sans-serif;
+            font-size: 16px;
+            font-weight: bold;
+        }
+
+        stacksidebar row:checked label, stacksidebar row.selected label {
+            color: #333933; /* Dark text when active */
+        }
+
+        /* --- FLAT LIST ITEMS (SONGS, PASSWORDS, PLANS, ETC) --- */
+        .fav-item-btn, .music-item-album, .music-item-playlist {
+            background-color: transparent;
+            border: none;
+            border-radius: 12px;
+            padding: 6px 8px;
+            transition: background-color 0.15s ease;
+            box-shadow: none;
+        }
+
+        .fav-item-btn:hover, .music-item-album:hover, .music-item-playlist:hover {
+            background-color: rgba(233, 117, 202, 0.15);
+        }
+
+        /* Active / Playing / Pinned Item (Solid Pink Background!) */
+        .fav-item-btn.pinned, .music-item-album.pinned, .music-item-playlist.pinned {
+            background-color: #ffa8e4;
+            border: none;
+        }
+
+        /* Fixed 36x36 Album Art Frame with Subtle Shadow */
+        .music-art-frame {
+            background-color: transparent;
+            border: none;
+            border-radius: 8px;
+            min-width: 36px;
+            min-height: 36px;
+            box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.15); /* Makes the art pop off the flat background */
+        }
+
+        /* --- SEARCH BARS & INPUTS --- */
+        .fav-search {
+            background-color: rgba(255, 255, 255, 0.5);
+            border: 1px solid #e975ca;
+            border-radius: 12px;
+            color: #333933;
+            font-family: 'Josefin Sans', sans-serif;
+            padding: 6px 12px;
+        }
+
+        .fav-search:focus {
+            background-color: rgba(255, 255, 255, 0.8);
+        }
+
+        /* --- TYPOGRAPHY & BADGES --- */
+        .fav-group-header {
+            color: #bf40a1;
+            font-weight: bold;
+            font-size: 13px;
+            font-family: 'MesloLGL Nerd Font', monospace;
+            margin-left: 4px;
+            letter-spacing: 1px;
+        }
+
+        .fav-score-badge {
+            color: #d437a3; /* Vibrant magenta for Artist/Duration text! */
+            font-family: 'MesloLGL Nerd Font', monospace;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        /* --- STANDARD BUTTONS --- */
+        .plan-fmt-btn, .plan-close-btn {
+            background-color: #ffc2ff;
+            border: 1px solid #e975ca;
+            border-radius: 8px;
+            padding: 4px 10px;
+            color: #333933;
+            font-family: 'Josefin Sans', sans-serif;
+            font-weight: bold;
+            transition: all 0.15s ease;
+        }
+
+        .plan-fmt-btn:hover, .plan-close-btn:hover {
+            background-color: #ef96d9;
+        }
+
+        .plan-fmt-btn.active, .plan-close-btn.active {
+            background-color: #bf40a1;
+            border-color: #bf40a1;
+            color: #fee4ff;
         }
 
         .session-restore-btn {
-            background-color: #ffc2ff;
+            background-color: transparent;
             border: 1px solid #e975ca;
             border-radius: 10px;
             padding: 8px 6px;
             margin: 4px 8px;
+            transition: background-color 0.15s ease;
         }
 
         .session-restore-btn:hover {
-            background-color: #ef96d9;
+            background-color: rgba(233, 117, 202, 0.15);
         }
 
         .session-restore-lbl {
@@ -111,7 +218,7 @@ fn load_css() {
             font-size: 12px;
             font-weight: bold;
         }
-        
+
         label {
             color: #333933;
             font-family: 'Josefin Sans', sans-serif;
@@ -144,45 +251,6 @@ fn load_css() {
             transform: translateX(0px);
         }
 
-        .fav-search {
-            background-color: #f8d4ff;
-            border: 2px solid #e975ca;
-            border-radius: 12px;
-            color: #333933;
-            font-family: 'Josefin Sans', sans-serif;
-            padding: 4px 8px;
-        }
-
-        .fav-group-header {
-            color: #bf40a1;
-            font-weight: bold;
-            font-size: 13px;
-            font-family: 'MesloLGL Nerd Font', monospace;
-            margin-left: 4px;
-        }
-
-        .fav-item-btn {
-            background-color: #ffc2ff;
-            border: 1px solid #e975ca;
-            border-radius: 10px;
-            padding: 6px 10px;
-            transition: background-color 0.15s ease;
-        }
-
-        .fav-item-btn.pinned {
-            border: 2px solid #bf40a1;
-        }
-
-        .fav-item-btn:hover {
-            background-color: #ef96d9;
-        }
-
-        .fav-score-badge {
-            color: #bf40a1;
-            font-family: 'MesloLGL Nerd Font', monospace;
-            font-size: 12px;
-        }
-
         popover.fav-popover > contents {
             background-color: #fee4ff;
             border: 2px solid #e975ca;
@@ -211,19 +279,6 @@ fn load_css() {
         .plan-divider {
             background-color: #ef96d9;
             border-radius: 1px;
-        }
-
-        .plan-close-btn {
-            background-color: #ffc2ff;
-            border: 1px solid #e975ca;
-            border-radius: 8px;
-            padding: 4px 10px;
-            color: #bf40a1;
-            font-weight: bold;
-        }
-
-        .plan-close-btn:hover {
-            background-color: #ef96d9;
         }
 
         .plan-h1 {
@@ -285,27 +340,6 @@ fn load_css() {
             background-color: #f8d4ff;
             border-top: 2px solid #ef96d9;
             padding: 10px 14px;
-        }
-
-        .plan-fmt-btn {
-            background-color: #ffc2ff;
-            border: 1px solid #e975ca;
-            border-radius: 8px;
-            padding: 3px 8px;
-            color: #333933;
-            font-family: 'MesloLGL Nerd Font', monospace;
-            font-size: 12px;
-        }
-
-        .plan-fmt-btn:hover {
-            background-color: #ef96d9;
-        }
-
-        .plan-fmt-btn.active {
-            background-color: #bf40a1;
-            border-color: #bf40a1;
-            color: #fee4ff;
-            font-weight: bold;
         }
 
         .plan-delete-menu-btn {
@@ -401,43 +435,6 @@ fn load_css() {
             background-color: #bf40a1;
             border-radius: 5px;
         }
-        /* --- PASTEL COLOR-CODED MUSIC WIDGETS --- */
-        /* Songs = Pastel Pink (.fav-item-btn) */
-
-        /* Albums = Pastel Blue */
-        .music-item-album {
-            background-color: #d0e8ff;
-            border: 1px solid #75b8e9;
-            border-radius: 10px;
-            padding: 6px 10px;
-            transition: background-color 0.15s ease;
-        }
-
-        .music-item-album:hover {
-            background-color: #add6ff;
-        }
-
-        /* Playlists = Pastel Orange / Peach */
-        .music-item-playlist {
-            background-color: #ffe0c2;
-            border: 1px solid #e9a275;
-            border-radius: 10px;
-            padding: 6px 10px;
-            transition: background-color 0.15s ease;
-        }
-
-        .music-item-playlist:hover {
-            background-color: #ffcaa0;
-        }
-
-        /* Fixed 36x36 Album Art Frame */
-        .music-art-frame {
-            background-color: #f8d4ff;
-            border: 1px solid #e975ca;
-            border-radius: 6px;
-            min-width: 36px;
-            min-height: 36px;
-        }
         ",
     );
 
@@ -520,8 +517,19 @@ fn build_ui(app: &Application) -> Button {
     let sidebar_column = Box::builder()
         .orientation(Orientation::Vertical)
         .css_classes(vec!["sidebar-column".to_string()])
-        .width_request(110)
         .vexpand(true)
+        .build();
+
+    let sidebar_clamp = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Never)
+        .min_content_width(110)
+        .max_content_width(110)
+        .width_request(110) // <-- ABSOLUTE HARD LIMIT
+        .has_frame(false)   // <-- REMOVES HIDDEN GTK BORDERS
+        .hexpand(false)
+        .vexpand(true)
+        .child(&sidebar_column)
         .build();
 
     let sidebar = StackSidebar::new();
@@ -684,12 +692,14 @@ fn build_ui(app: &Application) -> Button {
         .vscrollbar_policy(gtk4::PolicyType::Never)
         .min_content_width(288)
         .max_content_width(288)
+        .width_request(288) // <-- ABSOLUTE HARD LIMIT
+        .has_frame(false)   // <-- REMOVES HIDDEN GTK BORDERS
         .hexpand(false)
         .vexpand(true)
         .child(&stack)
         .build();
 
-    dash_box.append(&sidebar_column);
+    dash_box.append(&sidebar_clamp);
     dash_box.append(&stack_clamp);
     dash_box.append(&plans_ui.detail_view);
 

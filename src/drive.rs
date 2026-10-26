@@ -1,10 +1,10 @@
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box, Button, Entry, FileDialog, Label, Orientation, PolicyType, ProgressBar,
-    ScrolledWindow,
+    Align, Box, Button, Entry, FileChooserAction, FileChooserNative, Label, Orientation,
+    PolicyType, ProgressBar, ResponseType, ScrolledWindow,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 enum UploadMsg {
-    Progress { percent: f64, text: String },
+    // Changed percent to Option<f64> so it matches lines that don't have a percentage!
+    Progress { percent: Option<f64>, text: String },
     Done(bool),
     Error(String),
 }
@@ -107,6 +108,7 @@ pub fn build_drive_ui() -> Box {
         .label("Selected: None")
         .halign(Align::Start)
         .wrap(true)
+        .width_chars(1) // <-- ADD THIS
         .wrap_mode(gtk4::pango::WrapMode::WordChar)
         .css_classes(vec!["fav-score-badge".to_string()])
         .build();
@@ -121,6 +123,8 @@ pub fn build_drive_ui() -> Box {
     let status_lbl = Label::builder()
         .label("Ready.")
         .halign(Align::Center)
+        .width_chars(1) // <-- ADD THIS
+        .ellipsize(gtk4::pango::EllipsizeMode::End) // <-- ADD THIS
         .css_classes(vec!["plan-body".to_string()])
         .build();
 
@@ -135,40 +139,54 @@ pub fn build_drive_ui() -> Box {
 
     // --- LOGIC WIRING ---
 
-    // Select File
+    // Select File using bulletproof FileChooserNative
     let path_clone_f = selected_path_rc.clone();
     let lbl_clone_f = selected_lbl.clone();
     pick_file_btn.connect_clicked(move |_| {
-        let dialog = FileDialog::new();
+        let dialog = FileChooserNative::builder()
+            .title("Select File")
+            .action(FileChooserAction::Open)
+            .build();
+            
         let path_cb = path_clone_f.clone();
         let lbl_cb = lbl_clone_f.clone();
-        dialog.open(None::<&gtk4::Window>, None::<&gio::Cancellable>, move |res| {
-            if let Ok(file) = res {
-                if let Some(p) = file.path() {
-                    let s = p.to_string_lossy().to_string();
-                    *path_cb.borrow_mut() = s.clone();
-                    lbl_cb.set_label(&format!("Selected File:\n{}", s));
+        dialog.connect_response(move |d, res| {
+            if res == ResponseType::Accept {
+                if let Some(file) = d.file() {
+                    if let Some(p) = file.path() {
+                        let s = p.to_string_lossy().to_string();
+                        *path_cb.borrow_mut() = s.clone();
+                        lbl_cb.set_label(&format!("Selected File:\n{}", s));
+                    }
                 }
             }
         });
+        dialog.show();
     });
 
-    // Select Folder
+    // Select Folder using bulletproof FileChooserNative
     let path_clone_d = selected_path_rc.clone();
     let lbl_clone_d = selected_lbl.clone();
     pick_folder_btn.connect_clicked(move |_| {
-        let dialog = FileDialog::new();
+        let dialog = FileChooserNative::builder()
+            .title("Select Folder")
+            .action(FileChooserAction::SelectFolder)
+            .build();
+            
         let path_cb = path_clone_d.clone();
         let lbl_cb = lbl_clone_d.clone();
-        dialog.select_folder(None::<&gtk4::Window>, None::<&gio::Cancellable>, move |res| {
-            if let Ok(file) = res {
-                if let Some(p) = file.path() {
-                    let s = p.to_string_lossy().to_string();
-                    *path_cb.borrow_mut() = s.clone();
-                    lbl_cb.set_label(&format!("Selected Folder:\n{}", s));
+        dialog.connect_response(move |d, res| {
+            if res == ResponseType::Accept {
+                if let Some(file) = d.file() {
+                    if let Some(p) = file.path() {
+                        let s = p.to_string_lossy().to_string();
+                        *path_cb.borrow_mut() = s.clone();
+                        lbl_cb.set_label(&format!("Selected Folder:\n{}", s));
+                    }
                 }
             }
         });
+        dialog.show();
     });
 
     // Upload & Cancel Action
@@ -242,9 +260,12 @@ pub fn build_drive_ui() -> Box {
                 "copy",
                 &local_path,
                 &dest_path,
+                "-v",
                 "--stats",
                 "1s",
                 "--stats-one-line",
+                "--log-format", // <-- Drops the ugly date/INFO prefix natively!
+                "",
             ]);
 
             if !bwlimit.is_empty() {
@@ -264,7 +285,6 @@ pub fn build_drive_ui() -> Box {
                     let reader = BufReader::new(stderr);
                     for line in reader.lines().map_while(Result::ok) {
                         let mut percent = None;
-                        // Rclone stat line example: "25 MiB / 100 MiB, 25%, 1 MiB/s, ETA 1m"
                         for part in line.split(',') {
                             let p = part.trim();
                             if p.ends_with('%') {
@@ -279,7 +299,6 @@ pub fn build_drive_ui() -> Box {
                         });
                     }
 
-                    // Check if it was cancelled vs naturally finished
                     let is_alive = { child_bg.lock().unwrap().is_some() };
                     if is_alive {
                         if let Ok(mut lock) = child_bg.lock() {
@@ -297,7 +316,6 @@ pub fn build_drive_ui() -> Box {
         });
     });
 
-    // Main loop poller for progress updates
     let pb_poll = progress_bar.clone();
     let status_poll = status_lbl.clone();
     let btn_poll = action_btn.clone();

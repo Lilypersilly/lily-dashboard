@@ -366,7 +366,7 @@ impl PlayerState {
         };
         let mpris = MediaControls::new(config).ok();
 
-        Self {
+        let mut state = Self {
             mpv_child: None,
             is_paused: false,
             current_track: None,
@@ -375,9 +375,13 @@ impl PlayerState {
             queue_idx: 0,
             queue_source: QueueSource::Manual,
             mpris,
-        }
+        };
+        // Pre-warm the persistent idle mpv daemon right on startup!
+        state.ensure_mpv_daemon(None);
+        state
     }
 
+    /// Ensures a single persistent `mpv --idle=yes` daemon is running in the background
     fn ensure_mpv_daemon(&mut self, cookie_arg: Option<&str>) {
         let alive = if let Some(ref mut child) = self.mpv_child {
             matches!(child.try_wait(), Ok(None))
@@ -419,6 +423,8 @@ impl PlayerState {
     fn play_track(&mut self, track: TrackItem, cookie_arg: Option<&str>) {
         self.ensure_mpv_daemon(cookie_arg);
 
+        // If we already pre-resolved the direct Google Video audio stream URL, pass it
+        // straight to mpv so it starts playing in <0.05s without running yt-dlp!
         let target_url = get_cached_stream_url(&track.id)
             .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={}", track.id));
 
@@ -436,6 +442,7 @@ impl PlayerState {
 
         let unpause_cmd = b"{\"command\": [\"set_property\", \"pause\", false]}\n";
 
+        // Send `loadfile` over IPC socket (retry briefly if mpv daemon just started up)
         let mut sent = false;
         for _ in 0..30 {
             if let Ok(mut stream) = UnixStream::connect(MPV_SOCKET) {
@@ -478,6 +485,7 @@ impl PlayerState {
             }
         }
 
+        // Immediately pre-fetch the direct stream URLs for the NEXT 3 songs in the queue!
         self.trigger_prefetch(cookie_arg);
     }
 
@@ -559,6 +567,7 @@ impl PlayerState {
         }
         let insert_pos = (self.queue_idx + 1).min(self.queue.len());
         self.queue.insert(insert_pos, track);
+        // Pre-fetch the newly inserted "Play Next" song right away!
         self.trigger_prefetch(cookie_arg);
         None
     }
@@ -593,6 +602,8 @@ impl PlayerState {
         }
     }
 
+    /// Since `mpv --idle=yes` stays running between tracks, we check `idle-active`
+    /// (after a 3-second grace period from starting a track) to know when the track finished!
     fn check_autoplay_next(&mut self, cookie_arg: Option<&str>) -> Option<TrackItem> {
         self.current_track.as_ref()?;
         if self.started_at.elapsed() < Duration::from_secs(3) {
@@ -3125,15 +3136,28 @@ fn append_single_track_row(
         .orientation(Orientation::Horizontal)
         .build();
 
-    // Color-code by MediaKind: Pink = Song, Blue = Album, Orange = Playlist!
+    // Color-code by MediaKind, but keep it transparent by default
     let card_class = match track.kind {
         MediaKind::Song => "fav-item-btn",
         MediaKind::Album => "music-item-album",
         MediaKind::Playlist => "music-item-playlist",
     };
 
+    let mut btn_classes = vec![card_class.to_string()];
+
+    // If this specific song is currently playing, highlight it with the solid pink background!
+    let is_playing = if let Some(ref cur) = player.borrow().current_track {
+        cur.id == track.id
+    } else {
+        false
+    };
+    
+    if is_playing {
+        btn_classes.push("pinned".to_string());
+    }
+
     let btn = Button::builder()
-        .css_classes(vec![card_class.to_string()])
+        .css_classes(btn_classes)
         .hexpand(true)
         .tooltip_text(match track.kind {
             MediaKind::Song => "Left-click to play | Right-click for Play Next / Add to Queue",
