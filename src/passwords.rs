@@ -99,17 +99,79 @@ fn delete_entry(target_line_idx: usize) {
     }
 }
 
-/// Generates a random 18-character password using Linux `/dev/urandom`
-fn generate_random_password(len: usize) -> String {
+/// Pulls cryptographically secure local bytes and modulates them using a 
+/// Quantum-Seeded Random API. Falls back to pure local entropy if offline.
+fn generate_quantum_password(len: usize) -> (String, bool) {
     const CHARSET: &[u8] =
         b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*-_";
-    let mut buf = vec![0u8; len];
-    if let Ok(mut f) = fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
+    
+    // 1. Base Entropy: Generate local cryptographically secure bytes
+    let mut random_bytes = vec![0u8; len * 2];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = std::io::Read::read_exact(&mut f, &mut random_bytes);
     }
-    buf.into_iter()
-        .map(|b| CHARSET[(b as usize) % CHARSET.len()] as char)
-        .collect()
+
+    // 2. Quantum Modulation: Fetch a 9-digit quantum number from Lizaonair API
+    let mut quantum_success = false;
+    let url = "https://lizaonair.com/qrng/?min=100000000&max=999999999";
+    
+    if let Ok(output) = std::process::Command::new("curl")
+        .args([
+            "-sL", 
+            "-H", "Accept: application/json", 
+            "--max-time", "2", 
+            url
+        ])
+        .output() 
+    {
+        if output.status.success() {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                // Ensure "value" is an actual number (not null!)
+                if let Some(num) = json.get("value").and_then(|v| v.as_u64()) {
+                    let quantum_entropy = num.to_string().into_bytes();
+                    
+                    if !quantum_entropy.is_empty() {
+                        for (i, byte) in random_bytes.iter_mut().enumerate() {
+                            let q_byte = quantum_entropy[i % quantum_entropy.len()];
+                            *byte ^= q_byte;
+                        }
+                        quantum_success = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Convert modulated bytes to characters using Rejection Sampling
+    let mut password = String::new();
+    let max_valid = 256 - (256 % CHARSET.len()); 
+
+    for byte in random_bytes {
+        let b = byte as usize;
+        if b < max_valid {
+            password.push(CHARSET[b % CHARSET.len()] as char);
+            if password.len() == len {
+                break;
+            }
+        }
+    }
+
+    // 4. In the extraordinarily rare case that rejection sampling discarded too many bytes
+    while password.len() < len {
+        let mut fallback = [0u8; 1];
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let _ = std::io::Read::read_exact(&mut f, &mut fallback);
+            let b = fallback[0] as usize;
+            if b < max_valid {
+                password.push(CHARSET[b % CHARSET.len()] as char);
+            }
+        } else {
+            // Absolute failsafe so it never infinite loops if the OS is deeply broken
+            password.push(CHARSET[password.len() % CHARSET.len()] as char);
+        }
+    }
+
+    (password, quantum_success)
 }
 
 fn copy_to_clipboard(text: &str) {
@@ -201,9 +263,51 @@ pub fn build_passwords_ui(popover_guard: Rc<Cell<usize>>) -> Box {
         .build();
 
     let pass_for_gen = pass_entry.clone();
-    gen_btn.connect_clicked(move |_| {
-        let generated = generate_random_password(18);
-        pass_for_gen.set_text(&generated);
+    gen_btn.connect_clicked(move |btn| {
+        btn.set_sensitive(false);
+        btn.set_label("...");
+
+        let (tx, rx) = std::sync::mpsc::channel::<(String, bool)>();
+        let btn_clone = btn.clone();
+        let pass_entry_clone = pass_for_gen.clone();
+
+        std::thread::spawn(move || {
+            let result = generate_quantum_password(18);
+            let _ = tx.send(result);
+        });
+
+        glib::timeout_add_local(Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok((pwd, is_quantum)) => {
+                    pass_entry_clone.set_text(&pwd);
+                    btn_clone.set_sensitive(true);
+                    
+                    if is_quantum {
+                        // Success! Flash "Quantum!" so you know it used the API
+                        btn_clone.set_label("Quantum!");
+                        let btn_reset = btn_clone.clone();
+                        glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+                            btn_reset.set_label("Gen");
+                        });
+                    } else {
+                        // Offline/Error! Flash "Failed" so you know it used the fallback
+                        btn_clone.set_label("Failed");
+                        let btn_reset = btn_clone.clone();
+                        glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+                            btn_reset.set_label("Gen");
+                        });
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Prevents infinite "..." loading if the background thread ever drops!
+                    btn_clone.set_sensitive(true);
+                    btn_clone.set_label("Error");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
     });
 
     pass_row.append(&pass_entry);
