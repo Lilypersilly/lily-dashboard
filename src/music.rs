@@ -157,6 +157,11 @@ enum WorkerMsg {
 static STREAM_URL_CACHE: std::sync::OnceLock<Mutex<HashMap<String, (String, Instant)>>> =
     std::sync::OnceLock::new();
 
+static ACTIVE_DOWNLOADS: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+
+static URL_TO_PIXEL_HASH: std::sync::OnceLock<Mutex<HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
 fn get_stream_cache() -> &'static Mutex<HashMap<String, (String, Instant)>> {
     STREAM_URL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -226,6 +231,15 @@ fn hash_key(s: &str) -> String {
     format!("{:016x}", hash)
 }
 
+fn hash_key_bytes(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", hash)
+}
+
 thread_local! {
     static TEXTURE_RAM_CACHE: RefCell<HashMap<String, gtk4::gdk::Texture>> = RefCell::new(HashMap::new());
 }
@@ -256,8 +270,8 @@ fn decode_and_crop_bytes(path: &std::path::Path) -> Option<(glib::Bytes, bool, u
 }
 
 /// Builds a strictly uniform 36x36 square Album Art widget.
-/// Text and scrolling are prioritized 100%; images decode & crop in the background!
-fn build_album_art_widget(key: &str, thumb_url: &str) -> Box {
+/// Text and scrolling are prioritized 100%; images decode, crop, and deduplicate by PIXELS in the background!
+fn build_album_art_widget(_key: &str, thumb_url: &str) -> Box {
     let frame = Box::builder()
         .css_classes(vec!["music-art-frame".to_string()])
         .width_request(36)
@@ -267,7 +281,7 @@ fn build_album_art_widget(key: &str, thumb_url: &str) -> Box {
         .overflow(Overflow::Hidden)
         .build();
 
-    if key.is_empty() || thumb_url.is_empty() {
+    if thumb_url.is_empty() {
         return frame;
     }
 
@@ -278,40 +292,111 @@ fn build_album_art_widget(key: &str, thumb_url: &str) -> Box {
         .build();
     frame.append(&img);
 
-    let cache_hash = hash_key(&format!("{}|{}", key, thumb_url));
+    let url_owned = thumb_url.to_string();
 
-    // 1. Instant RAM Texture hit (0.00ms, zero disk or CPU decoding!)
-    let cached_tex = TEXTURE_RAM_CACHE.with(|cache| cache.borrow().get(&cache_hash).cloned());
-    if let Some(tex) = cached_tex {
-        img.set_paintable(Some(&tex));
-        return frame;
+    // 1. Check if we already mapped this URL to a known pixel hash!
+    let known_pixel_hash = {
+        let map = URL_TO_PIXEL_HASH.get_or_init(|| Mutex::new(HashMap::new()));
+        map.lock().unwrap().get(&url_owned).cloned()
+    };
+
+    if let Some(ref ph) = known_pixel_hash {
+        // Instant RAM Texture hit (0.00ms, zero disk or CPU decoding!)
+        let cached_tex = TEXTURE_RAM_CACHE.with(|cache| cache.borrow().get(ph).cloned());
+        if let Some(tex) = cached_tex {
+            img.set_paintable(Some(&tex));
+            return frame;
+        }
     }
 
-    // 2. Otherwise, download (if needed) + decode + crop to raw 36x36 bytes on a background thread!
+    // 2. Otherwise, download + decode + crop to raw 36x36 bytes on a background thread!
     let _ = std::fs::create_dir_all(THUMB_RAM_DIR);
-    let cache_file = std::path::PathBuf::from(THUMB_RAM_DIR).join(format!("{}.jpg", cache_hash));
-    let url_owned = thumb_url.to_string();
-    let (tx, rx) = mpsc::channel::<Option<(glib::Bytes, bool, usize)>>();
+    let cache_hash = hash_key(&url_owned);
+    let (tx, rx) = mpsc::channel::<Option<(glib::Bytes, bool, usize, String)>>();
 
     std::thread::spawn(move || {
-        if !cache_file.exists() {
-            let _ = Command::new("curl")
-                .args([
-                    "-sL",
-                    "--max-time",
-                    "5",
-                    "-o",
-                    &cache_file.to_string_lossy(),
-                    &url_owned,
-                ])
-                .status();
+        let mut needs_download = false;
+        let tmp_path = format!("{}/{}.tmp", THUMB_RAM_DIR, cache_hash);
+
+        let active_map = ACTIVE_DOWNLOADS.get_or_init(|| Mutex::new(HashSet::new()));
+        if let Ok(mut lock) = active_map.lock() {
+            if lock.insert(url_owned.clone()) {
+                needs_download = true;
+            }
         }
-        let cropped = if cache_file.exists() {
-            decode_and_crop_bytes(&cache_file)
+
+        if needs_download {
+            let status = Command::new("curl")
+                .args(["-sL", "--max-time", "5", "-o", &tmp_path, &url_owned])
+                .status();
+
+            if let Ok(mut lock) = active_map.lock() {
+                lock.remove(&url_owned);
+            }
+            if !status.map(|s| s.success()).unwrap_or(false) {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
         } else {
-            None
-        };
-        let _ = tx.send(cropped);
+            // Another thread is downloading this URL. Wait up to 5 seconds for it to finish!
+            let mut attempts = 0;
+            while attempts < 50 {
+                std::thread::sleep(Duration::from_millis(100));
+                let map = URL_TO_PIXEL_HASH.get_or_init(|| Mutex::new(HashMap::new()));
+                if map.lock().unwrap().contains_key(&url_owned) {
+                    break;
+                }
+                attempts += 1;
+            }
+        }
+
+        // Did another thread successfully map this URL while we waited?
+        let mut final_ph = None;
+        if let Some(ph) = URL_TO_PIXEL_HASH
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .get(&url_owned)
+        {
+            final_ph = Some(ph.clone());
+        }
+
+        let mut cropped_result = None;
+
+        if let Some(ph) = final_ph {
+            // Yes! Just read the final deduplicated file from disk.
+            let final_file = std::path::PathBuf::from(THUMB_RAM_DIR).join(format!("{}.jpg", ph));
+            if let Some((bytes, has_alpha, rowstride)) = decode_and_crop_bytes(&final_file) {
+                cropped_result = Some((bytes, has_alpha, rowstride, ph));
+            }
+        } else if std::path::Path::new(&tmp_path).exists() {
+            // No, we are the downloading thread. Decode it and hash the pixels!
+            if let Some((bytes, has_alpha, rowstride)) =
+                decode_and_crop_bytes(std::path::Path::new(&tmp_path))
+            {
+                let pixel_hash = hash_key_bytes(&bytes);
+                let final_file =
+                    std::path::PathBuf::from(THUMB_RAM_DIR).join(format!("{}.jpg", pixel_hash));
+
+                // If the exact same image pixels already exist from a DIFFERENT URL, delete the temp file!
+                if !final_file.exists() {
+                    let _ = std::fs::rename(&tmp_path, &final_file);
+                } else {
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
+
+                URL_TO_PIXEL_HASH
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap()
+                    .insert(url_owned, pixel_hash.clone());
+
+                cropped_result = Some((bytes, has_alpha, rowstride, pixel_hash));
+            } else {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+        }
+
+        let _ = tx.send(cropped_result);
     });
 
     let img_weak = img.downgrade();
@@ -319,7 +404,7 @@ fn build_album_art_widget(key: &str, thumb_url: &str) -> Box {
     glib::timeout_add_local(Duration::from_millis(45), move || {
         ticks += 1;
         if let Ok(res_opt) = rx.try_recv() {
-            if let Some((bytes, has_alpha, rowstride)) = res_opt {
+            if let Some((bytes, has_alpha, rowstride, pixel_hash)) = res_opt {
                 let fmt = if has_alpha {
                     gtk4::gdk::MemoryFormat::R8g8b8a8
                 } else {
@@ -329,7 +414,7 @@ fn build_album_art_widget(key: &str, thumb_url: &str) -> Box {
                 let texture: gtk4::gdk::Texture = mem_tex.upcast();
 
                 TEXTURE_RAM_CACHE.with(|cache| {
-                    cache.borrow_mut().insert(cache_hash.clone(), texture.clone());
+                    cache.borrow_mut().insert(pixel_hash, texture.clone());
                 });
                 if let Some(i) = img_weak.upgrade() {
                     i.set_paintable(Some(&texture));
@@ -792,15 +877,25 @@ fn get_browser_candidates() -> Vec<String> {
 }
 
 fn extract_thumb_from_json(val: &serde_json::Value, id: &str) -> String {
-    // 1. For standard 11-char YouTube Video/Song IDs, ALWAYS use the guaranteed 320x180 JPEG!
-    // (Avoids broken .webp urls in yt-dlp search results!)
+    // 1. Prefer Google's shared album art CDNs (which are identical for EVERY track in an album!)
+    // This completely deduplicates downloads to disk!
+    if let Some(arr) = val.get("thumbnails").and_then(|v| v.as_array()) {
+        for item in arr.iter().rev() {
+            if let Some(u) = item.get("url").and_then(|v| v.as_str()) {
+                if u.contains("lh3.googleusercontent.com") || u.contains("ggpht.com") {
+                    return u.split('?').next().unwrap_or(u).to_string();
+                }
+            }
+        }
+    }
+
+    // 2. For standard 11-char YouTube Video IDs, use the guaranteed 320x180 JPEG
     if id.len() == 11 && !id.starts_with("PL") && !id.starts_with("OL") {
         return format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", id);
     }
 
-    // 2. For Playlists/Albums, grab the playlist cover thumbnail from `thumbnails`
+    // 3. Fallbacks for standard Playlists
     if let Some(arr) = val.get("thumbnails").and_then(|v| v.as_array()) {
-        // Iterate in reverse to get the actual playlist cover rather than channel avatar
         for item in arr.iter().rev() {
             if let Some(u) = item.get("url").and_then(|v| v.as_str()) {
                 if u.starts_with("http") && !u.contains("yt3.ggpht.com") {
