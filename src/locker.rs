@@ -780,11 +780,13 @@ pub fn build_locker_ui(popover_guard: Rc<Cell<usize>>) -> Box {
         .build();
 
     let vault_hdr_lbl = Label::builder()
-        .label("QUANTUM VAULT")
-        .halign(Align::Start)
-        .hexpand(true)
-        .css_classes(vec!["fav-group-header".to_string()])
-        .build();
+     .label("VAULT")
+     .halign(Align::Start)
+     .hexpand(true)
+     .width_chars(1)
+     .ellipsize(gtk4::pango::EllipsizeMode::End)
+     .css_classes(vec!["fav-group-header".to_string()])
+     .build();
 
     let vacuum_btn = Button::builder()
         .label("Vacuum")
@@ -952,10 +954,15 @@ pub fn build_locker_ui(popover_guard: Rc<Cell<usize>>) -> Box {
             ));
 
             if dead_bytes > 0 {
-                vac_btn_r.set_label(&format!("Vacuum ({})", format_bytes(dead_bytes)));
+             vac_btn_r.add_css_class("active");
+             vac_btn_r.set_tooltip_text(Some(&format!(
+                 "Reclaim {} of dead space",
+                 format_bytes(dead_bytes)
+             )));
             } else {
-                vac_btn_r.set_label("Vacuum");
-            }
+             vac_btn_r.remove_css_class("active");
+             vac_btn_r.set_tooltip_text(Some("No dead space to vacuum"));
+             }
 
             let q = query_r.borrow().clone();
             let mut shown = 0;

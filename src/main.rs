@@ -718,7 +718,7 @@ fn build_ui(app: &Application) -> Button {
     });
 
     let stack_clamp = gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::External) // <-- NEVER stretches parent!
+        .hscrollbar_policy(gtk4::PolicyType::Never) // <-- NEVER stretches parent!
         .vscrollbar_policy(gtk4::PolicyType::Never)
         .propagate_natural_width(false)                // <-- Locks width strictly!
         .min_content_width(288)
