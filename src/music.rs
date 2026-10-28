@@ -639,6 +639,17 @@ impl PlayerState {
         }
     }
 
+    fn set_volume(&self, volume: f64) {
+        if let Ok(mut stream) = UnixStream::connect(MPV_SOCKET) {
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(30)));
+            let cmd = format!(
+                "{{\"command\": [\"set_property\", \"volume\", {:.0}]}}\n",
+                volume.clamp(0.0, 100.0)
+            );
+            let _ = stream.write_all(cmd.as_bytes());
+        }
+    }
+
     fn play_next_in_queue(
         &mut self,
         track: TrackItem,
@@ -1883,6 +1894,32 @@ pub fn build_music_ui() -> Box {
         .css_classes(vec!["plan-fmt-btn".to_string()])
         .hexpand(true)
         .build();
+    let vol_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .build();
+
+    let vol_lbl = Label::builder()
+        .label("Vol")
+        .css_classes(vec!["fav-score-badge".to_string()])
+        .build();
+
+    let vol_scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+    vol_scale.set_value(100.0);
+    vol_scale.set_draw_value(false);
+    vol_scale.set_hexpand(true);
+    vol_scale.set_css_classes(&["music-seek"]);
+
+    let vol_pct_lbl = Label::builder()
+        .label("100%")
+        .width_chars(4)
+        .halign(Align::End)
+        .css_classes(vec!["fav-score-badge".to_string()])
+        .build();
+
+    vol_row.append(&vol_lbl);
+    vol_row.append(&vol_scale);
+    vol_row.append(&vol_pct_lbl);
 
     controls_row.append(&prev_btn);
     controls_row.append(&play_pause_btn);
@@ -1892,6 +1929,7 @@ pub fn build_music_ui() -> Box {
     player_dock.append(&meta_row);
     player_dock.append(&seek_scale);
     player_dock.append(&controls_row);
+    player_dock.append(&vol_row);
 
     music_page.append(&top_nav_row);
     music_page.append(&search_entry);
@@ -2031,6 +2069,13 @@ pub fn build_music_ui() -> Box {
     let player_seek = player.clone();
     let last_seek_stamp = last_user_seek.clone();
     let time_lbl_seek = time_lbl.clone();
+    let player_vol = player.clone();
+    let vol_pct_clone = vol_pct_lbl.clone();
+    vol_scale.connect_value_changed(move |scale| {
+        let val = scale.value().clamp(0.0, 100.0);
+        vol_pct_clone.set_label(&format!("{:.0}%", val));
+        player_vol.borrow().set_volume(val);
+    });
     seek_scale.connect_change_value(move |scale, _, new_val| {
         let max_dur = scale.adjustment().upper();
         let target = new_val.clamp(0.0, max_dur);

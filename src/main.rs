@@ -5,6 +5,7 @@ mod music;
 mod plans;
 mod session;
 mod drive;
+mod locker;
 
 use gtk4::cairo::{RectangleInt, Region};
 use gtk4::prelude::*;
@@ -508,6 +509,32 @@ fn build_ui(app: &Application) -> Button {
         .overflow(Overflow::Hidden)
         .build();
 
+    // Dynamically adjust closed translateX offset whenever dash_box changes width!
+    let dynamic_offset_provider = CssProvider::new();
+    gtk4::style_context_add_provider_for_display(
+        &gdk::Display::default().expect("Could not connect to a display."),
+        &dynamic_offset_provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_USER,
+    );
+
+    let last_dash_width = Rc::new(Cell::new(400));
+    let dash_watch = dash_box.clone();
+    let last_w_watch = last_dash_width.clone();
+    dash_box.add_tick_callback(move |box_widget, _| {
+        let w = box_widget.width();
+        if w > 0 && w != last_w_watch.get() {
+            last_w_watch.set(w);
+            let push_back = w + 10; // Always push 15px past the exact rendered width!
+            dynamic_offset_provider.load_from_data(&format!(
+                ".drawer-container {{ transform: translateX(-{}px); }}
+                 .drawer-container.open {{ transform: translateX(0px); }}",
+                push_back
+            ));
+        }
+        glib::ControlFlow::Continue
+    });
+    let _ = dash_watch;
+
     let stack = Stack::new();
     stack.set_hhomogeneous(false);
     stack.set_size_request(288, -1);
@@ -521,12 +548,13 @@ fn build_ui(app: &Application) -> Button {
         .build();
 
     let sidebar_clamp = gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .hscrollbar_policy(gtk4::PolicyType::External) // <-- NEVER stretches parent!
         .vscrollbar_policy(gtk4::PolicyType::Never)
+        .propagate_natural_width(false)                // <-- Locks width strictly!
         .min_content_width(110)
         .max_content_width(110)
-        .width_request(110) // <-- ABSOLUTE HARD LIMIT
-        .has_frame(false)   // <-- REMOVES HIDDEN GTK BORDERS
+        .width_request(110)
+        .has_frame(false)
         .hexpand(false)
         .vexpand(true)
         .child(&sidebar_column)
@@ -669,6 +697,8 @@ fn build_ui(app: &Application) -> Button {
 
     let drive_ui = drive::build_drive_ui();
     stack.add_titled(&drive_ui, Some("drive"), "Drive");
+    let locker_ui = locker::build_locker_ui(popover_guard.clone());
+    stack.add_titled(&locker_ui, Some("locker"), "Locker");
 
     let detail_tab = plans_ui.detail_view.clone();
     let win_tab = window.clone();
@@ -688,12 +718,13 @@ fn build_ui(app: &Application) -> Button {
     });
 
     let stack_clamp = gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .hscrollbar_policy(gtk4::PolicyType::External) // <-- NEVER stretches parent!
         .vscrollbar_policy(gtk4::PolicyType::Never)
+        .propagate_natural_width(false)                // <-- Locks width strictly!
         .min_content_width(288)
         .max_content_width(288)
-        .width_request(288) // <-- ABSOLUTE HARD LIMIT
-        .has_frame(false)   // <-- REMOVES HIDDEN GTK BORDERS
+        .width_request(288)
+        .has_frame(false)
         .hexpand(false)
         .vexpand(true)
         .child(&stack)
