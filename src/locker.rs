@@ -784,7 +784,6 @@ pub fn build_locker_ui(popover_guard: Rc<Cell<usize>>) -> Box {
      .halign(Align::Start)
      .hexpand(true)
      .width_chars(1)
-     .ellipsize(gtk4::pango::EllipsizeMode::End)
      .css_classes(vec!["fav-group-header".to_string()])
      .build();
 
