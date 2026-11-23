@@ -61,12 +61,12 @@ fn load_css() {
         .drawer-container {
             transform: translateX(-415px);
             transition: transform 0.35s cubic-bezier(0.25, 0.8, 0.25, 1);
-            opacity: 0.8;
+            opacity: 0.95;
         }
 
         .drawer-container.open {
             transform: translateX(0px);
-            opacity: 0.8;
+            opacity: 0.95;
         }
 
         .dash-box {
