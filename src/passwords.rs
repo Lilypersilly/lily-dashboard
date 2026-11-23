@@ -8,7 +8,7 @@ use gtk4::{
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::rc::Rc;

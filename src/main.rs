@@ -6,6 +6,8 @@ mod plans;
 mod session;
 mod drive;
 mod locker;
+mod weather;
+mod timers;
 
 use gtk4::cairo::{RectangleInt, Region};
 use gtk4::prelude::*;
@@ -30,7 +32,7 @@ fn main() {
     
 
     let app = Application::builder().application_id(APP_ID).build();
-    app.connect_startup(|_| load_css());
+    app.connect_startup(|_| init_theme());
 
     // Store the trigger button so re-running `lily-dashboard` (e.g. via SUPER keybind)
     // toggles the already-running dashboard open/closed instead of spawning a second window!
@@ -50,403 +52,177 @@ fn main() {
     app.run();
 }
 
-fn load_css() {
+fn init_theme() {
     let provider = CssProvider::new();
-    provider.load_from_data(
-        "
-        window {
-            background-color: transparent;
-        }
-
-        .drawer-container {
-            transform: translateX(-415px);
-            transition: transform 0.35s cubic-bezier(0.25, 0.8, 0.25, 1);
-            opacity: 0.95;
-        }
-
-        .drawer-container.open {
-            transform: translateX(0px);
-            opacity: 0.95;
-        }
-
-        .dash-box {
-            background-color: #fee4ff;
-            border: 2px solid #e975ca;
-            border-left: none;
-            border-top-right-radius: 16px;
-            border-bottom-right-radius: 16px;
-            min-width: 398px;
-        }
-        
-        .sidebar-column {
-            background-color: #fbe6ff; /* Slightly lighter for the sidebar */
-            border-right: 1px solid #e975ca; /* Thinner separator line */
-        }
-
-        /* --- SIDEBAR NAVIGATION --- */
-        stacksidebar {
-            background-color: transparent;
-        }
-        
-        stacksidebar list {
-            background-color: transparent;
-        }
-
-        stacksidebar row {
-            padding: 8px 10px;
-            border-radius: 12px;
-            margin: 2px 4px;
-            transition: background-color 0.2s ease, color 0.2s ease;
-        }
-
-        stacksidebar row:hover {
-            background-color: rgba(233, 117, 202, 0.15);
-        }
-
-        stacksidebar row:checked, stacksidebar row.selected {
-            background-color: rgba(0, 0, 0, 0.06); /* Soft translucent overlay like the mockup! */
-        }
-
-        stacksidebar label {
-            color: #6a5e6a; /* Muted text when unselected */
-            font-family: 'Josefin Sans', sans-serif;
-            font-size: 16px;
-            font-weight: bold;
-        }
-
-        stacksidebar row:checked label, stacksidebar row.selected label {
-            color: #333933; /* Dark text when active */
-        }
-
-        /* --- FLAT LIST ITEMS (SONGS, PASSWORDS, PLANS, ETC) --- */
-        .fav-item-btn, .music-item-album, .music-item-playlist {
-            background-color: transparent;
-            border: none;
-            border-radius: 12px;
-            padding: 6px 8px;
-            transition: background-color 0.15s ease;
-            box-shadow: none;
-        }
-
-        .fav-item-btn:hover, .music-item-album:hover, .music-item-playlist:hover {
-            background-color: rgba(233, 117, 202, 0.15);
-        }
-
-        /* Active / Playing / Pinned Item (Solid Pink Background!) */
-        .fav-item-btn.pinned, .music-item-album.pinned, .music-item-playlist.pinned {
-            background-color: #ffa8e4;
-            border: none;
-        }
-
-        /* Fixed 36x36 Album Art Frame with Subtle Shadow */
-        .music-art-frame {
-            background-color: transparent;
-            border: none;
-            border-radius: 8px;
-            min-width: 36px;
-            min-height: 36px;
-            box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.15); /* Makes the art pop off the flat background */
-        }
-
-        /* --- SEARCH BARS & INPUTS --- */
-        .fav-search {
-            background-color: rgba(255, 255, 255, 0.5);
-            border: 1px solid #e975ca;
-            border-radius: 12px;
-            color: #333933;
-            font-family: 'Josefin Sans', sans-serif;
-            padding: 6px 12px;
-        }
-
-        .fav-search:focus {
-            background-color: rgba(255, 255, 255, 0.8);
-        }
-
-        /* --- TYPOGRAPHY & BADGES --- */
-        .fav-group-header {
-            color: #bf40a1;
-            font-weight: bold;
-            font-size: 13px;
-            font-family: 'MesloLGL Nerd Font', monospace;
-            margin-left: 4px;
-            letter-spacing: 1px;
-        }
-
-        .fav-score-badge {
-            color: #d437a3; /* Vibrant magenta for Artist/Duration text! */
-            font-family: 'MesloLGL Nerd Font', monospace;
-            font-size: 12px;
-            font-weight: bold;
-        }
-
-        /* --- STANDARD BUTTONS --- */
-        .plan-fmt-btn, .plan-close-btn {
-            background-color: #ffc2ff;
-            border: 1px solid #e975ca;
-            border-radius: 8px;
-            padding: 4px 10px;
-            color: #333933;
-            font-family: 'Josefin Sans', sans-serif;
-            font-weight: bold;
-            transition: all 0.15s ease;
-        }
-
-        .plan-fmt-btn:hover, .plan-close-btn:hover {
-            background-color: #ef96d9;
-        }
-
-        .plan-fmt-btn.active, .plan-close-btn.active {
-            background-color: #bf40a1;
-            border-color: #bf40a1;
-            color: #fee4ff;
-        }
-
-        .session-restore-btn {
-            background-color: transparent;
-            border: 1px solid #e975ca;
-            border-radius: 10px;
-            padding: 8px 6px;
-            margin: 4px 8px;
-            transition: background-color 0.15s ease;
-        }
-
-        .session-restore-btn:hover {
-            background-color: rgba(233, 117, 202, 0.15);
-        }
-
-        .session-restore-lbl {
-            color: #bf40a1;
-            font-size: 12px;
-            font-weight: bold;
-        }
-
-        label {
-            color: #333933;
-            font-family: 'Josefin Sans', sans-serif;
-            font-size: 16px;
-        }
-
-        .trigger-wrapper {
-            min-width: 56px;
-            min-height: 130px;
-        }
-
-        .trigger-btn {
-            background-color: #ffc2ff;
-            border: 2px solid #e975ca;
-            border-left: none;
-            border-top-right-radius: 100px;
-            border-bottom-right-radius: 100px;
-            min-width: 50px;
-            min-height: 100px;
-            padding: 0;
-            transform: translateX(-36px);
-            transition-property: transform, background-color;
-            transition-duration: 0.2s;
-            transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
-        }
-        
-        .trigger-btn.peeking,
-        .trigger-btn.riding {
-            background-color: #ef96d9;
-            transform: translateX(0px);
-        }
-
-        popover.fav-popover > contents {
-            background-color: #fee4ff;
-            border: 2px solid #e975ca;
-            border-radius: 12px;
-            padding: 6px;
-        }
-
-        .fav-hide-btn {
-            background-color: #ffc2ff;
-            border: none;
-            border-radius: 8px;
-            padding: 6px 12px;
-            color: #333933;
-        }
-
-        .fav-hide-btn:hover {
-            background-color: #ef96d9;
-        }
-
-        .plan-detail-pane {
-            background-color: #fee4ff;
-            border-left: 2px solid #ef96d9;
-            min-width: 400px;
-        }
-
-        .plan-divider {
-            background-color: #ef96d9;
-            border-radius: 1px;
-        }
-
-        .plan-h1 {
-            color: #bf40a1;
-            font-weight: bold;
-            font-size: 19px;
-        }
-
-        .plan-h2 {
-            color: #bf40a1;
-            font-weight: bold;
-            font-size: 16px;
-        }
-
-        .plan-step {
-            color: #bf40a1;
-            font-weight: bold;
-            font-size: 15px;
-        }
-
-        .plan-body {
-            color: #333933;
-            font-size: 14px;
-        }
-
-        .plan-subnote {
-            color: #bf40a1;
-            font-family: 'MesloLGL Nerd Font', monospace;
-            font-size: 12px;
-        }
-
-        .plan-checked-text {
-            opacity: 0.55;
-            text-decoration: line-through;
-        }
-
-        .plan-check-row {
-            background-color: #f8d4ff;
-            border: 1px solid #ef96d9;
-            border-radius: 10px;
-            padding: 6px 10px;
-        }
-
-        checkbutton.plan-checkbox > check {
-            background-color: #ffc2ff;
-            border: 2px solid #e975ca;
-            border-radius: 5px;
-            min-width: 18px;
-            min-height: 18px;
-        }
-
-        checkbutton.plan-checkbox:checked > check {
-            background-color: #bf40a1;
-            border-color: #bf40a1;
-            color: #fee4ff;
-        }
-
-        .plan-composer-dock {
-            background-color: #f8d4ff;
-            border-top: 2px solid #ef96d9;
-            padding: 10px 14px;
-        }
-
-        .plan-delete-menu-btn {
-            background-color: #ffc2ff;
-            border: none;
-            border-radius: 8px;
-            padding: 6px 12px;
-            color: #bf40a1;
-            font-weight: bold;
-        }
-
-        .plan-delete-menu-btn:hover {
-            background-color: #ef96d9;
-        }
-
-        .plan-line-del-btn {
-            background-color: #ffc2ff;
-            border: 1px solid #e975ca;
-            border-radius: 6px;
-            padding: 1px 6px;
-            color: #bf40a1;
-            font-size: 11px;
-            min-width: 22px;
-            min-height: 22px;
-        }
-
-        .plan-line-del-btn:hover {
-            background-color: #ef96d9;
-        }
-
-        .plan-drag-handle {
-            color: #bf40a1;
-            font-family: 'MesloLGL Nerd Font', monospace;
-            font-size: 13px;
-            font-weight: bold;
-            padding: 2px 4px;
-            opacity: 0.7;
-        }
-
-        .plan-edit-row {
-            border: 1px solid transparent;
-            border-radius: 8px;
-            padding: 2px 4px;
-            transition: background-color 0.1s ease, border-color 0.1s ease;
-        }
-
-        .plan-edit-row:hover {
-            background-color: #f8d4ff;
-        }
-
-        .plan-edit-row.dragging {
-            opacity: 0.4;
-        }
-
-        .plan-edit-row.drop-target {
-            border: 2px dashed #bf40a1;
-            background-color: #ffc2ff;
-        }
-
-        scale.music-seek {
-            padding: 2px 0px;
-        }
-
-        scale.music-seek > trough {
-            background-color: #ffc2ff;
-            border: 1px solid #e975ca;
-            border-radius: 6px;
-            min-height: 6px;
-        }
-
-        scale.music-seek > trough > highlight {
-            background-color: #bf40a1;
-            border-radius: 6px;
-        }
-
-        scale.music-seek > trough > slider {
-            background-color: #fee4ff;
-            border: 2px solid #bf40a1;
-            border-radius: 50%;
-            min-width: 12px;
-            min-height: 12px;
-            margin: -4px 0px;
-        }
-
-        progressbar.drive-progress > trough {
-            background-color: #ffc2ff;
-            border: 1px solid #e975ca;
-            border-radius: 6px;
-            min-height: 14px;
-        }
-
-        progressbar.drive-progress > trough > progress {
-            background-color: #bf40a1;
-            border-radius: 5px;
-        }
-        ",
-    );
-
     gtk4::style_context_add_provider_for_display(
         &gdk::Display::default().expect("Could not connect to a display."),
         &provider,
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+
+    let update_css = {
+        let provider = provider.clone();
+        move || {
+            let mut map = std::collections::HashMap::new();
+            let mut path = glib::user_config_dir();
+            path.push("theme-switch");
+            path.push("current.conf");
+            
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                for line in content.lines() {
+                    let line = line.split('#').next().unwrap_or("").trim();
+                    if let Some((k, v)) = line.split_once('=') {
+                        map.insert(k.trim().to_string(), v.trim().to_string());
+                    }
+                }
+            }
+
+            macro_rules! get_c {
+                ($k:expr, $fallback:expr) => {
+                    map.get($k).map(|s| s.as_str()).unwrap_or($fallback)
+                };
+            }
+            
+            // Map the generic theme variables to the dashboard's semantic roles
+            let bg_main = get_c!("bg_main", "fee4ff");
+            let bg_pill = get_c!("bg_pill", get_c!("bg_dark", "ffc2ff"));
+            let bg_recessed = get_c!("bg_recessed", get_c!("bg_dark", "f8d4ff"));
+            let bg_contrast = get_c!("bg_contrast", get_c!("bg_dark", "322a32"));
+            
+            let fg_main = get_c!("fg_main", "333933");
+            let fg_muted = get_c!("fg_muted", get_c!("fg_dim", "856d8a"));
+            
+            let accent1 = get_c!("accent", get_c!("accent1", "e975ca"));
+            let accent2 = get_c!("magenta", get_c!("accent2", "bf40a1"));
+            let selection = get_c!("selection", get_c!("accent1", "ef96d9"));
+            
+            let hex_to_rgba = |hex: &str, alpha: f32| -> String {
+                let clean = hex.trim_start_matches('#');
+                if clean.len() >= 6 {
+                    if let (Ok(r), Ok(g), Ok(b)) = (
+                        u8::from_str_radix(&clean[0..2], 16),
+                        u8::from_str_radix(&clean[2..4], 16),
+                        u8::from_str_radix(&clean[4..6], 16),
+                    ) {
+                        return format!("rgba({}, {}, {}, {})", r, g, b, alpha);
+                    }
+                }
+                format!("rgba(128, 128, 128, {})", alpha)
+            };
+
+            let accent1_15 = hex_to_rgba(accent1, 0.15);
+            let fg_main_06 = hex_to_rgba(fg_main, 0.06);
+            let bg_contrast_50 = hex_to_rgba(bg_contrast, 0.50);
+            let bg_contrast_80 = hex_to_rgba(bg_contrast, 0.80);
+
+            let css = format!(
+                r#"
+                window {{ background-color: transparent; }}
+                .drawer-container {{ transform: translateX(-415px); transition: transform 0.35s cubic-bezier(0.25, 0.8, 0.25, 1); opacity: 0.95; }}
+                .drawer-container.open {{ transform: translateX(0px); opacity: 0.95; }}
+                
+                .dash-box {{ background-color: #{bg_main}; border: 2px solid #{accent1}; border-left: none; border-top-right-radius: 16px; border-bottom-right-radius: 16px; min-width: 398px; }}
+                .sidebar-column {{ background-color: #{bg_recessed}; border-right: 1px solid #{accent1}; }}
+                
+                stacksidebar {{ background-color: transparent; }}
+                stacksidebar list {{ background-color: transparent; }}
+                stacksidebar row {{ padding: 8px 10px; border-radius: 12px; margin: 2px 4px; transition: background-color 0.2s ease, color 0.2s ease; }}
+                stacksidebar row:hover {{ background-color: {accent1_15}; }}
+                stacksidebar row:checked, stacksidebar row.selected {{ background-color: {fg_main_06}; }}
+                stacksidebar label {{ color: #{fg_muted}; font-family: 'Josefin Sans', sans-serif; font-size: 16px; font-weight: bold; }}
+                stacksidebar row:checked label, stacksidebar row.selected label {{ color: #{fg_main}; }}
+                
+                .fav-item-btn, .music-item-album, .music-item-playlist {{ background-color: transparent; border: none; border-radius: 12px; padding: 6px 8px; transition: background-color 0.15s ease; box-shadow: none; }}
+                .fav-item-btn:hover, .music-item-album:hover, .music-item-playlist:hover {{ background-color: {accent1_15}; }}
+                .fav-item-btn.pinned, .music-item-album.pinned, .music-item-playlist.pinned {{ background-color: #{selection}; border: none; }}
+                
+                .music-art-frame {{ background-color: transparent; border: none; border-radius: 8px; min-width: 36px; min-height: 36px; box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.15); }}
+                
+                .fav-search {{ background-color: {bg_contrast_50}; border: 1px solid #{accent1}; border-radius: 12px; color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; padding: 6px 12px; }}
+                .fav-search:focus {{ background-color: {bg_contrast_80}; }}
+                
+                .fav-group-header {{ color: #{accent2}; font-weight: bold; font-size: 13px; font-family: 'MesloLGL Nerd Font', monospace; margin-left: 4px; letter-spacing: 1px; }}
+                .fav-score-badge {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 12px; font-weight: bold; }}
+                
+                .plan-fmt-btn, .plan-close-btn {{ background-color: #{bg_pill}; border: 1px solid #{accent1}; border-radius: 8px; padding: 4px 10px; color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-weight: bold; transition: all 0.15s ease; }}
+                .plan-fmt-btn:hover, .plan-close-btn:hover {{ background-color: #{selection}; }}
+                .plan-fmt-btn.active, .plan-close-btn.active {{ background-color: #{accent2}; border-color: #{accent2}; color: #{bg_contrast}; }}
+                
+                .session-restore-btn {{ background-color: transparent; border: 1px solid #{accent1}; border-radius: 10px; padding: 8px 6px; margin: 4px 8px; transition: background-color 0.15s ease; }}
+                .session-restore-btn:hover {{ background-color: {accent1_15}; }}
+                .session-restore-lbl {{ color: #{accent2}; font-size: 12px; font-weight: bold; }}
+                
+                label {{ color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 16px; }}
+                
+                .trigger-wrapper {{ min-width: 56px; min-height: 130px; }}
+                .trigger-btn {{ background-color: #{bg_pill}; border: 2px solid #{accent1}; border-left: none; border-top-right-radius: 100px; border-bottom-right-radius: 100px; min-width: 50px; min-height: 100px; padding: 0; transform: translateX(-36px); transition-property: transform, background-color; transition-duration: 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1); }}
+                .trigger-btn.peeking, .trigger-btn.riding {{ background-color: #{selection}; transform: translateX(0px); }}
+                
+                popover.fav-popover > contents {{ background-color: #{bg_main}; border: 2px solid #{accent1}; border-radius: 12px; padding: 6px; }}
+                .fav-hide-btn {{ background-color: #{bg_pill}; border: none; border-radius: 8px; padding: 6px 12px; color: #{fg_main}; }}
+                .fav-hide-btn:hover {{ background-color: #{selection}; }}
+                
+                .plan-detail-pane {{ background-color: #{bg_main}; border-left: 2px solid #{selection}; min-width: 400px; }}
+                .plan-divider {{ background-color: #{selection}; border-radius: 1px; }}
+                .plan-h1 {{ color: #{accent2}; font-weight: bold; font-size: 19px; }}
+                .plan-h2 {{ color: #{accent2}; font-weight: bold; font-size: 16px; }}
+                .plan-step {{ color: #{accent2}; font-weight: bold; font-size: 15px; }}
+                .plan-body {{ color: #{fg_main}; font-size: 14px; }}
+                .plan-subnote {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 12px; }}
+                .plan-checked-text {{ opacity: 0.55; text-decoration: line-through; }}
+                .plan-check-row {{ background-color: #{bg_recessed}; border: 1px solid #{selection}; border-radius: 10px; padding: 6px 10px; }}
+                checkbutton.plan-checkbox > check {{ background-color: #{bg_pill}; border: 2px solid #{accent1}; border-radius: 5px; min-width: 18px; min-height: 18px; }}
+                checkbutton.plan-checkbox:checked > check {{ background-color: #{accent2}; border-color: #{accent2}; color: #{bg_main}; }}
+                
+                .plan-composer-dock {{ background-color: #{bg_recessed}; border-top: 2px solid #{selection}; padding: 10px 14px; }}
+                .plan-delete-menu-btn {{ background-color: #{bg_pill}; border: none; border-radius: 8px; padding: 6px 12px; color: #{accent2}; font-weight: bold; }}
+                .plan-delete-menu-btn:hover {{ background-color: #{selection}; }}
+                .plan-line-del-btn {{ background-color: #{bg_pill}; border: 1px solid #{accent1}; border-radius: 6px; padding: 1px 6px; color: #{accent2}; font-size: 11px; min-width: 22px; min-height: 22px; }}
+                .plan-line-del-btn:hover {{ background-color: #{selection}; }}
+                
+                .plan-drag-handle {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 13px; font-weight: bold; padding: 2px 4px; opacity: 0.7; }}
+                .plan-edit-row {{ border: 1px solid transparent; border-radius: 8px; padding: 2px 4px; transition: background-color 0.1s ease, border-color 0.1s ease; }}
+                .plan-edit-row:hover {{ background-color: #{bg_recessed}; }}
+                .plan-edit-row.dragging {{ opacity: 0.4; }}
+                .plan-edit-row.drop-target {{ border: 2px dashed #{accent2}; background-color: #{bg_pill}; }}
+                
+                scale.music-seek {{ padding: 2px 0px; }}
+                scale.music-seek > trough {{ background-color: #{bg_pill}; border: 1px solid #{accent1}; border-radius: 6px; min-height: 6px; }}
+                scale.music-seek > trough > highlight {{ background-color: #{accent2}; border-radius: 6px; }}
+                scale.music-seek > trough > slider {{ background-color: #{bg_main}; border: 2px solid #{accent2}; border-radius: 50%; min-width: 12px; min-height: 12px; margin: -4px 0px; }}
+                
+                progressbar.drive-progress > trough {{ background-color: #{bg_pill}; border: 1px solid #{accent1}; border-radius: 6px; min-height: 14px; }}
+                progressbar.drive-progress > trough > progress {{ background-color: #{accent2}; border-radius: 5px; }}
+                "#
+            );
+            
+            // Fix 1: Pass the string directly instead of converting to bytes
+            provider.load_from_data(&css);
+        }
+    };
+
+    // Load it immediately on startup
+    update_css();
+
+    // Attach FileMonitor so it live-updates instantly when you run theme-switch!
+    let mut path = glib::user_config_dir();
+    path.push("theme-switch");
+    path.push("current.conf");
+    let file = gtk4::gio::File::for_path(&path);
+    
+    if let Ok(monitor) = file.monitor_file(gtk4::gio::FileMonitorFlags::NONE, gtk4::gio::Cancellable::NONE) {
+        monitor.connect_changed(move |_, _, _, event| {
+            if event == gtk4::gio::FileMonitorEvent::ChangesDoneHint || event == gtk4::gio::FileMonitorEvent::Created {
+                update_css();
+            }
+        });
+        
+        // Fix 2: Explicitly tell Rust to use the memory Box, not the GTK UI Box!
+        std::boxed::Box::leak(std::boxed::Box::new(monitor)); 
+    }
 }
 
-fn update_input_region(window: &ApplicationWindow, is_open: bool, is_expanded: bool) {
+fn update_input_region(window: &ApplicationWindow, is_open: bool, dash_width: i32) {
     if let Some(surface) = window.surface() {
         let height = window.height().max(1080);
         let region = if !is_open {
@@ -454,28 +230,58 @@ fn update_input_region(window: &ApplicationWindow, is_open: bool, is_expanded: b
             Region::create_rectangle(&RectangleInt::new(
                 0,
                 (center_y - 75).max(0),
-                TRIGGER_WIDTH,
-                150,
-            ))
-        } else if is_expanded {
-            Region::create_rectangle(&RectangleInt::new(
-                0,
-                0,
-                TOTAL_DASH_WIDTH + TRIGGER_WIDTH,
-                height,
+                10,
+                104,
             ))
         } else {
+            // Dynamically hug the EXACT rendered width of the dashboard
+            let w = if dash_width > 0 { dash_width } else { BASE_DASH_WIDTH };
             Region::create_rectangle(&RectangleInt::new(
                 0,
                 0,
-                BASE_DASH_WIDTH + TRIGGER_WIDTH,
+                w + TRIGGER_WIDTH,
                 height,
             ))
         };
         surface.set_input_region(&region);
+        
+        // Force a Wayland surface commit so the new invisible hitbox actually applies!
+        window.queue_draw();
     }
 }
+fn move_to_monitor(window: &ApplicationWindow, target: Option<&str>) {
+    let mut active_name = target.map(|s| s.to_string());
 
+    // Fallback to hyprctl if no explicit target provided (e.g., on first launch)
+    if active_name.is_none() {
+        if let Ok(output) = std::process::Command::new("hyprctl").args(["monitors", "-j"]).output() {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                if let Some(monitors) = json.as_array() {
+                    active_name = monitors.iter()
+                        .find(|m| m.get("focused").and_then(|f| f.as_bool()).unwrap_or(false))
+                        .and_then(|m| m.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+        }
+    }
+
+    let Some(target_name) = active_name else { return };
+    let Some(display) = gdk::Display::default() else { return };
+    let gdk_monitors = display.monitors();
+
+    for i in 0..gdk_monitors.n_items() {
+        if let Some(mon) = gdk_monitors.item(i).and_downcast::<gdk::Monitor>() {
+            if let Some(conn) = mon.connector() {
+                if conn == target_name {
+                    window.set_monitor(&mon);
+                    break;
+                }
+            }
+        }
+    }
+}
 fn build_ui(app: &Application) -> Button {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -646,7 +452,16 @@ fn build_ui(app: &Application) -> Button {
         });
     });
 
+    // Create the weather tab AND the small sidebar widget button
+    let (weather_page, weather_sidebar_btn) = weather::build_weather_ui(&stack);
+    
+    // Add to stack using `add_named`. 
+    // Using `add_named` (no title provided) tells GTK to intentionally HIDE it from the default text sidebar list!
+    stack.add_named(&weather_page, Some("weather"));
+
+    // Add everything to the sidebar column in order
     sidebar_column.append(&sidebar);
+    sidebar_column.append(&weather_sidebar_btn); // <-- The cute weather widget goes here!
     sidebar_column.append(&reload_btn);
     sidebar_column.append(&session_btn);
 
@@ -656,13 +471,11 @@ fn build_ui(app: &Application) -> Button {
     let is_closing = Rc::new(Cell::new(false));
     let popover_guard = Rc::new(Cell::new(0usize));
 
-    let win_for_plans = window.clone();
-    let open_for_plans = is_open.clone();
-    let expanded_for_plans = is_expanded.clone();
+    let popover_guard = Rc::new(Cell::new(0usize));
 
-    let plans_ui = plans::build_plans_ui(popover_guard.clone(), move |expand| {
-        expanded_for_plans.set(expand);
-        update_input_region(&win_for_plans, open_for_plans.get(), expand);
+    let plans_ui = plans::build_plans_ui(popover_guard.clone(), move |_expand| {
+        // We don't need to manually update the hitbox here anymore!
+        // The bulletproof win_tick callback perfectly handles width expansions for us automatically.
     });
 
     stack.add_titled(&plans_ui.list_view, Some("plans"), "Plans");
@@ -701,16 +514,11 @@ fn build_ui(app: &Application) -> Button {
     stack.add_titled(&locker_ui, Some("locker"), "Locker");
 
     let detail_tab = plans_ui.detail_view.clone();
-    let win_tab = window.clone();
-    let open_tab = is_open.clone();
-    let expanded_tab = is_expanded.clone();
     let run_search = launcher_ui.search_entry.clone();
     stack.connect_visible_child_name_notify(move |stk| {
         let current = stk.visible_child_name();
-        if current.as_deref() != Some("plans") && expanded_tab.get() {
-            expanded_tab.set(false);
+        if current.as_deref() != Some("plans") {
             detail_tab.set_visible(false);
-            update_input_region(&win_tab, open_tab.get(), false);
         }
         if current.as_deref() == Some("run") {
             run_search.grab_focus();
@@ -718,9 +526,9 @@ fn build_ui(app: &Application) -> Button {
     });
 
     let stack_clamp = gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Never) // <-- NEVER stretches parent!
+        .hscrollbar_policy(gtk4::PolicyType::Never) 
         .vscrollbar_policy(gtk4::PolicyType::Never)
-        .propagate_natural_width(false)                // <-- Locks width strictly!
+        .propagate_natural_width(false)                
         .min_content_width(288)
         .max_content_width(288)
         .width_request(288)
@@ -736,6 +544,9 @@ fn build_ui(app: &Application) -> Button {
 
     let music_ui = music::build_music_ui();
     stack.add_titled(&music_ui, Some("music"), "Music");
+
+    let timers_ui = timers::build_timers_ui();
+    stack.add_titled(&timers_ui, Some("timers"), "Timers");
 
     let win_motion = EventControllerMotion::new();
     let btn_motion = trigger_btn.clone();
@@ -764,19 +575,18 @@ fn build_ui(app: &Application) -> Button {
     });
     window.add_controller(win_motion);
 
+    // DYNAMIC CLOSE-CLICK HANDLER
     let win_click = GestureClick::builder().button(1).build();
     let btn_win_click = trigger_btn.clone();
     let open_win_click = is_open.clone();
-    let expanded_win_click = is_expanded.clone();
+    let dash_box_click = dash_box.clone();
     win_click.connect_pressed(move |_, _, x, _| {
         if !open_win_click.get() {
             btn_win_click.emit_clicked();
         } else {
-            let dash_edge = if expanded_win_click.get() {
-                TOTAL_DASH_WIDTH as f64
-            } else {
-                BASE_DASH_WIDTH as f64
-            };
+            // Dynamically calculate the right edge of the dashboard based on actual physical width!
+            let current_w = dash_box_click.width() as f64;
+            let dash_edge = if current_w > 0.0 { current_w } else { BASE_DASH_WIDTH as f64 };
             if x >= dash_edge {
                 btn_win_click.emit_clicked();
             }
@@ -789,25 +599,26 @@ fn build_ui(app: &Application) -> Button {
     let window_clone = window.clone();
     let hovered_click = is_hovered.clone();
     let open_click = is_open.clone();
-    let expanded_click = is_expanded.clone();
     let closing_click = is_closing.clone();
+    let dash_box_btn = dash_box.clone();
 
     trigger_btn.connect_clicked(move |btn| {
         let currently_open = open_click.get();
 
         if !currently_open {
+            move_to_monitor(&window_clone, None);
             open_click.set(true);
             closing_click.set(false);
 
             window_clone.set_keyboard_mode(KeyboardMode::OnDemand);
-            update_input_region(&window_clone, true, expanded_click.get());
+            // Pass the exact width of the dashboard to the hitbox
+            update_input_region(&window_clone, true, dash_box_btn.width());
             window_clone.present();
 
             btn.add_css_class("riding");
             drawer_clone.add_css_class("open");
         } else {
             open_click.set(false);
-            expanded_click.set(false);
             closing_click.set(true);
             hovered_click.set(false);
 
@@ -825,7 +636,8 @@ fn build_ui(app: &Application) -> Button {
                 closing_after.set(false);
                 if !open_after.get() {
                     btn_after.remove_css_class("riding");
-                    update_input_region(&win_after, false, false);
+                    // Pass 0, width doesn't matter when the dashboard is closed
+                    update_input_region(&win_after, false, 0);
                 }
             });
         }
@@ -848,10 +660,86 @@ fn build_ui(app: &Application) -> Button {
 
     window.set_child(Some(&drawer_container));
 
-    window.connect_map(|win| {
-        update_input_region(win, false, false);
+    // --- THE BULLETPROOF HITBOX FIX (UPDATED FOR DYNAMIC WIDTH) ---
+    let last_known_height = Rc::new(Cell::new(0));
+    let last_known_width = Rc::new(Cell::new(0));
+    let win_tick = window.clone();
+    let open_tick = is_open.clone();
+    let dash_box_tick = dash_box.clone();
+
+    win_tick.add_tick_callback(move |win, _| {
+        let current_height = win.height();
+        let current_width = dash_box_tick.width();
+        
+        // If the height OR width changes physically, update the hitbox instantly!
+        if current_height > 0 && (current_height != last_known_height.get() || current_width != last_known_width.get()) {
+            last_known_height.set(current_height);
+            last_known_width.set(current_width);
+            let app_win = win.downcast_ref::<ApplicationWindow>().unwrap();
+            update_input_region(app_win, open_tick.get(), current_width);
+        }
+        glib::ControlFlow::Continue
+    });
+    // ----------------------------------
+
+    // --- START HYPRLAND IPC LISTENER ---
+    let (tx_mon, rx_mon) = std::sync::mpsc::channel::<String>();
+    
+    std::thread::spawn(move || {
+        let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").unwrap_or_default();
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".to_string());
+        let sock_path = format!("{}/hypr/{}/.socket2.sock", runtime_dir, signature);
+
+        loop {
+            if let Ok(stream) = std::os::unix::net::UnixStream::connect(&sock_path) {
+                let reader = std::io::BufReader::new(stream);
+                for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
+                    if let Some(rest) = line.strip_prefix("focusedmon>>") {
+                        if let Some((mon_name, _)) = rest.split_once(',') {
+                            let _ = tx_mon.send(mon_name.to_string());
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2)); 
+        }
     });
 
+    let win_focus = window.clone();
+    let open_focus = is_open.clone();
+    let dash_box_ipc = dash_box.clone();
+
+    glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        let mut latest_mon: Option<String> = None;
+        while let Ok(mon) = rx_mon.try_recv() {
+            latest_mon = Some(mon);
+        }
+        
+        if let Some(mon_name) = latest_mon {
+            move_to_monitor(&win_focus, Some(&mon_name));
+
+            let win_region = win_focus.clone();
+            let o = open_focus.get();
+            let db_w = dash_box_ipc.width();
+            
+            glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+                update_input_region(&win_region, o, db_w);
+            });
+        }
+        glib::ControlFlow::Continue
+    });
+    // --- END HYPRLAND IPC LISTENER ---
+
+    // Map the window hitbox dynamically so it doesn't break if you move screens while it's open
+    let open_map = is_open.clone();
+    let dash_box_map = dash_box.clone();
+    window.connect_map(move |win| {
+        update_input_region(win, open_map.get(), dash_box_map.width());
+    });
+
+    // Ensure it's on the right screen as soon as you boot the dashboard
+    move_to_monitor(&window, None);
+    
     window.present();
 
     trigger_btn
