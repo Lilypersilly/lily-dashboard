@@ -16,7 +16,7 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
     mpsc,
 };
@@ -655,8 +655,147 @@ fn hash_key_bytes(bytes: &[u8]) -> String {
     format!("{:016x}", hash)
 }
 
+const MAX_CACHED_TEXTURES: usize = 120;
+const MAX_URL_HASH_ENTRIES: usize = 500;
+const THUMB_WORKER_COUNT: usize = 3;
+
 thread_local! {
-    static TEXTURE_RAM_CACHE: RefCell<HashMap<String, gtk4::gdk::Texture>> = RefCell::new(HashMap::new());
+    static TEXTURE_RAM_CACHE: RefCell<(HashMap<String, gtk4::gdk::Texture>, VecDeque<String>)> =
+        RefCell::new((HashMap::new(), VecDeque::new()));
+}
+
+fn cache_get_texture(key: &str) -> Option<gtk4::gdk::Texture> {
+    TEXTURE_RAM_CACHE.with(|cache| cache.borrow().0.get(key).cloned())
+}
+
+fn cache_insert_texture(key: String, texture: gtk4::gdk::Texture) {
+    TEXTURE_RAM_CACHE.with(|cache| {
+        let mut guard = cache.borrow_mut();
+        if !guard.0.contains_key(&key) {
+            while guard.0.len() >= MAX_CACHED_TEXTURES {
+                if let Some(old_key) = guard.1.pop_front() {
+                    guard.0.remove(&old_key);
+                } else {
+                    break;
+                }
+            }
+            guard.1.push_back(key.clone());
+        }
+        guard.0.insert(key, texture);
+    });
+}
+
+struct ThumbJob {
+    url: String,
+    cache_hash: String,
+    tx: mpsc::Sender<Option<(glib::Bytes, bool, usize, String)>>,
+}
+
+static THUMB_POOL: OnceLock<Arc<(Mutex<VecDeque<ThumbJob>>, Condvar)>> = OnceLock::new();
+
+fn process_thumb_job(job: ThumbJob) {
+    let ThumbJob {
+        url: url_owned,
+        cache_hash,
+        tx,
+    } = job;
+
+    let mut needs_download = false;
+    let tmp_path = format!("{}/{}.tmp", THUMB_RAM_DIR, cache_hash);
+
+    let active_map = ACTIVE_DOWNLOADS.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut lock) = active_map.lock() {
+        if lock.insert(url_owned.clone()) {
+            needs_download = true;
+        }
+    }
+
+    if needs_download {
+        let status = Command::new("curl")
+            .args(["-sL", "--max-time", "5", "-o", &tmp_path, &url_owned])
+            .status();
+        if let Ok(mut lock) = active_map.lock() {
+            lock.remove(&url_owned);
+        }
+        if !status.map(|s| s.success()).unwrap_or(false) {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    } else {
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            let map = URL_TO_PIXEL_HASH.get_or_init(|| Mutex::new(HashMap::new()));
+            if map.lock().unwrap().contains_key(&url_owned) {
+                break;
+            }
+        }
+    }
+
+    let final_ph = URL_TO_PIXEL_HASH
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(&url_owned)
+        .cloned();
+
+    let mut cropped_result = None;
+    if let Some(ph) = final_ph {
+        let final_file = std::path::PathBuf::from(THUMB_RAM_DIR).join(format!("{}.jpg", ph));
+        if let Some((bytes, has_alpha, rowstride)) = decode_and_crop_bytes(&final_file) {
+            cropped_result = Some((bytes, has_alpha, rowstride, ph));
+        }
+    } else if std::path::Path::new(&tmp_path).exists() {
+        if let Some((bytes, has_alpha, rowstride)) =
+            decode_and_crop_bytes(std::path::Path::new(&tmp_path))
+        {
+            let pixel_hash = hash_key_bytes(&bytes);
+            let final_file =
+                std::path::PathBuf::from(THUMB_RAM_DIR).join(format!("{}.jpg", pixel_hash));
+            if !final_file.exists() {
+                let _ = std::fs::rename(&tmp_path, &final_file);
+            } else {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            let mut map = URL_TO_PIXEL_HASH
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap();
+            if map.len() >= MAX_URL_HASH_ENTRIES {
+                map.clear();
+            }
+            map.insert(url_owned, pixel_hash.clone());
+            cropped_result = Some((bytes, has_alpha, rowstride, pixel_hash));
+        } else {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    }
+    let _ = tx.send(cropped_result);
+}
+
+fn enqueue_thumb_job(job: ThumbJob) {
+    let pool = THUMB_POOL.get_or_init(|| {
+        let shared = Arc::new((Mutex::new(VecDeque::<ThumbJob>::new()), Condvar::new()));
+        for _ in 0..THUMB_WORKER_COUNT {
+            let worker_shared = Arc::clone(&shared);
+            std::thread::spawn(move || loop {
+                let next_job = {
+                    let (lock, cvar) = &*worker_shared;
+                    let mut q = lock.lock().unwrap();
+                    while q.is_empty() {
+                        q = cvar.wait(q).unwrap();
+                    }
+                    q.pop_front().unwrap()
+                };
+                process_thumb_job(next_job);
+            });
+        }
+        shared
+    });
+
+    let (lock, cvar) = &**pool;
+    if let Ok(mut q) = lock.lock() {
+        q.push_back(job);
+        cvar.notify_one();
+    }
 }
 
 fn decode_and_crop_bytes(path: &std::path::Path) -> Option<(glib::Bytes, bool, usize)> {
@@ -697,8 +836,7 @@ fn build_album_art_widget(_key: &str, thumb_url: &str) -> Box {
     };
 
     if let Some(ref ph) = known_pixel_hash {
-        let cached_tex = TEXTURE_RAM_CACHE.with(|cache| cache.borrow().get(ph).cloned());
-        if let Some(tex) = cached_tex {
+        if let Some(tex) = cache_get_texture(ph) {
             img.set_paintable(Some(&tex));
             return frame;
         }
@@ -708,75 +846,18 @@ fn build_album_art_widget(_key: &str, thumb_url: &str) -> Box {
     let cache_hash = hash_key(&url_owned);
     let (tx, rx) = mpsc::channel::<Option<(glib::Bytes, bool, usize, String)>>();
 
-    std::thread::spawn(move || {
-        let mut needs_download = false;
-        let tmp_path = format!("{}/{}.tmp", THUMB_RAM_DIR, cache_hash);
-
-        let active_map = ACTIVE_DOWNLOADS.get_or_init(|| Mutex::new(HashSet::new()));
-        if let Ok(mut lock) = active_map.lock() {
-            if lock.insert(url_owned.clone()) {
-                needs_download = true;
-            }
-        }
-
-        if needs_download {
-            let status = Command::new("curl")
-                .args(["-sL", "--max-time", "5", "-o", &tmp_path, &url_owned])
-                .status();
-            if let Ok(mut lock) = active_map.lock() {
-                lock.remove(&url_owned);
-            }
-            if !status.map(|s| s.success()).unwrap_or(false) {
-                let _ = std::fs::remove_file(&tmp_path);
-            }
-        } else {
-            for _ in 0..50 {
-                std::thread::sleep(Duration::from_millis(100));
-                let map = URL_TO_PIXEL_HASH.get_or_init(|| Mutex::new(HashMap::new()));
-                if map.lock().unwrap().contains_key(&url_owned) {
-                    break;
-                }
-            }
-        }
-
-        let final_ph = URL_TO_PIXEL_HASH
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap()
-            .get(&url_owned)
-            .cloned();
-
-        let mut cropped_result = None;
-        if let Some(ph) = final_ph {
-            let final_file = std::path::PathBuf::from(THUMB_RAM_DIR).join(format!("{}.jpg", ph));
-            if let Some((bytes, has_alpha, rowstride)) = decode_and_crop_bytes(&final_file) {
-                cropped_result = Some((bytes, has_alpha, rowstride, ph));
-            }
-        } else if std::path::Path::new(&tmp_path).exists() {
-            if let Some((bytes, has_alpha, rowstride)) = decode_and_crop_bytes(std::path::Path::new(&tmp_path)) {
-                let pixel_hash = hash_key_bytes(&bytes);
-                let final_file = std::path::PathBuf::from(THUMB_RAM_DIR).join(format!("{}.jpg", pixel_hash));
-                if !final_file.exists() {
-                    let _ = std::fs::rename(&tmp_path, &final_file);
-                } else {
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
-                URL_TO_PIXEL_HASH
-                    .get_or_init(|| Mutex::new(HashMap::new()))
-                    .lock()
-                    .unwrap()
-                    .insert(url_owned, pixel_hash.clone());
-                cropped_result = Some((bytes, has_alpha, rowstride, pixel_hash));
-            } else {
-                let _ = std::fs::remove_file(&tmp_path);
-            }
-        }
-        let _ = tx.send(cropped_result);
+    enqueue_thumb_job(ThumbJob {
+        url: url_owned,
+        cache_hash,
+        tx,
     });
 
     let img_weak = img.downgrade();
     let mut ticks = 0u8;
     glib::timeout_add_local(Duration::from_millis(45), move || {
+        let Some(i) = img_weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
         ticks += 1;
         if let Ok(res_opt) = rx.try_recv() {
             if let Some((bytes, has_alpha, rowstride, pixel_hash)) = res_opt {
@@ -787,12 +868,8 @@ fn build_album_art_widget(_key: &str, thumb_url: &str) -> Box {
                 };
                 let mem_tex = gtk4::gdk::MemoryTexture::new(36, 36, fmt, &bytes, rowstride);
                 let texture: gtk4::gdk::Texture = mem_tex.upcast();
-                TEXTURE_RAM_CACHE.with(|cache| {
-                    cache.borrow_mut().insert(pixel_hash, texture.clone());
-                });
-                if let Some(i) = img_weak.upgrade() {
-                    i.set_paintable(Some(&texture));
-                }
+                cache_insert_texture(pixel_hash, texture.clone());
+                i.set_paintable(Some(&texture));
             }
             return glib::ControlFlow::Break;
         }
@@ -3048,70 +3125,101 @@ fn append_single_track_row(
     });
 
     if track.kind == MediaKind::Song {
-        let popover = Popover::builder().css_classes(vec!["fav-popover".to_string()]).autohide(true).build();
-        popover.set_parent(&row_box);
-
-        let menu_box = Box::builder().orientation(Orientation::Vertical).spacing(4).build();
-        let play_next_btn = Button::builder().label("Play Next").css_classes(vec!["fav-hide-btn".to_string()]).build();
-        let add_queue_btn = Button::builder().label("Add to Queue").css_classes(vec!["fav-hide-btn".to_string()]).build();
-        menu_box.append(&play_next_btn);
-        menu_box.append(&add_queue_btn);
-        popover.set_child(Some(&menu_box));
-
         let right_click = GestureClick::builder().button(3).build();
-        let pop_open = popover.clone();
-        right_click.connect_pressed(move |_, _, _, _| pop_open.popup());
+        let row_weak = row_box.downgrade();
+        let track_ctx = track.clone();
+        let player_ctx = player.clone();
+        let title_ctx = np_title.clone();
+        let artist_ctx = np_artist.clone();
+        let pp_ctx = pp_btn.clone();
+        let dur_ctx = dur_lbl.clone();
+        let orig_dur_ctx = track.duration_str.clone();
+        let refresh_q_ctx = refresh_queue_ui.clone();
+
+        right_click.connect_pressed(move |_, _, _, _| {
+            let Some(parent_row) = row_weak.upgrade() else {
+                return;
+            };
+
+            let popover = Popover::builder()
+                .css_classes(vec!["fav-popover".to_string()])
+                .autohide(true)
+                .build();
+            popover.set_parent(&parent_row);
+
+            popover.connect_closed(|p| {
+                let p_weak = p.downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(pop) = p_weak.upgrade() {
+                        pop.unparent();
+                    }
+                });
+            });
+
+            let menu_box = Box::builder().orientation(Orientation::Vertical).spacing(4).build();
+            let play_next_btn = Button::builder().label("Play Next").css_classes(vec!["fav-hide-btn".to_string()]).build();
+            let add_queue_btn = Button::builder().label("Add to Queue").css_classes(vec!["fav-hide-btn".to_string()]).build();
+            menu_box.append(&play_next_btn);
+            menu_box.append(&add_queue_btn);
+            popover.set_child(Some(&menu_box));
+
+            let track_pn = track_ctx.clone();
+            let player_pn = player_ctx.clone();
+            let title_pn = title_ctx.clone();
+            let artist_pn = artist_ctx.clone();
+            let pp_pn = pp_ctx.clone();
+            let dur_pn = dur_ctx.clone();
+            let orig_dur_pn = orig_dur_ctx.clone();
+            let pop_pn = popover.downgrade();
+            let refresh_q_pn = refresh_q_ctx.clone();
+
+            play_next_btn.connect_clicked(move |_| {
+                if let Some(p) = pop_pn.upgrade() {
+                    p.popdown();
+                }
+                let started = player_pn.borrow_mut().play_next_in_queue(track_pn.clone());
+                if let Some(started_track) = started {
+                    title_pn.set_label(&started_track.title);
+                    artist_pn.set_label(&started_track.uploader);
+                    pp_pn.set_label("Pause");
+                }
+                refresh_q_pn();
+                dur_pn.set_label("Next!");
+                let dur_reset = dur_pn.clone();
+                let orig = orig_dur_pn.clone();
+                glib::timeout_add_local_once(Duration::from_millis(1000), move || dur_reset.set_label(&orig));
+            });
+
+            let track_aq = track_ctx.clone();
+            let player_aq = player_ctx.clone();
+            let title_aq = title_ctx.clone();
+            let artist_aq = artist_ctx.clone();
+            let pp_aq = pp_ctx.clone();
+            let dur_aq = dur_ctx.clone();
+            let orig_dur_aq = orig_dur_ctx.clone();
+            let pop_aq = popover.downgrade();
+            let refresh_q_aq = refresh_q_ctx.clone();
+
+            add_queue_btn.connect_clicked(move |_| {
+                if let Some(p) = pop_aq.upgrade() {
+                    p.popdown();
+                }
+                let started = player_aq.borrow_mut().add_to_queue(track_aq.clone());
+                if let Some(started_track) = started {
+                    title_aq.set_label(&started_track.title);
+                    artist_aq.set_label(&started_track.uploader);
+                    pp_aq.set_label("Pause");
+                }
+                refresh_q_aq();
+                dur_aq.set_label("Queued!");
+                let dur_reset = dur_aq.clone();
+                let orig = orig_dur_aq.clone();
+                glib::timeout_add_local_once(Duration::from_millis(1000), move || dur_reset.set_label(&orig));
+            });
+
+            popover.popup();
+        });
         btn.add_controller(right_click);
-
-        let track_pn = track.clone();
-        let player_pn = player.clone();
-        let title_pn = np_title.clone();
-        let artist_pn = np_artist.clone();
-        let pp_pn = pp_btn.clone();
-        let dur_pn = dur_lbl.clone();
-        let orig_dur_pn = track.duration_str.clone();
-        let pop_pn = popover.clone();
-        let refresh_q_pn = refresh_queue_ui.clone();
-
-        play_next_btn.connect_clicked(move |_| {
-            pop_pn.popdown();
-            let started = player_pn.borrow_mut().play_next_in_queue(track_pn.clone());
-            if let Some(started_track) = started {
-                title_pn.set_label(&started_track.title);
-                artist_pn.set_label(&started_track.uploader);
-                pp_pn.set_label("Pause");
-            }
-            refresh_q_pn();
-            dur_pn.set_label("Next!");
-            let dur_reset = dur_pn.clone();
-            let orig = orig_dur_pn.clone();
-            glib::timeout_add_local_once(Duration::from_millis(1000), move || dur_reset.set_label(&orig));
-        });
-
-        let track_aq = track.clone();
-        let player_aq = player.clone();
-        let title_aq = np_title.clone();
-        let artist_aq = np_artist.clone();
-        let pp_aq = pp_btn.clone();
-        let dur_aq = dur_lbl.clone();
-        let orig_dur_aq = track.duration_str.clone();
-        let pop_aq = popover.clone();
-        let refresh_q_aq = refresh_queue_ui.clone();
-
-        add_queue_btn.connect_clicked(move |_| {
-            pop_aq.popdown();
-            let started = player_aq.borrow_mut().add_to_queue(track_aq.clone());
-            if let Some(started_track) = started {
-                title_aq.set_label(&started_track.title);
-                artist_aq.set_label(&started_track.uploader);
-                pp_aq.set_label("Pause");
-            }
-            refresh_q_aq();
-            dur_aq.set_label("Queued!");
-            let dur_reset = dur_aq.clone();
-            let orig = orig_dur_aq.clone();
-            glib::timeout_add_local_once(Duration::from_millis(1000), move || dur_reset.set_label(&orig));
-        });
     }
 
     row_box.append(&btn);

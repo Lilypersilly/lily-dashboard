@@ -222,6 +222,21 @@ fn load_installed_apps() -> Vec<AppEntry> {
     apps
 }
 
+/// Runs on dashboard startup so configured Preload Apps warm up in RAM even while
+/// the Run tab UI itself is lazily constructed on demand.
+pub fn preload_configured_apps() {
+    let cfg = load_config();
+    if cfg.preloaded_apps.is_empty() {
+        return;
+    }
+    let installed = load_installed_apps();
+    for app in installed {
+        if cfg.preloaded_apps.contains(&app.name) {
+            preload_app_in_background(app);
+        }
+    }
+}
+
 pub fn build_launcher_ui<F>(popover_guard: Rc<Cell<usize>>, on_launch: F) -> LauncherUi
 where
     F: Fn() + 'static,
@@ -262,13 +277,6 @@ where
 
     let installed = load_installed_apps();
     let cfg = load_config();
-
-    // Automatically pre-warm all configured Preload Apps right on dashboard startup!
-    for app in &installed {
-        if cfg.preloaded_apps.contains(&app.name) {
-            preload_app_in_background(app.clone());
-        }
-    }
 
     let apps = Rc::new(RefCell::new(installed));
     let pinned = Rc::new(RefCell::new(cfg.pinned_apps));
@@ -557,167 +565,199 @@ fn build_app_row(
         launch_cb();
     });
 
-    // Right-Click Context Menu: Pin App | Preload in RAM | Launch on Workspace 1..5
-    let popover = Popover::builder()
-        .css_classes(vec!["fav-popover".to_string()])
-        .autohide(true)
-        .build();
-    popover.set_parent(&row_box);
+    // Lazily build Right-Click Context Menu on demand and unparent on close to avoid
+    // allocating hundreds of Popovers upfront and prevent GTK reference-cycle leaks.
+    let right_click = GestureClick::builder().button(3).build();
+    let row_weak = row_box.downgrade();
+    let app_ctx = app.clone();
+    let container_ctx = container.clone();
+    let apps_ctx = apps_rc.clone();
+    let pinned_ctx = pinned_rc.clone();
+    let preloaded_ctx = preloaded_rc.clone();
+    let query_ctx = query.to_string();
+    let guard_ctx = popover_guard.clone();
+    let launch_ctx = on_launch.clone();
 
-    let guard_map = popover_guard.clone();
-    popover.connect_map(move |_| {
-        guard_map.set(guard_map.get() + 1);
-    });
-    let guard_unmap = popover_guard.clone();
-    popover.connect_unmap(move |_| {
-        let g = guard_unmap.clone();
-        glib::timeout_add_local_once(Duration::from_millis(150), move || {
-            g.set(g.get().saturating_sub(1));
+    right_click.connect_pressed(move |_, _, _, _| {
+        let Some(parent_row) = row_weak.upgrade() else {
+            return;
+        };
+
+        let popover = Popover::builder()
+            .css_classes(vec!["fav-popover".to_string()])
+            .autohide(true)
+            .build();
+        popover.set_parent(&parent_row);
+
+        popover.connect_closed(|p| {
+            let p_weak = p.downgrade();
+            glib::idle_add_local_once(move || {
+                if let Some(pop) = p_weak.upgrade() {
+                    pop.unparent();
+                }
+            });
         });
-    });
 
-    let menu_box = Box::builder()
-        .orientation(Orientation::Vertical)
-        .spacing(4)
-        .build();
+        let guard_map = guard_ctx.clone();
+        popover.connect_map(move |_| {
+            guard_map.set(guard_map.get() + 1);
+        });
+        let guard_unmap = guard_ctx.clone();
+        popover.connect_unmap(move |_| {
+            let g = guard_unmap.clone();
+            glib::timeout_add_local_once(Duration::from_millis(150), move || {
+                g.set(g.get().saturating_sub(1));
+            });
+        });
 
-    let pin_btn = Button::builder()
-        .label(if is_pinned { "Unpin App" } else { "Pin App to Top" })
-        .css_classes(vec!["fav-hide-btn".to_string()])
-        .build();
-
-    let preload_btn = Button::builder()
-        .label(if is_preloaded {
-            "Remove from Preload"
-        } else {
-            "Preload in Background"
-        })
-        .css_classes(vec!["fav-hide-btn".to_string()])
-        .build();
-
-    let ws_label = Label::builder()
-        .label("Open on Workspace:")
-        .css_classes(vec!["fav-score-badge".to_string()])
-        .margin_top(4)
-        .build();
-
-    let ws_row = Box::builder()
-        .orientation(Orientation::Horizontal)
-        .spacing(4)
-        .build();
-
-    for ws_num in 1..=5 {
-        let ws_btn = Button::builder()
-            .label(&format!("{}", ws_num))
-            .css_classes(vec!["plan-fmt-btn".to_string()])
+        let menu_box = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(4)
             .build();
 
-        let cmd_ws = app.exec_cmdline.clone();
-        let pop_ws = popover.clone();
-        ws_btn.connect_clicked(move |_| {
-            pop_ws.popdown();
-            let lua_dispatch = format!(
-                "hl.dsp.exec_cmd(\"[workspace {} silent] {}\")",
-                ws_num,
-                cmd_ws.replace('"', "\\\"")
-            );
-            let _ = Command::new("hyprctl")
-                .args(["dispatch", &lua_dispatch])
-                .spawn();
-        });
-        ws_row.append(&ws_btn);
-    }
+        let cur_pinned = pinned_ctx.borrow().contains(&app_ctx.name);
+        let cur_preloaded = preloaded_ctx.borrow().contains(&app_ctx.name);
 
-    menu_box.append(&pin_btn);
-    menu_box.append(&preload_btn);
-    menu_box.append(&ws_label);
-    menu_box.append(&ws_row);
-    popover.set_child(Some(&menu_box));
+        let pin_btn = Button::builder()
+            .label(if cur_pinned { "Unpin App" } else { "Pin App to Top" })
+            .css_classes(vec!["fav-hide-btn".to_string()])
+            .build();
 
-    let right_click = GestureClick::builder().button(3).build();
-    let pop_open = popover.clone();
-    right_click.connect_pressed(move |_, _, _, _| {
-        pop_open.popup();
+        let preload_btn = Button::builder()
+            .label(if cur_preloaded {
+                "Remove from Preload"
+            } else {
+                "Preload in Background"
+            })
+            .css_classes(vec!["fav-hide-btn".to_string()])
+            .build();
+
+        let ws_label = Label::builder()
+            .label("Open on Workspace:")
+            .css_classes(vec!["fav-score-badge".to_string()])
+            .margin_top(4)
+            .build();
+
+        let ws_row = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(4)
+            .build();
+
+        for ws_num in 1..=5 {
+            let ws_btn = Button::builder()
+                .label(&format!("{}", ws_num))
+                .css_classes(vec!["plan-fmt-btn".to_string()])
+                .build();
+
+            let cmd_ws = app_ctx.exec_cmdline.clone();
+            let pop_ws = popover.downgrade();
+            ws_btn.connect_clicked(move |_| {
+                if let Some(p) = pop_ws.upgrade() {
+                    p.popdown();
+                }
+                let lua_dispatch = format!(
+                    "hl.dsp.exec_cmd(\"[workspace {} silent] {}\")",
+                    ws_num,
+                    cmd_ws.replace('"', "\\\"")
+                );
+                let _ = Command::new("hyprctl")
+                    .args(["dispatch", &lua_dispatch])
+                    .spawn();
+            });
+            ws_row.append(&ws_btn);
+        }
+
+        menu_box.append(&pin_btn);
+        menu_box.append(&preload_btn);
+        menu_box.append(&ws_label);
+        menu_box.append(&ws_row);
+        popover.set_child(Some(&menu_box));
+
+        // Pin button handler
+        {
+            let app_name = app_ctx.name.clone();
+            let container_pin = container_ctx.clone();
+            let apps_pin = apps_ctx.clone();
+            let pinned_pin = pinned_ctx.clone();
+            let preloaded_pin = preloaded_ctx.clone();
+            let query_pin = query_ctx.clone();
+            let guard_pin = guard_ctx.clone();
+            let launch_pin = launch_ctx.clone();
+            let pop_pin = popover.downgrade();
+
+            pin_btn.connect_clicked(move |_| {
+                if let Some(p) = pop_pin.upgrade() {
+                    p.popdown();
+                }
+                {
+                    let mut set = pinned_pin.borrow_mut();
+                    if set.contains(&app_name) {
+                        set.remove(&app_name);
+                    } else {
+                        set.insert(app_name.clone());
+                    }
+                    save_config(&set, &preloaded_pin.borrow());
+                }
+                populate_app_list(
+                    &container_pin,
+                    &apps_pin,
+                    &pinned_pin,
+                    &preloaded_pin,
+                    &query_pin,
+                    &guard_pin,
+                    &launch_pin,
+                );
+            });
+        }
+
+        // Preload button handler
+        {
+            let app_clone = app_ctx.clone();
+            let container_pre = container_ctx.clone();
+            let apps_pre = apps_ctx.clone();
+            let pinned_pre = pinned_ctx.clone();
+            let preloaded_pre = preloaded_ctx.clone();
+            let query_pre = query_ctx.clone();
+            let guard_pre = guard_ctx.clone();
+            let launch_pre = launch_ctx.clone();
+            let pop_pre = popover.downgrade();
+
+            preload_btn.connect_clicked(move |_| {
+                if let Some(p) = pop_pre.upgrade() {
+                    p.popdown();
+                }
+                let added = {
+                    let mut set = preloaded_pre.borrow_mut();
+                    let is_added = if set.contains(&app_clone.name) {
+                        set.remove(&app_clone.name);
+                        false
+                    } else {
+                        set.insert(app_clone.name.clone());
+                        true
+                    };
+                    save_config(&pinned_pre.borrow(), &set);
+                    is_added
+                };
+
+                if added {
+                    preload_app_in_background(app_clone.clone());
+                }
+
+                populate_app_list(
+                    &container_pre,
+                    &apps_pre,
+                    &pinned_pre,
+                    &preloaded_pre,
+                    &query_pre,
+                    &guard_pre,
+                    &launch_pre,
+                );
+            });
+        }
+
+        popover.popup();
     });
     btn.add_controller(right_click);
-
-    // Pin button handler
-    {
-        let app_name = app.name.clone();
-        let container_pin = container.clone();
-        let apps_pin = apps_rc.clone();
-        let pinned_pin = pinned_rc.clone();
-        let preloaded_pin = preloaded_rc.clone();
-        let query_pin = query.to_string();
-        let guard_pin = popover_guard.clone();
-        let launch_pin = on_launch.clone();
-        let pop_pin = popover.clone();
-
-        pin_btn.connect_clicked(move |_| {
-            pop_pin.popdown();
-            {
-                let mut set = pinned_pin.borrow_mut();
-                if set.contains(&app_name) {
-                    set.remove(&app_name);
-                } else {
-                    set.insert(app_name.clone());
-                }
-                save_config(&set, &preloaded_pin.borrow());
-            }
-            populate_app_list(
-                &container_pin,
-                &apps_pin,
-                &pinned_pin,
-                &preloaded_pin,
-                &query_pin,
-                &guard_pin,
-                &launch_pin,
-            );
-        });
-    }
-
-    // Preload button handler
-    {
-        let app_clone = app.clone();
-        let container_pre = container.clone();
-        let apps_pre = apps_rc.clone();
-        let pinned_pre = pinned_rc.clone();
-        let preloaded_pre = preloaded_rc.clone();
-        let query_pre = query.to_string();
-        let guard_pre = popover_guard.clone();
-        let launch_pre = on_launch.clone();
-        let pop_pre = popover.clone();
-
-        preload_btn.connect_clicked(move |_| {
-            pop_pre.popdown();
-            let added = {
-                let mut set = preloaded_pre.borrow_mut();
-                let is_added = if set.contains(&app_clone.name) {
-                    set.remove(&app_clone.name);
-                    false
-                } else {
-                    set.insert(app_clone.name.clone());
-                    true
-                };
-                save_config(&pinned_pre.borrow(), &set);
-                is_added
-            };
-
-            if added {
-                preload_app_in_background(app_clone.clone());
-            }
-
-            populate_app_list(
-                &container_pre,
-                &apps_pre,
-                &pinned_pre,
-                &preloaded_pre,
-                &query_pre,
-                &guard_pre,
-                &launch_pre,
-            );
-        });
-    }
 
     row_box.append(&btn);
     row_box

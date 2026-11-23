@@ -25,11 +25,23 @@ struct FavoritesConfig {
     saved_scores: HashMap<String, u32>,
 }
 
+pub struct FavoritesUi {
+    pub root: Box,
+    set_active_cb: Rc<dyn Fn(bool)>,
+}
+
+impl FavoritesUi {
+    pub fn set_active(&self, active: bool) {
+        (self.set_active_cb)(active);
+    }
+}
+
 pub struct FavoritesState {
     scores: HashMap<PathBuf, u32>,
     ignored: HashSet<String>,
     pinned: HashSet<String>,
     search_query: String,
+    is_active: bool,
     list_container: Box,
     popover_guard: Rc<Cell<usize>>,
 }
@@ -139,7 +151,7 @@ impl FavoritesState {
     }
 }
 
-pub fn build_favorites_ui(popover_guard: Rc<Cell<usize>>) -> Box {
+pub fn build_favorites_ui(popover_guard: Rc<Cell<usize>>) -> FavoritesUi {
     let root = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(8)
@@ -178,6 +190,7 @@ pub fn build_favorites_ui(popover_guard: Rc<Cell<usize>>) -> Box {
         ignored: cfg.ignored_paths,
         pinned: cfg.pinned_paths,
         search_query: String::new(),
+        is_active: false,
         list_container,
         popover_guard,
     }));
@@ -186,7 +199,6 @@ pub fn build_favorites_ui(popover_guard: Rc<Cell<usize>>) -> Box {
         let mut st = state.borrow_mut();
         st.seed_initial_files(cfg.saved_scores);
     }
-    refresh_list(&state);
 
     let state_search = state.clone();
     search_entry.connect_search_changed(move |entry| {
@@ -204,13 +216,35 @@ pub fn build_favorites_ui(popover_guard: Rc<Cell<usize>>) -> Box {
                 st.record_event(path, 1, true);
             }
         }
+        let active = st.is_active;
         drop(st);
-        refresh_list(&state_recent);
+        if active {
+            refresh_list(&state_recent);
+        }
+    });
+
+    let state_active = state.clone();
+    let set_active_cb: Rc<dyn Fn(bool)> = Rc::new(move |active: bool| {
+        let changed = {
+            let mut st = state_active.borrow_mut();
+            if st.is_active == active {
+                false
+            } else {
+                st.is_active = active;
+                true
+            }
+        };
+        if changed {
+            refresh_list(&state_active);
+        }
     });
 
     start_notify_daemon(state);
 
-    root
+    FavoritesUi {
+        root,
+        set_active_cb,
+    }
 }
 
 fn start_notify_daemon(state: Rc<RefCell<FavoritesState>>) {
@@ -254,8 +288,14 @@ fn start_notify_daemon(state: Rc<RefCell<FavoritesState>>) {
             updated = true;
         }
         if updated {
-            state.borrow().save_config();
-            refresh_list(&state);
+            let active = {
+                let st = state.borrow();
+                st.save_config();
+                st.is_active
+            };
+            if active {
+                refresh_list(&state);
+            }
         }
         glib::ControlFlow::Continue
     });
@@ -267,6 +307,10 @@ pub fn refresh_list(state_rc: &Rc<RefCell<FavoritesState>>) {
 
         while let Some(child) = state.list_container.first_child() {
             state.list_container.remove(&child);
+        }
+
+        if !state.is_active {
+            return;
         }
 
         let mut groups: BTreeMap<String, Vec<(PathBuf, String, u32, bool)>> = BTreeMap::new();
@@ -406,87 +450,110 @@ fn build_file_row(
         }
     });
 
-    // Right-click Context Menu Popover
-    let popover = Popover::builder()
-        .css_classes(vec!["fav-popover".to_string()])
-        .autohide(true)
-        .build();
-    popover.set_parent(&row_box);
-
-    let guard = state_rc.borrow().popover_guard.clone();
-    let guard_map = guard.clone();
-    popover.connect_map(move |_| {
-        guard_map.set(guard_map.get() + 1);
-    });
-    let guard_unmap = guard.clone();
-    popover.connect_unmap(move |_| {
-        let g = guard_unmap.clone();
-        glib::timeout_add_local_once(Duration::from_millis(150), move || {
-            g.set(g.get().saturating_sub(1));
-        });
-    });
-
-    let menu_box = Box::builder()
-        .orientation(Orientation::Vertical)
-        .spacing(4)
-        .build();
-
-    let pin_btn = Button::builder()
-        .label(if is_pinned { "Unpin" } else { "Pin to Top" })
-        .css_classes(vec!["fav-hide-btn".to_string()])
-        .build();
-
-    let folder_btn = Button::builder()
-        .label("Open Containing Folder")
-        .css_classes(vec!["fav-hide-btn".to_string()])
-        .build();
-
-    let hide_btn = Button::builder()
-        .label("Hide from Favorites")
-        .css_classes(vec!["plan-delete-menu-btn".to_string()])
-        .build();
-
-    menu_box.append(&pin_btn);
-    menu_box.append(&folder_btn);
-    menu_box.append(&hide_btn);
-    popover.set_child(Some(&menu_box));
-
+    // Lazily build Right-click Context Menu Popover on demand & unparent on close
     let right_click = GestureClick::builder().button(3).build();
-    let pop_clone = popover.clone();
+    let row_weak = row_box.downgrade();
+    let state_ctx = state_rc.clone();
+    let path_str = path.to_string_lossy().to_string();
+    let parent_dir = path.parent().map(|p| p.to_path_buf());
+
     right_click.connect_pressed(move |_, _, _, _| {
-        pop_clone.popup();
+        let Some(parent_row) = row_weak.upgrade() else {
+            return;
+        };
+
+        let popover = Popover::builder()
+            .css_classes(vec!["fav-popover".to_string()])
+            .autohide(true)
+            .build();
+        popover.set_parent(&parent_row);
+
+        popover.connect_closed(|p| {
+            let p_weak = p.downgrade();
+            glib::idle_add_local_once(move || {
+                if let Some(pop) = p_weak.upgrade() {
+                    pop.unparent();
+                }
+            });
+        });
+
+        let guard = state_ctx.borrow().popover_guard.clone();
+        let guard_map = guard.clone();
+        popover.connect_map(move |_| {
+            guard_map.set(guard_map.get() + 1);
+        });
+        let guard_unmap = guard;
+        popover.connect_unmap(move |_| {
+            let g = guard_unmap.clone();
+            glib::timeout_add_local_once(Duration::from_millis(150), move || {
+                g.set(g.get().saturating_sub(1));
+            });
+        });
+
+        let menu_box = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(4)
+            .build();
+
+        let pin_btn = Button::builder()
+            .label(if is_pinned { "Unpin" } else { "Pin to Top" })
+            .css_classes(vec!["fav-hide-btn".to_string()])
+            .build();
+
+        let folder_btn = Button::builder()
+            .label("Open Containing Folder")
+            .css_classes(vec!["fav-hide-btn".to_string()])
+            .build();
+
+        let hide_btn = Button::builder()
+            .label("Hide from Favorites")
+            .css_classes(vec!["plan-delete-menu-btn".to_string()])
+            .build();
+
+        menu_box.append(&pin_btn);
+        menu_box.append(&folder_btn);
+        menu_box.append(&hide_btn);
+        popover.set_child(Some(&menu_box));
+
+        let path_pin = path_str.clone();
+        let state_pin = state_ctx.clone();
+        let pop_pin = popover.downgrade();
+        pin_btn.connect_clicked(move |_| {
+            if let Some(p) = pop_pin.upgrade() {
+                p.popdown();
+            }
+            state_pin.borrow_mut().toggle_pin(path_pin.clone());
+            refresh_list(&state_pin);
+        });
+
+        let parent_dir_c = parent_dir.clone();
+        let pop_folder = popover.downgrade();
+        folder_btn.connect_clicked(move |_| {
+            if let Some(p) = pop_folder.upgrade() {
+                p.popdown();
+            }
+            if let Some(ref dir) = parent_dir_c {
+                if let Ok(uri) = glib::filename_to_uri(dir, None) {
+                    let _ =
+                        gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+                }
+            }
+        });
+
+        let path_hide = path_str.clone();
+        let state_hide = state_ctx.clone();
+        let pop_hide = popover.downgrade();
+        hide_btn.connect_clicked(move |_| {
+            if let Some(p) = pop_hide.upgrade() {
+                p.popdown();
+            }
+            state_hide.borrow_mut().ignore_file(path_hide.clone());
+            refresh_list(&state_hide);
+        });
+
+        popover.popup();
     });
     btn.add_controller(right_click);
-
-    let path_str = path.to_string_lossy().to_string();
-
-    let path_pin = path_str.clone();
-    let state_pin = state_rc.clone();
-    let pop_pin = popover.clone();
-    pin_btn.connect_clicked(move |_| {
-        pop_pin.popdown();
-        state_pin.borrow_mut().toggle_pin(path_pin.clone());
-        refresh_list(&state_pin);
-    });
-
-    let parent_dir = path.parent().map(|p| p.to_path_buf());
-    let pop_folder = popover.clone();
-    folder_btn.connect_clicked(move |_| {
-        pop_folder.popdown();
-        if let Some(ref dir) = parent_dir {
-            if let Ok(uri) = glib::filename_to_uri(dir, None) {
-                let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
-            }
-        }
-    });
-
-    let state_hide = state_rc.clone();
-    let pop_hide = popover.clone();
-    hide_btn.connect_clicked(move |_| {
-        pop_hide.popdown();
-        state_hide.borrow_mut().ignore_file(path_str.clone());
-        refresh_list(&state_hide);
-    });
 
     row_box.append(&btn);
     row_box

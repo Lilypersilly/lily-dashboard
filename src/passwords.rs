@@ -513,127 +513,156 @@ fn populate_password_list(
             });
         });
 
-        // Right-Click Context Menu: Copy Username | Copy Password | Show/Hide | Delete
-        let popover = Popover::builder()
-            .css_classes(vec!["fav-popover".to_string()])
-            .autohide(true)
-            .build();
-        popover.set_parent(&row_box);
-
-        let guard_map = popover_guard.clone();
-        popover.connect_map(move |_| {
-            guard_map.set(guard_map.get() + 1);
-        });
-        let guard_unmap = popover_guard.clone();
-        popover.connect_unmap(move |_| {
-            let g = guard_unmap.clone();
-            glib::timeout_add_local_once(Duration::from_millis(150), move || {
-                g.set(g.get().saturating_sub(1));
-            });
-        });
-
-        let menu_box = Box::builder()
-            .orientation(Orientation::Vertical)
-            .spacing(4)
-            .build();
-
-        let copy_user_btn = Button::builder()
-            .label("Copy Username")
-            .css_classes(vec!["fav-hide-btn".to_string()])
-            .build();
-
-        let copy_pass_btn = Button::builder()
-            .label("Copy Password")
-            .css_classes(vec!["fav-hide-btn".to_string()])
-            .build();
-
-        let reveal_btn = Button::builder()
-            .label(if is_revealed {
-                "Hide Password"
-            } else {
-                "Show Password"
-            })
-            .css_classes(vec!["fav-hide-btn".to_string()])
-            .build();
-
-        let delete_btn = Button::builder()
-            .label("Delete Login")
-            .css_classes(vec!["plan-delete-menu-btn".to_string()])
-            .build();
-
-        menu_box.append(&copy_user_btn);
-        menu_box.append(&copy_pass_btn);
-        menu_box.append(&reveal_btn);
-        menu_box.append(&delete_btn);
-        popover.set_child(Some(&menu_box));
-
+        // Lazily build Right-Click Context Menu on demand & unparent on close
         let right_click = GestureClick::builder().button(3).build();
-        let pop_open = popover.clone();
+        let row_weak = row_box.downgrade();
+        let guard_ctx = popover_guard.clone();
+        let usr_ctx = item.username.clone();
+        let pwd_ctx = item.password.clone();
+        let status_ctx = status_lbl.clone();
+        let idx = item.line_idx;
+        let rev_ctx = revealed_set.clone();
+        let cont_ctx = container.clone();
+        let query_ctx = query.to_string();
+
         right_click.connect_pressed(move |_, _, _, _| {
-            pop_open.popup();
+            let Some(parent_row) = row_weak.upgrade() else {
+                return;
+            };
+
+            let popover = Popover::builder()
+                .css_classes(vec!["fav-popover".to_string()])
+                .autohide(true)
+                .build();
+            popover.set_parent(&parent_row);
+
+            popover.connect_closed(|p| {
+                let p_weak = p.downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(pop) = p_weak.upgrade() {
+                        pop.unparent();
+                    }
+                });
+            });
+
+            let guard_map = guard_ctx.clone();
+            popover.connect_map(move |_| {
+                guard_map.set(guard_map.get() + 1);
+            });
+            let guard_unmap = guard_ctx.clone();
+            popover.connect_unmap(move |_| {
+                let g = guard_unmap.clone();
+                glib::timeout_add_local_once(Duration::from_millis(150), move || {
+                    g.set(g.get().saturating_sub(1));
+                });
+            });
+
+            let menu_box = Box::builder()
+                .orientation(Orientation::Vertical)
+                .spacing(4)
+                .build();
+
+            let copy_user_btn = Button::builder()
+                .label("Copy Username")
+                .css_classes(vec!["fav-hide-btn".to_string()])
+                .build();
+
+            let copy_pass_btn = Button::builder()
+                .label("Copy Password")
+                .css_classes(vec!["fav-hide-btn".to_string()])
+                .build();
+
+            let reveal_btn = Button::builder()
+                .label(if is_revealed {
+                    "Hide Password"
+                } else {
+                    "Show Password"
+                })
+                .css_classes(vec!["fav-hide-btn".to_string()])
+                .build();
+
+            let delete_btn = Button::builder()
+                .label("Delete Login")
+                .css_classes(vec!["plan-delete-menu-btn".to_string()])
+                .build();
+
+            menu_box.append(&copy_user_btn);
+            menu_box.append(&copy_pass_btn);
+            menu_box.append(&reveal_btn);
+            menu_box.append(&delete_btn);
+            popover.set_child(Some(&menu_box));
+
+            // 1. Copy Username
+            let usr_str = usr_ctx.clone();
+            let pop_usr = popover.downgrade();
+            let status_usr = status_ctx.clone();
+            copy_user_btn.connect_clicked(move |_| {
+                if let Some(p) = pop_usr.upgrade() {
+                    p.popdown();
+                }
+                copy_to_clipboard(&usr_str);
+                status_usr.set_label("User Copied!");
+                let status_reset = status_usr.clone();
+                glib::timeout_add_local_once(Duration::from_millis(1200), move || {
+                    status_reset.set_label("Copy");
+                });
+            });
+
+            // 2. Copy Password
+            let pwd_str = pwd_ctx.clone();
+            let pop_pwd = popover.downgrade();
+            let status_pwd = status_ctx.clone();
+            copy_pass_btn.connect_clicked(move |_| {
+                if let Some(p) = pop_pwd.upgrade() {
+                    p.popdown();
+                }
+                copy_to_clipboard(&pwd_str);
+                status_pwd.set_label("Copied!");
+                let status_reset = status_pwd.clone();
+                glib::timeout_add_local_once(Duration::from_millis(1200), move || {
+                    status_reset.set_label("Copy");
+                });
+            });
+
+            // 3. Show / Hide Password
+            let rev_toggle = rev_ctx.clone();
+            let cont_rev = cont_ctx.clone();
+            let query_rev = query_ctx.clone();
+            let guard_rev = guard_ctx.clone();
+            let pop_rev = popover.downgrade();
+            reveal_btn.connect_clicked(move |_| {
+                if let Some(p) = pop_rev.upgrade() {
+                    p.popdown();
+                }
+                {
+                    let mut set = rev_toggle.borrow_mut();
+                    if set.contains(&idx) {
+                        set.remove(&idx);
+                    } else {
+                        set.insert(idx);
+                    }
+                }
+                populate_password_list(&cont_rev, &query_rev, &rev_toggle, &guard_rev);
+            });
+
+            // 4. Delete Login
+            let cont_del = cont_ctx.clone();
+            let query_del = query_ctx.clone();
+            let rev_del = rev_ctx.clone();
+            let guard_del = guard_ctx.clone();
+            let pop_del = popover.downgrade();
+            delete_btn.connect_clicked(move |_| {
+                if let Some(p) = pop_del.upgrade() {
+                    p.popdown();
+                }
+                delete_entry(idx);
+                rev_del.borrow_mut().remove(&idx);
+                populate_password_list(&cont_del, &query_del, &rev_del, &guard_del);
+            });
+
+            popover.popup();
         });
         btn.add_controller(right_click);
-
-        // 1. Copy Username
-        let usr_str = item.username.clone();
-        let pop_usr = popover.clone();
-        let status_usr = status_lbl.clone();
-        copy_user_btn.connect_clicked(move |_| {
-            pop_usr.popdown();
-            copy_to_clipboard(&usr_str);
-            status_usr.set_label("User Copied!");
-            let status_reset = status_usr.clone();
-            glib::timeout_add_local_once(Duration::from_millis(1200), move || {
-                status_reset.set_label("Copy");
-            });
-        });
-
-        // 2. Copy Password
-        let pwd_str = item.password.clone();
-        let pop_pwd = popover.clone();
-        let status_pwd = status_lbl.clone();
-        copy_pass_btn.connect_clicked(move |_| {
-            pop_pwd.popdown();
-            copy_to_clipboard(&pwd_str);
-            status_pwd.set_label("Copied!");
-            let status_reset = status_pwd.clone();
-            glib::timeout_add_local_once(Duration::from_millis(1200), move || {
-                status_reset.set_label("Copy");
-            });
-        });
-
-        // 3. Show / Hide Password
-        let idx = item.line_idx;
-        let rev_toggle = revealed_set.clone();
-        let cont_rev = container.clone();
-        let query_rev = query.to_string();
-        let guard_rev = popover_guard.clone();
-        let pop_rev = popover.clone();
-        reveal_btn.connect_clicked(move |_| {
-            pop_rev.popdown();
-            {
-                let mut set = rev_toggle.borrow_mut();
-                if set.contains(&idx) {
-                    set.remove(&idx);
-                } else {
-                    set.insert(idx);
-                }
-            }
-            populate_password_list(&cont_rev, &query_rev, &rev_toggle, &guard_rev);
-        });
-
-        // 4. Delete Login
-        let cont_del = container.clone();
-        let query_del = query.to_string();
-        let rev_del = revealed_set.clone();
-        let guard_del = popover_guard.clone();
-        let pop_del = popover.clone();
-        delete_btn.connect_clicked(move |_| {
-            pop_del.popdown();
-            delete_entry(idx);
-            rev_del.borrow_mut().remove(&idx);
-            populate_password_list(&cont_del, &query_del, &rev_del, &guard_del);
-        });
 
         row_box.append(&btn);
         container.append(&row_box);

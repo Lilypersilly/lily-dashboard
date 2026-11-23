@@ -467,10 +467,7 @@ fn build_ui(app: &Application) -> Button {
 
     let is_hovered = Rc::new(Cell::new(false));
     let is_open = Rc::new(Cell::new(false));
-    let is_expanded = Rc::new(Cell::new(false));
     let is_closing = Rc::new(Cell::new(false));
-    let popover_guard = Rc::new(Cell::new(0usize));
-
     let popover_guard = Rc::new(Cell::new(0usize));
 
     let plans_ui = plans::build_plans_ui(popover_guard.clone(), move |_expand| {
@@ -481,7 +478,7 @@ fn build_ui(app: &Application) -> Button {
     stack.add_titled(&plans_ui.list_view, Some("plans"), "Plans");
 
     let favs_ui = favorites::build_favorites_ui(popover_guard.clone());
-    stack.add_titled(&favs_ui, Some("favs"), "Favorites");
+    stack.add_titled(&favs_ui.root, Some("favs"), "Favorites");
 
     let trigger_wrapper = Box::builder()
         .css_classes(vec!["trigger-wrapper".to_string()])
@@ -496,32 +493,115 @@ fn build_ui(app: &Application) -> Button {
 
     trigger_wrapper.append(&trigger_btn);
 
-    let btn_on_launch = trigger_btn.clone();
-    let open_on_launch = is_open.clone();
-    let launcher_ui = launcher::build_launcher_ui(popover_guard.clone(), move || {
-        if open_on_launch.get() {
-            btn_on_launch.emit_clicked();
-        }
-    });
-    stack.add_titled(&launcher_ui.root, Some("run"), "Run");
+    // Keep background app RAM-preloading on startup without building Run UI widgets until opened
+    launcher::preload_configured_apps();
 
-    let passwords_ui = passwords::build_passwords_ui(popover_guard.clone());
-    stack.add_titled(&passwords_ui, Some("passwords"), "Passwords");
+    let make_lazy_slot = || {
+        Box::builder()
+            .orientation(Orientation::Vertical)
+            .hexpand(true)
+            .vexpand(true)
+            .build()
+    };
 
-    let drive_ui = drive::build_drive_ui();
-    stack.add_titled(&drive_ui, Some("drive"), "Drive");
-    let locker_ui = locker::build_locker_ui(popover_guard.clone());
-    stack.add_titled(&locker_ui, Some("locker"), "Locker");
+    let run_slot = make_lazy_slot();
+    stack.add_titled(&run_slot, Some("run"), "Run");
+
+    let passwords_slot = make_lazy_slot();
+    stack.add_titled(&passwords_slot, Some("passwords"), "Passwords");
+
+    let drive_slot = make_lazy_slot();
+    stack.add_titled(&drive_slot, Some("drive"), "Drive");
+
+    let locker_slot = make_lazy_slot();
+    stack.add_titled(&locker_slot, Some("locker"), "Locker");
+
+    let music_slot = make_lazy_slot();
+    let timers_slot = make_lazy_slot();
+
+    let run_search_slot: Rc<RefCell<Option<gtk4::SearchEntry>>> = Rc::new(RefCell::new(None));
 
     let detail_tab = plans_ui.detail_view.clone();
-    let run_search = launcher_ui.search_entry.clone();
+    let guard_lazy = popover_guard.clone();
+    let btn_on_launch = trigger_btn.clone();
+    let open_on_launch = is_open.clone();
+    let run_slot_c = run_slot.clone();
+    let passwords_slot_c = passwords_slot.clone();
+    let drive_slot_c = drive_slot.clone();
+    let locker_slot_c = locker_slot.clone();
+    let music_slot_c = music_slot.clone();
+    let timers_slot_c = timers_slot.clone();
+    let run_search_c = run_search_slot.clone();
+
     stack.connect_visible_child_name_notify(move |stk| {
         let current = stk.visible_child_name();
-        if current.as_deref() != Some("plans") {
+        let name = current.as_deref();
+
+        if name != Some("plans") {
             detail_tab.set_visible(false);
         }
-        if current.as_deref() == Some("run") {
-            run_search.grab_focus();
+
+        // Only keep Favorites row widgets built while Favorites is the active tab
+        favs_ui.set_active(name == Some("favs"));
+
+        // Unload stateless tabs when switching away so unused modules don't sit in RAM
+        if name != Some("run") {
+            *run_search_c.borrow_mut() = None;
+            while let Some(child) = run_slot_c.first_child() {
+                run_slot_c.remove(&child);
+            }
+        }
+        if name != Some("passwords") {
+            while let Some(child) = passwords_slot_c.first_child() {
+                passwords_slot_c.remove(&child);
+            }
+        }
+
+        match name {
+            Some("run") => {
+                if run_slot_c.first_child().is_none() {
+                    let btn_l = btn_on_launch.clone();
+                    let open_l = open_on_launch.clone();
+                    let launcher_ui = launcher::build_launcher_ui(guard_lazy.clone(), move || {
+                        if open_l.get() {
+                            btn_l.emit_clicked();
+                        }
+                    });
+                    run_slot_c.append(&launcher_ui.root);
+                    *run_search_c.borrow_mut() = Some(launcher_ui.search_entry);
+                }
+                if let Some(entry) = run_search_c.borrow().as_ref() {
+                    entry.grab_focus();
+                }
+            }
+            Some("passwords") => {
+                if passwords_slot_c.first_child().is_none() {
+                    passwords_slot_c.append(&passwords::build_passwords_ui(guard_lazy.clone()));
+                }
+            }
+            // Stateful tabs (active uploads, unlocked vault, playing music, active timers)
+            // are lazy-built on first visit and kept alive once opened.
+            Some("drive") => {
+                if drive_slot_c.first_child().is_none() {
+                    drive_slot_c.append(&drive::build_drive_ui());
+                }
+            }
+            Some("locker") => {
+                if locker_slot_c.first_child().is_none() {
+                    locker_slot_c.append(&locker::build_locker_ui(guard_lazy.clone()));
+                }
+            }
+            Some("music") => {
+                if music_slot_c.first_child().is_none() {
+                    music_slot_c.append(&music::build_music_ui());
+                }
+            }
+            Some("timers") => {
+                if timers_slot_c.first_child().is_none() {
+                    timers_slot_c.append(&timers::build_timers_ui());
+                }
+            }
+            _ => {}
         }
     });
 
@@ -542,11 +622,8 @@ fn build_ui(app: &Application) -> Button {
     dash_box.append(&stack_clamp);
     dash_box.append(&plans_ui.detail_view);
 
-    let music_ui = music::build_music_ui();
-    stack.add_titled(&music_ui, Some("music"), "Music");
-
-    let timers_ui = timers::build_timers_ui();
-    stack.add_titled(&timers_ui, Some("timers"), "Timers");
+    stack.add_titled(&music_slot, Some("music"), "Music");
+    stack.add_titled(&timers_slot, Some("timers"), "Timers");
 
     let win_motion = EventControllerMotion::new();
     let btn_motion = trigger_btn.clone();

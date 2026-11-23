@@ -420,131 +420,165 @@ fn populate_plan_buttons(
             expand_read(true);
         });
 
-        let popover = Popover::builder()
-            .css_classes(vec!["fav-popover".to_string()])
-            .autohide(true)
-            .build();
-        popover.set_parent(&row_box);
-
-        let guard_map = popover_guard.clone();
-        popover.connect_map(move |_| {
-            guard_map.set(guard_map.get() + 1);
-        });
-        let guard_unmap = popover_guard.clone();
-        popover.connect_unmap(move |_| {
-            let g = guard_unmap.clone();
-            glib::timeout_add_local_once(Duration::from_millis(150), move || {
-                g.set(g.get().saturating_sub(1));
-            });
-        });
-
-        let menu_box = Box::builder()
-            .orientation(Orientation::Vertical)
-            .spacing(4)
-            .build();
-
-        let edit_btn = Button::builder()
-            .label("Edit Plan")
-            .css_classes(vec!["fav-hide-btn".to_string()])
-            .build();
-
-        let rename_btn = Button::builder()
-            .label("Rename Plan")
-            .css_classes(vec!["fav-hide-btn".to_string()])
-            .build();
-
-        let copy_btn = Button::builder()
-            .label("Copy Plan")
-            .css_classes(vec!["fav-hide-btn".to_string()])
-            .build();
-
-        let delete_btn = Button::builder()
-            .label("Delete Plan")
-            .css_classes(vec!["plan-delete-menu-btn".to_string()])
-            .build();
-
-        menu_box.append(&edit_btn);
-        menu_box.append(&rename_btn);
-        menu_box.append(&copy_btn);
-        menu_box.append(&delete_btn);
-        popover.set_child(Some(&menu_box));
-
+        // Lazily build Right-Click Context Menu on demand & unparent on close
         let right_click = GestureClick::builder().button(3).build();
-        let pop_open = popover.clone();
+        let row_weak = row_box.downgrade();
+        let path_ctx = path.clone();
+        let files_ctx = files_box.clone();
+        let detail_ctx = detail_view.clone();
+        let guard_ctx = popover_guard.clone();
+        let expand_ctx = on_expand.clone();
+
         right_click.connect_pressed(move |_, _, _, _| {
-            pop_open.popup();
+            let Some(parent_row) = row_weak.upgrade() else {
+                return;
+            };
+
+            let popover = Popover::builder()
+                .css_classes(vec!["fav-popover".to_string()])
+                .autohide(true)
+                .build();
+            popover.set_parent(&parent_row);
+
+            popover.connect_closed(|p| {
+                let p_weak = p.downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(pop) = p_weak.upgrade() {
+                        pop.unparent();
+                    }
+                });
+            });
+
+            let guard_map = guard_ctx.clone();
+            popover.connect_map(move |_| {
+                guard_map.set(guard_map.get() + 1);
+            });
+            let guard_unmap = guard_ctx.clone();
+            popover.connect_unmap(move |_| {
+                let g = guard_unmap.clone();
+                glib::timeout_add_local_once(Duration::from_millis(150), move || {
+                    g.set(g.get().saturating_sub(1));
+                });
+            });
+
+            let menu_box = Box::builder()
+                .orientation(Orientation::Vertical)
+                .spacing(4)
+                .build();
+
+            let edit_btn = Button::builder()
+                .label("Edit Plan")
+                .css_classes(vec!["fav-hide-btn".to_string()])
+                .build();
+
+            let rename_btn = Button::builder()
+                .label("Rename Plan")
+                .css_classes(vec!["fav-hide-btn".to_string()])
+                .build();
+
+            let copy_btn = Button::builder()
+                .label("Copy Plan")
+                .css_classes(vec!["fav-hide-btn".to_string()])
+                .build();
+
+            let delete_btn = Button::builder()
+                .label("Delete Plan")
+                .css_classes(vec!["plan-delete-menu-btn".to_string()])
+                .build();
+
+            menu_box.append(&edit_btn);
+            menu_box.append(&rename_btn);
+            menu_box.append(&copy_btn);
+            menu_box.append(&delete_btn);
+            popover.set_child(Some(&menu_box));
+
+            // 1. Edit Plan
+            let path_edit = path_ctx.clone();
+            let files_edit = files_ctx.clone();
+            let detail_edit = detail_ctx.clone();
+            let guard_edit = guard_ctx.clone();
+            let expand_edit = expand_ctx.clone();
+            let pop_edit = popover.downgrade();
+            edit_btn.connect_clicked(move |_| {
+                if let Some(p) = pop_edit.upgrade() {
+                    p.popdown();
+                }
+                render_plan_file(
+                    &path_edit,
+                    &files_edit,
+                    &detail_edit,
+                    &guard_edit,
+                    &expand_edit,
+                    true,
+                    None,
+                );
+                detail_edit.set_visible(true);
+                expand_edit(true);
+            });
+
+            // 2. Rename Plan
+            let path_ren = path_ctx.clone();
+            let files_ren = files_ctx.clone();
+            let detail_ren = detail_ctx.clone();
+            let guard_ren = guard_ctx.clone();
+            let expand_ren = expand_ctx.clone();
+            let pop_ren = popover.downgrade();
+            rename_btn.connect_clicked(move |_| {
+                if let Some(p) = pop_ren.upgrade() {
+                    p.popdown();
+                }
+                populate_plan_buttons(
+                    &files_ren,
+                    &detail_ren,
+                    &guard_ren,
+                    &expand_ren,
+                    Some(path_ren.clone()),
+                );
+            });
+
+            // 3. Copy Plan
+            let path_copy = path_ctx.clone();
+            let files_copy = files_ctx.clone();
+            let detail_copy = detail_ctx.clone();
+            let guard_copy = guard_ctx.clone();
+            let expand_copy = expand_ctx.clone();
+            let pop_copy = popover.downgrade();
+            copy_btn.connect_clicked(move |_| {
+                if let Some(p) = pop_copy.upgrade() {
+                    p.popdown();
+                }
+                let copy_path = make_copy_path(&path_copy);
+                if fs::copy(&path_copy, &copy_path).is_ok() {
+                    populate_plan_buttons(
+                        &files_copy,
+                        &detail_copy,
+                        &guard_copy,
+                        &expand_copy,
+                        None,
+                    );
+                }
+            });
+
+            // 4. Delete Plan
+            let path_del = path_ctx.clone();
+            let files_del = files_ctx.clone();
+            let detail_del = detail_ctx.clone();
+            let guard_del = guard_ctx.clone();
+            let expand_del = expand_ctx.clone();
+            let pop_del = popover.downgrade();
+            delete_btn.connect_clicked(move |_| {
+                if let Some(p) = pop_del.upgrade() {
+                    p.popdown();
+                }
+                let _ = fs::remove_file(&path_del);
+                detail_del.set_visible(false);
+                expand_del(false);
+                populate_plan_buttons(&files_del, &detail_del, &guard_del, &expand_del, None);
+            });
+
+            popover.popup();
         });
         btn.add_controller(right_click);
-
-        // 1. Edit Plan
-        let path_edit = path.clone();
-        let files_edit = files_box.clone();
-        let detail_edit = detail_view.clone();
-        let guard_edit = popover_guard.clone();
-        let expand_edit = on_expand.clone();
-        let pop_edit = popover.clone();
-        edit_btn.connect_clicked(move |_| {
-            pop_edit.popdown();
-            render_plan_file(
-                &path_edit,
-                &files_edit,
-                &detail_edit,
-                &guard_edit,
-                &expand_edit,
-                true,
-                None,
-            );
-            detail_edit.set_visible(true);
-            expand_edit(true);
-        });
-
-        // 2. Rename Plan
-        let path_ren = path.clone();
-        let files_ren = files_box.clone();
-        let detail_ren = detail_view.clone();
-        let guard_ren = popover_guard.clone();
-        let expand_ren = on_expand.clone();
-        let pop_ren = popover.clone();
-        rename_btn.connect_clicked(move |_| {
-            pop_ren.popdown();
-            populate_plan_buttons(
-                &files_ren,
-                &detail_ren,
-                &guard_ren,
-                &expand_ren,
-                Some(path_ren.clone()),
-            );
-        });
-
-        // 3. Copy Plan
-        let path_copy = path.clone();
-        let files_copy = files_box.clone();
-        let detail_copy = detail_view.clone();
-        let guard_copy = popover_guard.clone();
-        let expand_copy = on_expand.clone();
-        let pop_copy = popover.clone();
-        copy_btn.connect_clicked(move |_| {
-            pop_copy.popdown();
-            let copy_path = make_copy_path(&path_copy);
-            if fs::copy(&path_copy, &copy_path).is_ok() {
-                populate_plan_buttons(&files_copy, &detail_copy, &guard_copy, &expand_copy, None);
-            }
-        });
-
-        // 4. Delete Plan
-        let path_del = path.clone();
-        let files_del = files_box.clone();
-        let detail_del = detail_view.clone();
-        let guard_del = popover_guard.clone();
-        let expand_del = on_expand.clone();
-        let pop_del = popover.clone();
-        delete_btn.connect_clicked(move |_| {
-            pop_del.popdown();
-            let _ = fs::remove_file(&path_del);
-            detail_del.set_visible(false);
-            expand_del(false);
-            populate_plan_buttons(&files_del, &detail_del, &guard_del, &expand_del, None);
-        });
 
         row_box.append(&btn);
         files_box.append(&row_box);

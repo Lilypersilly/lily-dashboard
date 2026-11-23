@@ -1026,234 +1026,274 @@ pub fn build_locker_ui(popover_guard: Rc<Cell<usize>>) -> Box {
                     });
                 });
 
-                // Right-Click Context Menu: Copy | Replace (from RAM) | Replace (Pick File) | Delete
-                let popover = Popover::builder()
-                    .css_classes(vec!["fav-popover".to_string()])
-                    .autohide(true)
-                    .build();
-                popover.set_parent(&row_box);
-
-                let guard_map = guard_r.clone();
-                popover.connect_map(move |_| {
-                    guard_map.set(guard_map.get() + 1);
-                });
-                let guard_unmap = guard_r.clone();
-                popover.connect_unmap(move |_| {
-                    let g = guard_unmap.clone();
-                    glib::timeout_add_local_once(Duration::from_millis(150), move || {
-                        g.set(g.get().saturating_sub(1));
-                    });
-                });
-
-                let menu_box = Box::builder()
-                    .orientation(Orientation::Vertical)
-                    .spacing(4)
-                    .build();
-
-                let copy_btn = Button::builder()
-                    .label("Copy to Host...")
-                    .css_classes(vec!["fav-hide-btn".to_string()])
-                    .build();
-
-                let replace_ram_btn = Button::builder()
-                    .label("Replace from RAM Edit")
-                    .css_classes(vec!["fav-hide-btn".to_string()])
-                    .build();
-
-                let replace_pick_btn = Button::builder()
-                    .label("Replace with File...")
-                    .css_classes(vec!["fav-hide-btn".to_string()])
-                    .build();
-
-                let del_btn = Button::builder()
-                    .label("Delete from Vault")
-                    .css_classes(vec!["plan-delete-menu-btn".to_string()])
-                    .build();
-
-                menu_box.append(&copy_btn);
-                menu_box.append(&replace_ram_btn);
-                menu_box.append(&replace_pick_btn);
-                menu_box.append(&del_btn);
-                popover.set_child(Some(&menu_box));
-
+                // Lazily build Right-Click Context Menu on demand & unparent on close
                 let right_click = GestureClick::builder().button(3).build();
-                let pop_open = popover.clone();
+                let row_weak = row_box.downgrade();
+                let guard_ctx = guard_r.clone();
+                let dlg_ctx = dialog_r.clone();
+                let entry_ctx = file_entry.clone();
+                let v_dir_ctx = sess.vault_dir.clone();
+                let dek_ctx = sess.dek;
+                let next_blk_ctx = sess.index.next_block_id;
+                let max_b_ctx = max_bytes;
+                let phys_b_ctx = phys_bytes;
+                let status_ctx = status_r.clone();
+                let tx_ctx = tx_r.clone();
+                let sess_ctx = sess_r.clone();
+                let refresh_ctx = self_weak.clone();
+
                 right_click.connect_pressed(move |_, _, _, _| {
-                    pop_open.popup();
-                });
-                btn.add_controller(right_click);
+                    let Some(parent_row) = row_weak.upgrade() else {
+                        return;
+                    };
 
-                // 1. Copy to Host...
-                {
-                    let pop_c = popover.clone();
-                    let dlg_slot = dialog_r.clone();
-                    let entry_c = file_entry.clone();
-                    let v_dir_c = sess.vault_dir.clone();
-                    let dek_c = sess.dek;
-                    let tx_c = tx_r.clone();
-                    copy_btn.connect_clicked(move |_| {
-                        pop_c.popdown();
-                        let dialog = FileChooserNative::builder()
-                            .title("Select Destination Folder for Copy")
-                            .action(FileChooserAction::SelectFolder)
-                            .build();
-                        let entry_inner = entry_c.clone();
-                        let v_dir_inner = v_dir_c.clone();
-                        let tx_inner = tx_c.clone();
-                        let dlg_clear = dlg_slot.clone();
-                        dialog.connect_response(move |d, res| {
-                            if res == ResponseType::Accept {
-                                if let Some(folder) = d.file().and_then(|f| f.path()) {
-                                    let dst = folder.join(&entry_inner.name);
-                                    let v_d = v_dir_inner.clone();
-                                    let e_cl = entry_inner.clone();
-                                    let t_cl = tx_inner.clone();
-                                    std::thread::spawn(move || {
-                                        let r = stream_decrypt_file_from_blocks(
-                                            &v_d, &dek_c, &e_cl, &dst, &t_cl,
-                                        )
-                                        .map(|_| (dst, false));
-                                        let _ = t_cl.send(WorkerEvent::ExtractDone(r));
-                                    });
-                                }
+                    let popover = Popover::builder()
+                        .css_classes(vec!["fav-popover".to_string()])
+                        .autohide(true)
+                        .build();
+                    popover.set_parent(&parent_row);
+
+                    popover.connect_closed(|p| {
+                        let p_weak = p.downgrade();
+                        glib::idle_add_local_once(move || {
+                            if let Some(pop) = p_weak.upgrade() {
+                                pop.unparent();
                             }
-                            *dlg_clear.borrow_mut() = None;
-                        });
-                        dialog.show();
-                        *dlg_slot.borrow_mut() = Some(dialog);
-                    });
-                }
-
-                // 2. Replace from RAM Edit (`/dev/shm/lily-locker/<name>`)
-                {
-                    let pop_rr = popover.clone();
-                    let entry_rr = file_entry.clone();
-                    let v_dir_rr = sess.vault_dir.clone();
-                    let dek_rr = sess.dek;
-                    let mut next_blk = sess.index.next_block_id;
-                    let max_b = max_bytes;
-                    let phys_b = phys_bytes;
-                    let status_rr = status_r.clone();
-                    let tx_rr = tx_r.clone();
-                    replace_ram_btn.connect_clicked(move |_| {
-                        pop_rr.popdown();
-                        let ram_file = PathBuf::from(RAM_EXTRACT_DIR).join(&entry_rr.name);
-                        if !ram_file.is_file() {
-                            status_rr.set_label("No edited file found in /dev/shm! Left-click to open first.");
-                            return;
-                        }
-                        let new_len = ram_file.metadata().map(|m| m.len()).unwrap_or(0);
-                        if phys_b + new_len > max_b {
-                            status_rr.set_label("Locker full! Increase max size, delete files, or Vacuum.");
-                            return;
-                        }
-                        let v_d = v_dir_rr.clone();
-                        let name_s = entry_rr.name.clone();
-                        let t_cl = tx_rr.clone();
-                        std::thread::spawn(move || {
-                            let res = stream_encrypt_file_to_blocks(
-                                &v_d,
-                                &dek_rr,
-                                &mut next_blk,
-                                &ram_file,
-                                name_s,
-                                &t_cl,
-                            )
-                            .map(|new_entry| {
-                                let _ = fs::remove_file(&ram_file);
-                                (idx, new_entry)
-                            });
-                            let _ = t_cl.send(WorkerEvent::ReplaceDone(res));
                         });
                     });
-                }
 
-                // 3. Replace with File... (FileChooserNative)
-                {
-                    let pop_rp = popover.clone();
-                    let dlg_slot = dialog_r.clone();
-                    let entry_rp = file_entry.clone();
-                    let v_dir_rp = sess.vault_dir.clone();
-                    let dek_rp = sess.dek;
-                    let mut next_blk = sess.index.next_block_id;
-                    let max_b = max_bytes;
-                    let phys_b = phys_bytes;
-                    let status_rp = status_r.clone();
-                    let tx_rp = tx_r.clone();
-                    replace_pick_btn.connect_clicked(move |_| {
-                        pop_rp.popdown();
-                        let dialog = FileChooserNative::builder()
-                            .title("Select Replacement File")
-                            .action(FileChooserAction::Open)
-                            .build();
-                        let entry_inner = entry_rp.clone();
-                        let v_dir_inner = v_dir_rp.clone();
-                        let status_inner = status_rp.clone();
-                        let tx_inner = tx_rp.clone();
-                        let dlg_clear = dlg_slot.clone();
-                        dialog.connect_response(move |d, res| {
-                            if res == ResponseType::Accept {
-                                if let Some(src_p) = d.file().and_then(|f| f.path()) {
-                                    let new_len = src_p.metadata().map(|m| m.len()).unwrap_or(0);
-                                    if phys_b + new_len > max_b {
-                                        status_inner.set_label(
-                                            "Locker full! Increase max size, delete files, or Vacuum.",
-                                        );
-                                    } else {
+                    let guard_map = guard_ctx.clone();
+                    popover.connect_map(move |_| {
+                        guard_map.set(guard_map.get() + 1);
+                    });
+                    let guard_unmap = guard_ctx.clone();
+                    popover.connect_unmap(move |_| {
+                        let g = guard_unmap.clone();
+                        glib::timeout_add_local_once(Duration::from_millis(150), move || {
+                            g.set(g.get().saturating_sub(1));
+                        });
+                    });
+
+                    let menu_box = Box::builder()
+                        .orientation(Orientation::Vertical)
+                        .spacing(4)
+                        .build();
+
+                    let copy_btn = Button::builder()
+                        .label("Copy to Host...")
+                        .css_classes(vec!["fav-hide-btn".to_string()])
+                        .build();
+
+                    let replace_ram_btn = Button::builder()
+                        .label("Replace from RAM Edit")
+                        .css_classes(vec!["fav-hide-btn".to_string()])
+                        .build();
+
+                    let replace_pick_btn = Button::builder()
+                        .label("Replace with File...")
+                        .css_classes(vec!["fav-hide-btn".to_string()])
+                        .build();
+
+                    let del_btn = Button::builder()
+                        .label("Delete from Vault")
+                        .css_classes(vec!["plan-delete-menu-btn".to_string()])
+                        .build();
+
+                    menu_box.append(&copy_btn);
+                    menu_box.append(&replace_ram_btn);
+                    menu_box.append(&replace_pick_btn);
+                    menu_box.append(&del_btn);
+                    popover.set_child(Some(&menu_box));
+
+                    // 1. Copy to Host...
+                    {
+                        let pop_c = popover.downgrade();
+                        let dlg_slot = dlg_ctx.clone();
+                        let entry_c = entry_ctx.clone();
+                        let v_dir_c = v_dir_ctx.clone();
+                        let dek_c = dek_ctx;
+                        let tx_c = tx_ctx.clone();
+                        copy_btn.connect_clicked(move |_| {
+                            if let Some(p) = pop_c.upgrade() {
+                                p.popdown();
+                            }
+                            let dialog = FileChooserNative::builder()
+                                .title("Select Destination Folder for Copy")
+                                .action(FileChooserAction::SelectFolder)
+                                .build();
+                            let entry_inner = entry_c.clone();
+                            let v_dir_inner = v_dir_c.clone();
+                            let tx_inner = tx_c.clone();
+                            let dlg_clear = dlg_slot.clone();
+                            dialog.connect_response(move |d, res| {
+                                if res == ResponseType::Accept {
+                                    if let Some(folder) = d.file().and_then(|f| f.path()) {
+                                        let dst = folder.join(&entry_inner.name);
                                         let v_d = v_dir_inner.clone();
-                                        let name_s = entry_inner.name.clone();
+                                        let e_cl = entry_inner.clone();
                                         let t_cl = tx_inner.clone();
                                         std::thread::spawn(move || {
-                                            let r = stream_encrypt_file_to_blocks(
-                                                &v_d,
-                                                &dek_rp,
-                                                &mut next_blk,
-                                                &src_p,
-                                                name_s,
-                                                &t_cl,
+                                            let r = stream_decrypt_file_from_blocks(
+                                                &v_d, &dek_c, &e_cl, &dst, &t_cl,
                                             )
-                                            .map(|new_e| (idx, new_e));
-                                            let _ = t_cl.send(WorkerEvent::ReplaceDone(r));
+                                            .map(|_| (dst, false));
+                                            let _ = t_cl.send(WorkerEvent::ExtractDone(r));
                                         });
                                     }
                                 }
-                            }
-                            *dlg_clear.borrow_mut() = None;
+                                *dlg_clear.borrow_mut() = None;
+                            });
+                            dialog.show();
+                            *dlg_slot.borrow_mut() = Some(dialog);
                         });
-                        dialog.show();
-                        *dlg_slot.borrow_mut() = Some(dialog);
-                    });
-                }
+                    }
 
-                // 4. Delete from Vault
-                {
-                    let pop_d = popover.clone();
-                    let sess_del = sess_r.clone();
-                    let status_del = status_r.clone();
-                    let refresh_del = self_weak.clone();
-                    del_btn.connect_clicked(move |_| {
-                        pop_d.popdown();
-                        {
-                            let mut borrow = sess_del.borrow_mut();
-                            if let Some(s) = borrow.as_mut() {
-                                if idx < s.index.files.len() {
-                                    let removed = s.index.files.remove(idx);
-                                    for seg in removed.segments {
-                                        *s.index
-                                            .dead_bytes_per_block
-                                            .entry(seg.block_id)
-                                            .or_insert(0) += seg.cipher_len;
+                    // 2. Replace from RAM Edit (`/dev/shm/lily-locker/<name>`)
+                    {
+                        let pop_rr = popover.downgrade();
+                        let entry_rr = entry_ctx.clone();
+                        let v_dir_rr = v_dir_ctx.clone();
+                        let dek_rr = dek_ctx;
+                        let mut next_blk = next_blk_ctx;
+                        let max_b = max_b_ctx;
+                        let phys_b = phys_b_ctx;
+                        let status_rr = status_ctx.clone();
+                        let tx_rr = tx_ctx.clone();
+                        replace_ram_btn.connect_clicked(move |_| {
+                            if let Some(p) = pop_rr.upgrade() {
+                                p.popdown();
+                            }
+                            let ram_file = PathBuf::from(RAM_EXTRACT_DIR).join(&entry_rr.name);
+                            if !ram_file.is_file() {
+                                status_rr.set_label(
+                                    "No edited file found in /dev/shm! Left-click to open first.",
+                                );
+                                return;
+                            }
+                            let new_len = ram_file.metadata().map(|m| m.len()).unwrap_or(0);
+                            if phys_b + new_len > max_b {
+                                status_rr.set_label(
+                                    "Locker full! Increase max size, delete files, or Vacuum.",
+                                );
+                                return;
+                            }
+                            let v_d = v_dir_rr.clone();
+                            let name_s = entry_rr.name.clone();
+                            let t_cl = tx_rr.clone();
+                            std::thread::spawn(move || {
+                                let res = stream_encrypt_file_to_blocks(
+                                    &v_d,
+                                    &dek_rr,
+                                    &mut next_blk,
+                                    &ram_file,
+                                    name_s,
+                                    &t_cl,
+                                )
+                                .map(|new_entry| {
+                                    let _ = fs::remove_file(&ram_file);
+                                    (idx, new_entry)
+                                });
+                                let _ = t_cl.send(WorkerEvent::ReplaceDone(res));
+                            });
+                        });
+                    }
+
+                    // 3. Replace with File... (FileChooserNative)
+                    {
+                        let pop_rp = popover.downgrade();
+                        let dlg_slot = dlg_ctx.clone();
+                        let entry_rp = entry_ctx.clone();
+                        let v_dir_rp = v_dir_ctx.clone();
+                        let dek_rp = dek_ctx;
+                        let mut next_blk = next_blk_ctx;
+                        let max_b = max_b_ctx;
+                        let phys_b = phys_b_ctx;
+                        let status_rp = status_ctx.clone();
+                        let tx_rp = tx_ctx.clone();
+                        replace_pick_btn.connect_clicked(move |_| {
+                            if let Some(p) = pop_rp.upgrade() {
+                                p.popdown();
+                            }
+                            let dialog = FileChooserNative::builder()
+                                .title("Select Replacement File")
+                                .action(FileChooserAction::Open)
+                                .build();
+                            let entry_inner = entry_rp.clone();
+                            let v_dir_inner = v_dir_rp.clone();
+                            let status_inner = status_rp.clone();
+                            let tx_inner = tx_rp.clone();
+                            let dlg_clear = dlg_slot.clone();
+                            dialog.connect_response(move |d, res| {
+                                if res == ResponseType::Accept {
+                                    if let Some(src_p) = d.file().and_then(|f| f.path()) {
+                                        let new_len =
+                                            src_p.metadata().map(|m| m.len()).unwrap_or(0);
+                                        if phys_b + new_len > max_b {
+                                            status_inner.set_label(
+                                                "Locker full! Increase max size, delete files, or Vacuum.",
+                                            );
+                                        } else {
+                                            let v_d = v_dir_inner.clone();
+                                            let name_s = entry_inner.name.clone();
+                                            let t_cl = tx_inner.clone();
+                                            std::thread::spawn(move || {
+                                                let r = stream_encrypt_file_to_blocks(
+                                                    &v_d,
+                                                    &dek_rp,
+                                                    &mut next_blk,
+                                                    &src_p,
+                                                    name_s,
+                                                    &t_cl,
+                                                )
+                                                .map(|new_e| (idx, new_e));
+                                                let _ = t_cl.send(WorkerEvent::ReplaceDone(r));
+                                            });
+                                        }
                                     }
-                                    let _ = save_vault_index(s);
-                                    status_del.set_label(&format!("Deleted {}.", removed.name));
+                                }
+                                *dlg_clear.borrow_mut() = None;
+                            });
+                            dialog.show();
+                            *dlg_slot.borrow_mut() = Some(dialog);
+                        });
+                    }
+
+                    // 4. Delete from Vault
+                    {
+                        let pop_d = popover.downgrade();
+                        let sess_del = sess_ctx.clone();
+                        let status_del = status_ctx.clone();
+                        let refresh_del = refresh_ctx.clone();
+                        del_btn.connect_clicked(move |_| {
+                            if let Some(p) = pop_d.upgrade() {
+                                p.popdown();
+                            }
+                            {
+                                let mut borrow = sess_del.borrow_mut();
+                                if let Some(s) = borrow.as_mut() {
+                                    if idx < s.index.files.len() {
+                                        let removed = s.index.files.remove(idx);
+                                        for seg in removed.segments {
+                                            *s.index
+                                                .dead_bytes_per_block
+                                                .entry(seg.block_id)
+                                                .or_insert(0) += seg.cipher_len;
+                                        }
+                                        let _ = save_vault_index(s);
+                                        status_del
+                                            .set_label(&format!("Deleted {}.", removed.name));
+                                    }
                                 }
                             }
-                        }
-                        if let Some(ref cb) = *refresh_del.borrow() {
-                            cb();
-                        }
-                    });
-                }
+                            if let Some(ref cb) = *refresh_del.borrow() {
+                                cb();
+                            }
+                        });
+                    }
+
+                    popover.popup();
+                });
+                btn.add_controller(right_click);
 
                 row_box.append(&btn);
                 list_r.append(&row_box);
