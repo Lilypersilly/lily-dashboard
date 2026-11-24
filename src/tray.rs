@@ -372,10 +372,7 @@ fn populate_ws_preview_popover(popover: &Popover, data: WsPreviewData) {
         // Check in reverse order so top-most / floating windows match first
         for (x, y, cw, ch, win) in rects_click.iter().rev() {
             if cx >= *x && cx <= x + cw && cy >= *y && cy <= y + ch {
-                let lua = format!("hl.dsp.focus({{ window = \"address:{}\" }})", win.address);
-                let _ = Command::new("hyprctl")
-                    .args(["dispatch", &lua])
-                    .spawn();
+                crate::config::hypr_focus_window(&win.address);
                 if let Some(p) = pop_map.upgrade() {
                     p.popdown();
                 }
@@ -430,12 +427,10 @@ fn populate_ws_preview_popover(popover: &Popover, data: WsPreviewData) {
         inner.append(&lbl);
         win_btn.set_child(Some(&inner));
 
-        let lua_f = format!("hl.dsp.focus({{ window = \"address:{}\" }})", win.address);
+        let addr_f = win.address.clone();
         let pop_f = popover.downgrade();
         win_btn.connect_clicked(move |_| {
-            let _ = Command::new("hyprctl")
-                .args(["dispatch", &lua_f])
-                .spawn();
+            crate::config::hypr_focus_window(&addr_f);
             if let Some(p) = pop_f.upgrade() {
                 p.popdown();
             }
@@ -447,15 +442,10 @@ fn populate_ws_preview_popover(popover: &Popover, data: WsPreviewData) {
             .valign(Align::Center)
             .tooltip_text("Close window")
             .build();
-        let lua_c = format!(
-            "hl.dsp.window.close({{ window = \"address:{}\" }})",
-            win.address
-        );
+        let addr_c = win.address.clone();
         let row_weak = row.downgrade();
         close_btn.connect_clicked(move |_| {
-            let _ = Command::new("hyprctl")
-                .args(["dispatch", &lua_c])
-                .spawn();
+            crate::config::hypr_close_window(&addr_c);
             if let Some(r) = row_weak.upgrade() {
                 r.set_visible(false);
             }
@@ -531,14 +521,7 @@ pub fn build_workspaces_widget() -> GtkBox {
     // Scroll anywhere on the top workspace bar to cycle workspaces
     let scroll_ctrl = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
     scroll_ctrl.connect_scroll(move |_, _, dy| {
-        let lua = if dy > 0.0 {
-            "hl.dsp.focus({ workspace = \"e+1\" })"
-        } else {
-            "hl.dsp.focus({ workspace = \"e-1\" })"
-        };
-        let _ = Command::new("hyprctl")
-            .args(["dispatch", lua])
-            .spawn();
+        crate::config::hypr_focus_workspace(if dy > 0.0 { "e+1" } else { "e-1" });
         glib::Propagation::Stop
     });
     bar.add_controller(scroll_ctrl);
@@ -689,10 +672,7 @@ pub fn build_workspaces_widget() -> GtkBox {
                             old.popdown();
                             old.unparent();
                         }
-                        let lua = format!("hl.dsp.focus({{ workspace = {} }})", ws_num);
-                        let _ = Command::new("hyprctl")
-                            .args(["dispatch", &lua])
-                            .spawn();
+                        crate::config::hypr_focus_workspace(&ws_num.to_string());
                     });
 
                     // Hover to show live workspace window preview popover!
@@ -869,7 +849,8 @@ pub fn build_status_strip() -> GtkBox {
         glib::ControlFlow::Continue
     });
 
-    // Notification Center badge (swaync)
+    // Notification Center badge (supports swaync, dunst, mako, or disabled via config)
+    let notif_daemon = crate::config::get().tools.notification_daemon;
     let notif_lbl = Label::builder()
         .label("󰂚")
         .css_classes(vec!["sidebar-status-lbl".to_string()])
@@ -879,19 +860,46 @@ pub fn build_status_strip() -> GtkBox {
         .halign(Align::End)
         .css_classes(vec!["sidebar-footer-btn".to_string()])
         .tooltip_text("Left-click: Notifications | Right-click: Toggle Do Not Disturb")
+        .visible(notif_daemon != "none")
         .build();
 
     notif_btn.connect_clicked(move |_| {
-        let _ = Command::new("swaync-client").args(["-t", "-sw"]).spawn();
+        match crate::config::get().tools.notification_daemon.as_str() {
+            "swaync" => {
+                let _ = Command::new("swaync-client").args(["-t", "-sw"]).spawn();
+            }
+            "dunst" => {
+                let _ = Command::new("dunstctl").arg("history-pop").spawn();
+            }
+            "mako" => {
+                let _ = Command::new("makoctl").arg("restore").spawn();
+            }
+            _ => {}
+        }
     });
     let right_click = GestureClick::builder().button(3).build();
     right_click.connect_pressed(move |_, _, _, _| {
-        let _ = Command::new("swaync-client").args(["-d", "-sw"]).spawn();
+        match crate::config::get().tools.notification_daemon.as_str() {
+            "swaync" => {
+                let _ = Command::new("swaync-client").args(["-d", "-sw"]).spawn();
+            }
+            "dunst" => {
+                let _ = Command::new("dunstctl").args(["set-paused", "toggle"]).spawn();
+            }
+            "mako" => {
+                let _ = Command::new("makoctl").args(["mode", "-t", "do-not-disturb"]).spawn();
+            }
+            _ => {}
+        }
     });
     notif_btn.add_controller(right_click);
 
     let (tx_n, rx_n) = mpsc::channel::<NotifState>();
+    let notif_daemon_bg = notif_daemon.clone();
     std::thread::spawn(move || {
+        if notif_daemon_bg != "swaync" {
+            return;
+        }
         // Stream swaync JSON updates (zero polling!)
         if let Ok(mut child) = Command::new("swaync-client")
             .arg("-swb")

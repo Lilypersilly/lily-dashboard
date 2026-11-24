@@ -514,15 +514,7 @@ pub fn restore_previous_session() -> usize {
             rules.push("fullscreen".to_string());
         }
 
-        let dispatch_arg = format!(
-            "hl.dsp.exec_cmd(\"[{}] {}\")",
-            rules.join("; "),
-            win.command.replace('"', "\\\"")
-        );
-
-        let _ = Command::new("hyprctl")
-            .args(["dispatch", &dispatch_arg])
-            .spawn();
+        crate::config::hypr_exec_with_rules(&rules.join("; "), &win.command);
 
         restored_count += 1;
     }

@@ -63,8 +63,9 @@ pub fn build_drive_ui() -> Box {
         .halign(Align::Start)
         .css_classes(vec!["plan-step".to_string()])
         .build();
+    let default_remote = crate::config::get().paths.rclone_default_remote;
     let remote_entry = Entry::builder()
-        .text("gdrive:/")
+        .text(&default_remote)
         .placeholder_text("e.g., gdrive:/Backups")
         .css_classes(vec!["fav-search".to_string()])
         .build();

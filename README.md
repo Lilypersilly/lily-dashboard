@@ -18,7 +18,8 @@ It sits on the left edge of the active monitor, replaces Waybar (workspaces, sys
 
 | File | What it does |
 | --- | --- |
-| `main.rs` | Window setup, layer-shell config, slide animation, dynamic input region, live CSS theming, sidebar navigation, footer (session load/save/auto-save, power/restart, weather, Nixie clock, self-rebuild button), and top-bar quick capture/color-picker buttons. |
+| `config.rs` | Centralized `~/.config/lily-dashboard/config.json` loader/saver with first-run tool auto-detection, built-in fallback color presets, and Hyprland (Hyprlua + classic) IPC helpers. |
+| `main.rs` | Window setup, layer-shell config, slide animation, dynamic input region, live CSS theming (with mathematically scaled corner rounding & opacity), sidebar navigation, footer (session load/save/auto-save, power/restart, weather, configurable clock click, self-rebuild/restart button), and top-bar quick capture/color-picker buttons. |
 | `tray.rs` | Top workspace bar (Hyprland socket listener, click to switch, scroll to cycle, hover popover with a proportional window layout mini-map + focus/close actions), D-Bus `StatusNotifierWatcher` system tray, mouse battery reader (`/sys/class/power_supply`), and SwayNC notification badge + right-click DND toggle. |
 | `launcher.rs` | `Run` tab (default). Scans `.desktop` entries via `gio::AppInfo`, supports fuzzy filtering, pinning, and optional background binary preloading (`cat <bin> > /dev/null`) to warm page cache. |
 | `favorites.rs` | `Favorites` tab. Tracks frequently accessed files/folders via `notify` filesystem watcher, scores usage in RAM (flushing `ignore.json` at most once every 60s), lets you pin or ignore paths, and opens items with `xdg-open`. |
@@ -31,13 +32,14 @@ It sits on the left edge of the active monitor, replaces Waybar (workspaces, sys
 | `drive.rs` | `Drive` tab. GUI wrapper around `rclone copy` with remote path, optional bandwidth limit, native file/folder chooser, live progress parsing, and cancel support. |
 | `passwords.rs` | `Passwords` tab. Simple local credential list stored in `passwords.txt` (`0600` permissions) with search, click-to-copy, and inline add/delete. |
 | `locker.rs` | `Locker` tab. Encrypted file vault using Argon2id + HKDF-SHA256 + streaming AES-256-GCM (`1 MB` chunks) packed into `.lilar` block files (up to 10 GB per block). Decrypted previews extract to `/dev/shm/lily-locker` (RAM tmpfs) and are cleaned up on lock. |
-| `system.rs` | `System` tab with a 400px slide-out detail pane covering: **Sound** (`pactl` sinks, sources, per-app streams), **Network** (`nmcli` active connections, Wi-Fi scan/connect, VPNs), **Themes** (`theme-switch` palette previews), **Wallpapers** (`swww` multi-monitor picker with vertical crop pairs in `~/Pictures/Wallpapers/vertical/`, RAM-only thumbnails), **Displays** (`hyprctl monitors`), **Keybinds** (live parser for `~/.config/hypr/binds.lua` with search), and **Overview** (CPU/RAM/GPU stats, `lumine-capture` screenshot modes, `slurp` + `grim` color picker, DND, Suspend, Reload Hyprland). |
+| `system.rs` | `System` tab with a 400px slide-out detail pane covering: **Sound** (`pactl` sinks, sources, per-app streams), **Network** (`nmcli` active connections, Wi-Fi scan/connect, VPNs), **Themes** (external `theme-switch` palettes + built-in fallback presets), **Wallpapers** (`swww`/`awww`/`hyprpaper`/custom multi-monitor picker with vertical crop pairs, RAM-only thumbnails), **Displays** (`hyprctl monitors`), **Keybinds** (live parser for Hyprlua `binds.lua` or classic `hyprland.conf` with search), **Overview** (CPU/RAM/GPU stats, configured screenshot modes, color picker, DND, Suspend, Reload Hyprland), and **Settings** (live Hyprland & dashboard corner rounding, opacity, gaps, border, blur, app/tool backends, visible tabs, and paths). |
 | `weather.rs` | Compact sidebar weather badge + click-to-open forecast popover backed by Open-Meteo (location search + daily/hourly forecast). |
 | `session.rs` | Saves and restores mapped Hyprland windows (workspace, geometry, float/fullscreen state, command line). Controlled by the sidebar's Load / Save / Auto-save buttons (auto-save defaults to off to avoid background SSD writes; when enabled it checks every 30s and ignores window-title changes). |
 
 ## Files & state on disk
 
 - `~/.config/lily-dashboard/`
+  - `config.json` — main user settings (Hyprland appearance, screenshot/color-picker/wallpaper/notification backends, visible tabs, paths, built-in theme preset)
   - `clipboard_pins.json` — pinned clipboard entries only (normal history stays in RAM)
   - `calendar_events.json` — per-day calendar notes
   - `passwords.txt` — owner-only (`0600`) password entries

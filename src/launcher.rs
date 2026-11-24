@@ -660,14 +660,8 @@ fn build_app_row(
                 if let Some(p) = pop_ws.upgrade() {
                     p.popdown();
                 }
-                let lua_dispatch = format!(
-                    "hl.dsp.exec_cmd(\"[workspace {} silent] {}\")",
-                    ws_num,
-                    cmd_ws.replace('"', "\\\"")
-                );
-                let _ = Command::new("hyprctl")
-                    .args(["dispatch", &lua_dispatch])
-                    .spawn();
+                let rules = format!("workspace {} silent", ws_num);
+                crate::config::hypr_exec_with_rules(&rules, &cmd_ws);
             });
             ws_row.append(&ws_btn);
         }

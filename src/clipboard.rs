@@ -20,7 +20,7 @@ use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::{
     Mutex, OnceLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -240,7 +240,7 @@ impl ClipboardStore {
 static STORE: OnceLock<Mutex<ClipboardStore>> = OnceLock::new();
 static WATCHER_CHILDREN: OnceLock<Mutex<Vec<Child>>> = OnceLock::new();
 static STORE_VERSION: AtomicU64 = AtomicU64::new(0);
-static WATCHER_STARTED: OnceLock<()> = OnceLock::new();
+static WATCHER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 fn store() -> &'static Mutex<ClipboardStore> {
     STORE.get_or_init(|| Mutex::new(ClipboardStore::new()))
@@ -346,17 +346,27 @@ impl From<String> for ClipPayload {
     }
 }
 
-/// Starts pure-RAM Wayland clipboard watchers (`wl-paste --watch`) for text & PNG images.
-/// Never writes anything to SSD.
+/// Starts pure-RAM Wayland clipboard watchers (`wl-paste --watch`) on startup if the
+/// Clipboard tab is enabled in `config.json`. Never writes anything to SSD.
 pub fn init_clipboard_watcher() {
-    WATCHER_STARTED.get_or_init(|| {
-        spawn_wl_paste_watcher("text/plain;charset=utf-8", false);
-        spawn_wl_paste_watcher("image/png", true);
-    });
+    set_watcher_enabled(crate::config::get().visible_tabs.clipboard);
+}
+
+/// Live-starts or kills the background `wl-paste` watchers when toggling Clipboard in Settings.
+pub fn set_watcher_enabled(enabled: bool) {
+    if enabled {
+        if !WATCHER_RUNNING.swap(true, Ordering::SeqCst) {
+            spawn_wl_paste_watcher("text/plain;charset=utf-8", false);
+            spawn_wl_paste_watcher("image/png", true);
+        }
+    } else if WATCHER_RUNNING.swap(false, Ordering::SeqCst) {
+        shutdown_watchers();
+    }
 }
 
 /// Cleans up background `wl-paste` watcher children on dashboard exit/reload.
 pub fn shutdown_watchers() {
+    WATCHER_RUNNING.store(false, Ordering::SeqCst);
     if let Some(lock) = WATCHER_CHILDREN.get() {
         if let Ok(mut children) = lock.lock() {
             for child in children.iter_mut() {

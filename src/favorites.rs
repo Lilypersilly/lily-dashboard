@@ -18,8 +18,28 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::Duration;
+
+static FAVORITES_ENABLED: AtomicBool = AtomicBool::new(true);
+static WATCHER_CTRL_TX: OnceLock<Mutex<Option<mpsc::Sender<bool>>>> = OnceLock::new();
+
+/// Enables or disables background file-access scoring and inotify watches live
+/// (triggered when toggling Favorites in `System -> Settings`).
+pub fn set_scoring_enabled(enabled: bool) {
+    FAVORITES_ENABLED.store(enabled, Ordering::Relaxed);
+    if let Some(lock) = WATCHER_CTRL_TX.get() {
+        if let Ok(guard) = lock.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(enabled);
+            }
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Default)]
 struct FavoritesConfig {
@@ -226,11 +246,14 @@ pub fn build_favorites_ui(popover_guard: Rc<Cell<usize>>) -> FavoritesUi {
     let recent_mgr = gtk4::RecentManager::default();
     let state_recent = state.clone();
     recent_mgr.connect_changed(move |mgr| {
+        if !FAVORITES_ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
         let mut st = state_recent.borrow_mut();
         for item in mgr.items().into_iter().take(5) {
             let uri = item.uri();
             if let Ok((path, _)) = glib::filename_from_uri(&uri) {
-                st.record_event(path, 1, true);
+                st.record_event(path, 1, false);
             }
         }
         let active = st.is_active;
@@ -265,41 +288,71 @@ pub fn build_favorites_ui(popover_guard: Rc<Cell<usize>>) -> FavoritesUi {
 }
 
 fn start_notify_daemon(state: Rc<RefCell<FavoritesState>>) {
+    let initial_enabled = crate::config::get().visible_tabs.favorites;
+    FAVORITES_ENABLED.store(initial_enabled, Ordering::Relaxed);
+
     let (tx, rx) = mpsc::channel::<PathBuf>();
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<bool>();
+    let slot = WATCHER_CTRL_TX.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(ctrl_tx);
+    }
 
     std::thread::spawn(move || {
-        let mut watcher =
-            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if let Ok(event) = res {
-                    if matches!(
-                        event.kind,
-                        EventKind::Access(_) | EventKind::Modify(_) | EventKind::Create(_)
-                    ) {
-                        for path in event.paths {
-                            let _ = tx.send(path);
+        let create_watcher = |tx_ev: mpsc::Sender<PathBuf>| -> Option<notify::RecommendedWatcher> {
+            let mut watcher =
+                notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                    if !FAVORITES_ENABLED.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Ok(event) = res {
+                        if matches!(
+                            event.kind,
+                            EventKind::Access(_) | EventKind::Modify(_) | EventKind::Create(_)
+                        ) {
+                            for path in event.paths {
+                                let _ = tx_ev.send(path);
+                            }
                         }
                     }
+                })
+                .ok()?;
+
+            let home = glib::home_dir();
+            for folder in ["Documents", "Downloads", "Videos", "Music", "Pictures"] {
+                let dir = home.join(folder);
+                if dir.exists() {
+                    let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
                 }
-            }) {
-                Ok(w) => w,
-                Err(_) => return,
-            };
-
-        let home = glib::home_dir();
-        for folder in ["Documents", "Downloads", "Videos", "Music", "Pictures"] {
-            let dir = home.join(folder);
-            if dir.exists() {
-                let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
             }
-        }
+            Some(watcher)
+        };
 
-        loop {
-            std::thread::sleep(Duration::from_secs(3600));
+        // Only hold live inotify watches while Favorites is enabled in Settings
+        let mut active_watcher = if initial_enabled {
+            create_watcher(tx.clone())
+        } else {
+            None
+        };
+
+        while let Ok(enable) = ctrl_rx.recv() {
+            if enable {
+                if active_watcher.is_none() {
+                    active_watcher = create_watcher(tx.clone());
+                }
+            } else {
+                // Dropping the RecommendedWatcher immediately removes all inotify watches
+                active_watcher = None;
+            }
         }
     });
 
     let state_flush = state.clone();
     glib::timeout_add_local(Duration::from_millis(500), move || {
+        if !FAVORITES_ENABLED.load(Ordering::Relaxed) {
+            while rx.try_recv().is_ok() {}
+            return glib::ControlFlow::Continue;
+        }
         let mut updated = false;
         while let Ok(path) = rx.try_recv() {
             state.borrow_mut().record_event(path, 1, false);
@@ -316,6 +369,9 @@ fn start_notify_daemon(state: Rc<RefCell<FavoritesState>>) {
 
     // Debounced disk flush: write accumulated score updates at most once every 60s
     glib::timeout_add_seconds_local(60, move || {
+        if !FAVORITES_ENABLED.load(Ordering::Relaxed) {
+            return glib::ControlFlow::Continue;
+        }
         let mut st = state_flush.borrow_mut();
         if st.dirty {
             st.save_config_and_clear_dirty();

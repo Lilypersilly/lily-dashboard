@@ -190,7 +190,10 @@ fn find_usb_keyfile() -> Option<PathBuf> {
         }
     }
 
-    let user = std::env::var("USER").unwrap_or_else(|_| "lilypersilly".to_string());
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| glib::user_name().to_string_lossy().to_string());
     for base_str in [format!("/run/media/{}", user), format!("/media/{}", user)] {
         let base = PathBuf::from(base_str);
         if let Ok(entries) = fs::read_dir(base) {

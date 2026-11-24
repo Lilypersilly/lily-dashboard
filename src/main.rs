@@ -5,6 +5,7 @@
 //! lazy/stateless tab lifecycle management, sidebar footer widgets, and top-bar
 //! quick capture/color-picker actions.
 
+mod config;
 mod favorites;
 mod launcher;
 mod passwords;
@@ -59,30 +60,46 @@ fn main() {
     }
 
     let app = Application::builder().application_id(APP_ID).build();
-    app.connect_startup(|_| init_theme());
+    let reload_theme_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let reload_theme_startup = reload_theme_slot.clone();
+    app.connect_startup(move |_| {
+        let reload_cb = init_theme();
+        *reload_theme_startup.borrow_mut() = Some(reload_cb);
+    });
     app.connect_shutdown(|_| clipboard::shutdown_watchers());
 
     // Store the trigger button so re-running `lily-dashboard` (e.g. via SUPER keybind)
     // toggles the already-running dashboard open/closed instead of spawning a second window!
     let existing_trigger: Rc<RefCell<Option<Button>>> = Rc::new(RefCell::new(None));
+    let reload_theme_act = reload_theme_slot.clone();
     app.connect_activate(move |app| {
         if let Some(btn) = existing_trigger.borrow().as_ref() {
             btn.emit_clicked();
             return;
         }
 
+        // Apply saved Hyprland live overrides on startup if the user opted in
+        let startup_cfg = config::get();
+        if startup_cfg.hyprland.apply_on_startup {
+            config::apply_hyprland_settings(&startup_cfg.hyprland);
+        }
+
         session::init_session_tracker();
         clipboard::init_clipboard_watcher();
         let media_handle = media_popout::init_media_popout(app);
 
-        let btn = build_ui(app, media_handle);
+        let reload_theme = reload_theme_act
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| Rc::new(|| {}));
+        let btn = build_ui(app, media_handle, reload_theme);
         *existing_trigger.borrow_mut() = Some(btn);
     });
 
     app.run();
 }
 
-fn init_theme() {
+fn init_theme() -> Rc<dyn Fn()> {
     let provider = CssProvider::new();
     gtk4::style_context_add_provider_for_display(
         &gdk::Display::default().expect("Could not connect to a display."),
@@ -90,22 +107,11 @@ fn init_theme() {
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    let update_css = {
+    let update_css: Rc<dyn Fn()> = {
         let provider = provider.clone();
-        move || {
-            let mut map = std::collections::HashMap::new();
-            let mut path = glib::user_config_dir();
-            path.push("theme-switch");
-            path.push("current.conf");
-            
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                for line in content.lines() {
-                    let line = line.split('#').next().unwrap_or("").trim();
-                    if let Some((k, v)) = line.split_once('=') {
-                        map.insert(k.trim().to_string(), v.trim().to_string());
-                    }
-                }
-            }
+        Rc::new(move || {
+            let cfg = config::get();
+            let map = config::resolve_theme_colors(&cfg);
 
             macro_rules! get_c {
                 ($k:expr, $fallback:expr) => {
@@ -114,17 +120,17 @@ fn init_theme() {
             }
             
             // Map the generic theme variables to the dashboard's semantic roles
-            let bg_main = get_c!("bg_main", "fee4ff");
-            let bg_pill = get_c!("bg_pill", get_c!("bg_dark", "ffc2ff"));
-            let bg_recessed = get_c!("bg_recessed", get_c!("bg_dark", "f8d4ff"));
-            let bg_contrast = get_c!("bg_contrast", get_c!("bg_dark", "322a32"));
+            let bg_main = get_c!("bg_main", "1c161e");
+            let bg_pill = get_c!("bg_pill", get_c!("bg_dark", "2a202d"));
+            let bg_recessed = get_c!("bg_recessed", get_c!("bg_dark", "141016"));
+            let bg_contrast = get_c!("bg_contrast", get_c!("bg_dark", "110d13"));
             
-            let fg_main = get_c!("fg_main", "333933");
-            let fg_muted = get_c!("fg_muted", get_c!("fg_dim", "856d8a"));
+            let fg_main = get_c!("fg_main", "fee4ff");
+            let fg_muted = get_c!("fg_muted", get_c!("fg_dim", "a884a6"));
             
             let accent1 = get_c!("accent", get_c!("accent1", "e975ca"));
-            let accent2 = get_c!("magenta", get_c!("accent2", "bf40a1"));
-            let selection = get_c!("selection", get_c!("accent1", "ef96d9"));
+            let accent2 = get_c!("magenta", get_c!("accent2", "ffc2ff"));
+            let selection = get_c!("selection", get_c!("accent1", "bf40a1"));
             
             let hex_to_rgba = |hex: &str, alpha: f32| -> String {
                 let clean = hex.trim_start_matches('#');
@@ -134,15 +140,17 @@ fn init_theme() {
                         u8::from_str_radix(&clean[2..4], 16),
                         u8::from_str_radix(&clean[4..6], 16),
                     ) {
-                        return format!("rgba({}, {}, {}, {})", r, g, b, alpha);
+                        return format!("rgba({}, {}, {}, {:.2})", r, g, b, alpha);
                     }
                 }
-                format!("rgba(128, 128, 128, {})", alpha)
+                format!("rgba(128, 128, 128, {:.2})", alpha)
             };
 
-            let bg_main_glass = hex_to_rgba(bg_main, 0.65);
-            let bg_recessed_glass = hex_to_rgba(bg_recessed, 0.72);
-            let bg_pill_glass = hex_to_rgba(bg_pill, 0.72);
+            let glass_a = cfg.hyprland.glass_opacity.clamp(0.30, 1.0) as f32;
+            let recessed_a = (glass_a + 0.07).min(1.0);
+            let bg_main_glass = hex_to_rgba(bg_main, glass_a);
+            let bg_recessed_glass = hex_to_rgba(bg_recessed, recessed_a);
+            let bg_pill_glass = hex_to_rgba(bg_pill, recessed_a);
             let accent1_15 = hex_to_rgba(accent1, 0.15);
             let accent1_24 = hex_to_rgba(accent1, 0.24);
             let accent1_35 = hex_to_rgba(accent1, 0.35);
@@ -154,42 +162,57 @@ fn init_theme() {
             let bg_contrast_65 = hex_to_rgba(bg_contrast, 0.65);
             let bg_contrast_88 = hex_to_rgba(bg_contrast, 0.88);
 
+            // Mathematically normalized corner rounding (t in [0.0, 1.0]):
+            // 1.0 = exact current max radii (matching Hyprland's max rounding proportionally)
+            // 0.0 = 0px sharp corners everywhere
+            let r_scale = cfg.hyprland.rounding_scale.clamp(0.0, 1.0);
+            let sr = |max_px: f64| -> i32 { (max_px * r_scale).round() as i32 };
+            let r_outer = sr(16.0);
+            let r_lg = sr(12.0);
+            let r_md = sr(10.0);
+            let r_sm = sr(9.0);
+            let r_xs = sr(8.0);
+            let r_xxs = sr(7.0);
+            let r_bar = sr(6.0);
+            let r_chk = sr(5.0);
+            let r_sliv = sr(4.0);
+
             let css = format!(
                 r#"
                 window {{ background-color: transparent; }}
                 .drawer-container {{ transform: translateX(-415px); transition: transform 0.35s cubic-bezier(0.25, 0.8, 0.25, 1); }}
                 .drawer-container.open {{ transform: translateX(0px); }}
                 
-                .dash-box {{ background-color: {bg_main_glass}; border: 2px solid #{accent1}; border-left: none; border-top-right-radius: 16px; border-bottom-right-radius: 16px; min-width: 398px; }}
+                .dash-box {{ background-color: {bg_main_glass}; border: 2px solid #{accent1}; border-left: none; border-top-right-radius: {r_outer}px; border-bottom-right-radius: {r_outer}px; min-width: 398px; }}
                 .sidebar-column {{ background-color: {bg_recessed_glass}; border-right: 1px solid #{accent1}; }}
                 
-                .sidebar-nav-btn {{ background-color: transparent; border: none; border-radius: 10px; padding: 6px 10px; margin: 1px 4px; box-shadow: none; transition: background-color 0.18s ease, color 0.18s ease; }}
+                .sidebar-nav-btn {{ background-color: transparent; border: none; border-radius: {r_md}px; padding: 6px 10px; margin: 1px 4px; box-shadow: none; transition: background-color 0.18s ease, color 0.18s ease; }}
                 .sidebar-nav-btn:hover {{ background-color: {accent1_15}; }}
                 .sidebar-nav-btn.selected {{ background-color: {fg_main_06}; }}
                 .sidebar-nav-btn label {{ color: #{fg_muted}; font-family: 'Josefin Sans', sans-serif; font-size: 15px; font-weight: bold; }}
                 .sidebar-nav-btn.selected label {{ color: #{fg_main}; }}
                 .sidebar-sep {{ background-color: {accent1_35}; min-height: 1px; margin: 4px 10px; }}
                 
-                .fav-item-btn, .music-item-album, .music-item-playlist {{ background-color: transparent; border: none; border-radius: 12px; padding: 6px 8px; transition: background-color 0.15s ease; box-shadow: none; }}
+                .fav-item-btn, .music-item-album, .music-item-playlist {{ background-color: transparent; border: none; border-radius: {r_lg}px; padding: 6px 8px; transition: background-color 0.15s ease; box-shadow: none; }}
                 .fav-item-btn:hover, .music-item-album:hover, .music-item-playlist:hover {{ background-color: {accent1_15}; }}
                 .fav-item-btn.pinned, .music-item-album.pinned, .music-item-playlist.pinned {{ background-color: #{selection}; border: none; }}
                 
-                .music-art-frame {{ background-color: transparent; border: none; border-radius: 8px; min-width: 36px; min-height: 36px; box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.15); }}
+                .music-art-frame {{ background-color: transparent; border: none; border-radius: {r_xs}px; min-width: 36px; min-height: 36px; box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.15); }}
                 
-                .fav-search {{ background-color: {bg_contrast_65}; border: 1px solid transparent; border-radius: 10px; color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; padding: 7px 12px; transition: background-color 0.16s ease, border-color 0.16s ease; }}
+                .fav-search {{ background-color: {bg_contrast_65}; border: 1px solid transparent; border-radius: {r_md}px; color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; padding: 7px 12px; transition: background-color 0.16s ease, border-color 0.16s ease; }}
                 .fav-search:focus {{ background-color: {bg_contrast_88}; border-color: {accent1_55}; }}
                 
                 .fav-group-header {{ color: #{accent2}; font-weight: bold; font-size: 13px; font-family: 'MesloLGL Nerd Font', monospace; margin-left: 4px; letter-spacing: 1px; }}
                 .fav-score-badge {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 12px; font-weight: bold; }}
                 
-                .plan-fmt-btn, .plan-close-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: 10px; padding: 6px 11px; color: #{fg_main}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-weight: bold; box-shadow: none; transition: background-color 0.16s ease, color 0.16s ease; }}
+                .plan-fmt-btn, .plan-close-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 6px 11px; color: #{fg_main}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-weight: bold; box-shadow: none; transition: background-color 0.16s ease, color 0.16s ease; }}
                 .plan-fmt-btn label, .plan-close-btn label {{ color: #{fg_main}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-size: 14px; font-weight: bold; }}
                 .plan-fmt-btn:hover, .plan-close-btn:hover {{ background-color: {fg_main_15}; }}
                 .plan-fmt-btn.active, .plan-close-btn.active {{ background-color: {accent1_24}; border-color: transparent; color: #{accent2}; }}
                 .plan-fmt-btn.active label, .plan-close-btn.active label {{ color: #{accent2}; }}
                 .plan-fmt-btn.active:hover, .plan-close-btn.active:hover {{ background-color: {accent1_38}; }}
 
-                .primary-btn {{ background-color: {accent1_24}; border: 1px solid transparent; border-radius: 10px; padding: 7px 14px; color: #{accent2}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-weight: bold; box-shadow: none; transition: background-color 0.16s ease, color 0.16s ease; }}
+                .primary-btn {{ background-color: {accent1_24}; border: 1px solid transparent; border-radius: {r_md}px; padding: 7px 14px; color: #{accent2}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-weight: bold; box-shadow: none; transition: background-color 0.16s ease, color 0.16s ease; }}
                 .primary-btn label {{ color: #{accent2}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-size: 14px; font-weight: bold; }}
                 .primary-btn:hover {{ background-color: {accent1_38}; color: #{fg_main}; }}
                 .primary-btn:hover label {{ color: #{fg_main}; }}
@@ -197,11 +220,11 @@ fn init_theme() {
                 .primary-btn.active label {{ color: #f38ba8; }}
                 .primary-btn.active:hover {{ background-color: rgba(243, 139, 168, 0.34); }}
                 
-                .session-restore-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: 10px; padding: 7px 6px; margin: 4px 8px; box-shadow: none; transition: background-color 0.16s ease; }}
+                .session-restore-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 7px 6px; margin: 4px 8px; box-shadow: none; transition: background-color 0.16s ease; }}
                 .session-restore-btn:hover {{ background-color: {fg_main_15}; }}
                 .session-restore-lbl {{ color: #{accent2}; font-size: 12px; font-weight: bold; }}
 
-                .power-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: 10px; padding: 5px 2px; min-height: 28px; box-shadow: none; transition: background-color 0.16s ease; }}
+                .power-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 5px 2px; min-height: 28px; box-shadow: none; transition: background-color 0.16s ease; }}
                 .power-btn:hover {{ background-color: {fg_main_15}; }}
                 .power-btn-lbl {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', 'Josefin Sans', sans-serif; font-size: 14px; font-weight: bold; }}
                 .power-btn.active {{ background-color: {accent1_24}; }}
@@ -209,7 +232,7 @@ fn init_theme() {
                 .power-btn.armed {{ background-color: rgba(243, 139, 168, 0.24); border-color: transparent; }}
                 .power-btn.armed .power-btn-lbl {{ color: #f38ba8; font-family: 'Josefin Sans', sans-serif; font-size: 11px; }}
 
-                .sidebar-footer-btn {{ background-color: transparent; border: none; border-radius: 6px; padding: 2px 3px; margin: 0px; min-height: 0px; min-width: 0px; box-shadow: none; transition: background-color 0.15s ease; }}
+                .sidebar-footer-btn {{ background-color: transparent; border: none; border-radius: {r_bar}px; padding: 2px 3px; margin: 0px; min-height: 0px; min-width: 0px; box-shadow: none; transition: background-color 0.15s ease; }}
                 .sidebar-footer-btn:hover {{ background-color: {accent1_15}; }}
                 .sidebar-weather-lbl {{ color: #{accent2}; font-family: 'Josefin Sans', sans-serif; font-size: 13px; font-weight: bold; }}
                 .sidebar-clock-lbl {{ color: #{fg_main}; font-family: 'MesloLGL Nerd Font', 'Josefin Sans', sans-serif; font-size: 12px; font-weight: bold; }}
@@ -220,38 +243,38 @@ fn init_theme() {
                 .notif-unread .sidebar-status-lbl {{ color: #{accent2}; }}
 
                 .ws-top-bar {{ background-color: {bg_recessed_glass}; border-bottom: 1px solid {accent1_35}; padding: 6px 10px; }}
-                .ws-pill-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: 10px; padding: 2px 9px; min-width: 24px; min-height: 22px; box-shadow: none; transition: all 0.15s ease; }}
+                .ws-pill-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 2px 9px; min-width: 24px; min-height: 22px; box-shadow: none; transition: all 0.15s ease; }}
                 .ws-pill-btn label {{ color: #{fg_muted}; font-family: 'MesloLGL Nerd Font', sans-serif; font-size: 12px; font-weight: bold; }}
                 .ws-pill-btn:hover {{ background-color: {fg_main_15}; }}
                 .ws-pill-btn.active {{ background-color: {accent1_24}; border-color: transparent; }}
                 .ws-pill-btn.active label {{ color: #{accent2}; }}
-                .ws-preview-map {{ border-radius: 8px; }}
-                .top-tool-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: 9px; padding: 2px 7px; min-width: 24px; min-height: 22px; box-shadow: none; transition: background-color 0.15s ease; }}
+                .ws-preview-map {{ border-radius: {r_xs}px; }}
+                .top-tool-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_sm}px; padding: 2px 7px; min-width: 24px; min-height: 22px; box-shadow: none; transition: background-color 0.15s ease; }}
                 .top-tool-btn label {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', sans-serif; font-size: 13px; }}
                 .top-tool-btn:hover {{ background-color: {fg_main_15}; }}
-                .kbd-pill {{ background-color: {fg_main_08}; border-radius: 7px; padding: 3px 8px; color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 11px; font-weight: bold; }}
+                .kbd-pill {{ background-color: {fg_main_08}; border-radius: {r_xxs}px; padding: 3px 8px; color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 11px; font-weight: bold; }}
 
-                .wall-tile-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: 10px; padding: 4px; box-shadow: none; transition: all 0.15s ease; }}
+                .wall-tile-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 4px; box-shadow: none; transition: all 0.15s ease; }}
                 .wall-tile-btn:hover {{ background-color: {fg_main_15}; }}
                 .wall-tile-btn.active {{ border: 2px solid #{accent2}; background-color: {accent1_24}; }}
 
-                .tray-icon-btn {{ background-color: transparent; border: 1px solid transparent; border-radius: 7px; padding: 2px; min-width: 22px; min-height: 22px; box-shadow: none; transition: background-color 0.15s ease; }}
+                .tray-icon-btn {{ background-color: transparent; border: 1px solid transparent; border-radius: {r_xxs}px; padding: 2px; min-width: 22px; min-height: 22px; box-shadow: none; transition: background-color 0.15s ease; }}
                 .tray-icon-btn:hover {{ background-color: {fg_main_15}; }}
 
-                .media-edge-sliver {{ background-color: #{accent2}; border-radius: 4px; opacity: 0.85; transition: all 0.18s ease; }}
+                .media-edge-sliver {{ background-color: #{accent2}; border-radius: {r_sliv}px; opacity: 0.85; transition: all 0.18s ease; }}
                 .media-edge-sliver.paused {{ background-color: #{accent1}; opacity: 0.55; }}
                 .media-edge-sliver.active {{ opacity: 0.35; }}
-                .media-popout-pill {{ background-color: {bg_main_glass}; border: 2px solid #{accent1}; border-radius: 16px; padding: 6px 12px; transition: background-color 0.15s ease; }}
+                .media-popout-pill {{ background-color: {bg_main_glass}; border: 2px solid #{accent1}; border-radius: {r_outer}px; padding: 6px 12px; transition: background-color 0.15s ease; }}
                 .media-popout-pill:hover {{ background-color: {bg_pill_glass}; }}
                 .media-pill-lbl {{ color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 13px; font-weight: bold; }}
-                .media-popout-card {{ background-color: {bg_main_glass}; border: 2px solid #{accent1}; border-radius: 16px; padding: 12px 14px; }}
+                .media-popout-card {{ background-color: {bg_main_glass}; border: 2px solid #{accent1}; border-radius: {r_outer}px; padding: 12px 14px; }}
                 .media-popout-title {{ color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 15px; font-weight: bold; }}
-                .media-art-box {{ background-color: #{bg_recessed}; border: 1px solid #{selection}; border-radius: 10px; }}
+                .media-art-box {{ background-color: #{bg_recessed}; border: 1px solid #{selection}; border-radius: {r_md}px; }}
 
-                calendar.lily-calendar {{ background-color: #{bg_recessed}; border: 1px solid #{accent1}; border-radius: 12px; color: #{fg_main}; padding: 4px; font-family: 'Josefin Sans', sans-serif; font-size: 13px; }}
+                calendar.lily-calendar {{ background-color: #{bg_recessed}; border: 1px solid #{accent1}; border-radius: {r_lg}px; color: #{fg_main}; padding: 4px; font-family: 'Josefin Sans', sans-serif; font-size: 13px; }}
                 calendar.lily-calendar > header {{ color: #{accent2}; font-weight: bold; border-bottom: 1px solid #{selection}; padding-bottom: 4px; }}
                 calendar.lily-calendar > grid > label.day-name {{ color: #{fg_muted}; font-weight: bold; }}
-                calendar.lily-calendar > grid > label.day-number {{ border-radius: 8px; padding: 3px; }}
+                calendar.lily-calendar > grid > label.day-number {{ border-radius: {r_xs}px; padding: 3px; }}
                 calendar.lily-calendar > grid > label.day-number:selected {{ background-color: #{accent2}; color: #{bg_contrast}; font-weight: bold; }}
                 calendar.lily-calendar > grid > label.day-number.today {{ border: 1px solid #{accent1}; font-weight: bold; }}
                 calendar.lily-calendar > grid > label.day-number.other-month {{ opacity: 0.35; }}
@@ -262,8 +285,8 @@ fn init_theme() {
                 .trigger-btn {{ background-color: #{bg_pill}; border: 2px solid #{accent1}; border-left: none; border-top-right-radius: 100px; border-bottom-right-radius: 100px; min-width: 50px; min-height: 100px; padding: 0; transform: translateX(-36px); transition-property: transform, background-color; transition-duration: 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1); }}
                 .trigger-btn.peeking, .trigger-btn.riding {{ background-color: #{selection}; transform: translateX(0px); }}
                 
-                popover.fav-popover > contents {{ background-color: {bg_main_glass}; border: 1px solid {accent1_35}; border-radius: 12px; padding: 6px; }}
-                .fav-hide-btn {{ background-color: {fg_main_08}; border: none; border-radius: 9px; padding: 6px 12px; color: #{fg_main}; box-shadow: none; transition: background-color 0.15s ease; }}
+                popover.fav-popover > contents {{ background-color: {bg_main_glass}; border: 1px solid {accent1_35}; border-radius: {r_lg}px; padding: 6px; }}
+                .fav-hide-btn {{ background-color: {fg_main_08}; border: none; border-radius: {r_sm}px; padding: 6px 12px; color: #{fg_main}; box-shadow: none; transition: background-color 0.15s ease; }}
                 .fav-hide-btn:hover {{ background-color: {fg_main_15}; }}
                 
                 .plan-detail-pane {{ background-color: {bg_main_glass}; border-left: 2px solid #{selection}; min-width: 400px; }}
@@ -274,58 +297,55 @@ fn init_theme() {
                 .plan-body {{ color: #{fg_main}; font-size: 14px; }}
                 .plan-subnote {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 12px; }}
                 .plan-checked-text {{ opacity: 0.55; text-decoration: line-through; }}
-                .plan-check-row {{ background-color: #{bg_recessed}; border: 1px solid #{selection}; border-radius: 10px; padding: 6px 10px; }}
-                checkbutton.plan-checkbox > check {{ background-color: #{bg_pill}; border: 2px solid #{accent1}; border-radius: 5px; min-width: 18px; min-height: 18px; }}
+                .plan-check-row {{ background-color: #{bg_recessed}; border: 1px solid #{selection}; border-radius: {r_md}px; padding: 6px 10px; }}
+                checkbutton.plan-checkbox > check {{ background-color: #{bg_pill}; border: 2px solid #{accent1}; border-radius: {r_chk}px; min-width: 18px; min-height: 18px; }}
                 checkbutton.plan-checkbox:checked > check {{ background-color: #{accent2}; border-color: #{accent2}; color: #{bg_main}; }}
                 
                 .plan-composer-dock {{ background-color: {bg_recessed_glass}; border-top: 1px solid {accent1_35}; padding: 10px 14px; }}
-                .plan-delete-menu-btn {{ background-color: rgba(243, 139, 168, 0.14); border: none; border-radius: 9px; padding: 6px 12px; color: #f38ba8; font-weight: bold; box-shadow: none; transition: background-color 0.15s ease; }}
+                .plan-delete-menu-btn {{ background-color: rgba(243, 139, 168, 0.14); border: none; border-radius: {r_sm}px; padding: 6px 12px; color: #f38ba8; font-weight: bold; box-shadow: none; transition: background-color 0.15s ease; }}
                 .plan-delete-menu-btn:hover {{ background-color: rgba(243, 139, 168, 0.26); }}
-                .plan-line-del-btn {{ background-color: transparent; border: 1px solid transparent; border-radius: 7px; padding: 0px 5px; color: #{fg_muted}; font-family: 'Josefin Sans', sans-serif; font-size: 14px; font-weight: bold; min-width: 24px; min-height: 24px; box-shadow: none; transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease; }}
+                .plan-line-del-btn {{ background-color: transparent; border: 1px solid transparent; border-radius: {r_xxs}px; padding: 0px 5px; color: #{fg_muted}; font-family: 'Josefin Sans', sans-serif; font-size: 14px; font-weight: bold; min-width: 24px; min-height: 24px; box-shadow: none; transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease; }}
                 .plan-line-del-btn label {{ color: #{fg_muted}; font-size: 14px; font-weight: bold; }}
                 .plan-line-del-btn:hover {{ background-color: rgba(243, 139, 168, 0.16); border-color: rgba(243, 139, 168, 0.42); color: #f38ba8; }}
                 .plan-line-del-btn:hover label {{ color: #f38ba8; }}
                 
                 .plan-drag-handle {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 13px; font-weight: bold; padding: 2px 4px; opacity: 0.7; }}
-                .plan-edit-row {{ border: 1px solid transparent; border-radius: 8px; padding: 2px 4px; transition: background-color 0.1s ease, border-color 0.1s ease; }}
+                .plan-edit-row {{ border: 1px solid transparent; border-radius: {r_xs}px; padding: 2px 4px; transition: background-color 0.1s ease, border-color 0.1s ease; }}
                 .plan-edit-row:hover {{ background-color: #{bg_recessed}; }}
                 .plan-edit-row.dragging {{ opacity: 0.4; }}
                 .plan-edit-row.drop-target {{ border: 2px dashed #{accent2}; background-color: #{bg_pill}; }}
                 
                 scale.music-seek {{ padding: 2px 0px; }}
-                scale.music-seek > trough {{ background-color: {fg_main_08}; border: none; border-radius: 6px; min-height: 6px; }}
-                scale.music-seek > trough > highlight {{ background-color: #{accent2}; border-radius: 6px; }}
+                scale.music-seek > trough {{ background-color: {fg_main_08}; border: none; border-radius: {r_bar}px; min-height: 6px; }}
+                scale.music-seek > trough > highlight {{ background-color: #{accent2}; border-radius: {r_bar}px; }}
                 scale.music-seek > trough > slider {{ background-color: #{bg_main}; border: 2px solid #{accent2}; border-radius: 50%; min-width: 12px; min-height: 12px; margin: -4px 0px; }}
                 
-                progressbar.drive-progress > trough {{ background-color: {fg_main_08}; border: none; border-radius: 6px; min-height: 10px; }}
-                progressbar.drive-progress > trough > progress {{ background-color: #{accent2}; border-radius: 6px; min-height: 10px; }}
+                progressbar.drive-progress > trough {{ background-color: {fg_main_08}; border: none; border-radius: {r_bar}px; min-height: 10px; }}
+                progressbar.drive-progress > trough > progress {{ background-color: #{accent2}; border-radius: {r_bar}px; min-height: 10px; }}
                 "#
             );
             
-            // Fix 1: Pass the string directly instead of converting to bytes
             provider.load_from_data(&css);
-        }
+        })
     };
 
-    // Load it immediately on startup
+    // Load immediately on startup
     update_css();
 
-    // Attach FileMonitor so it live-updates instantly when you run theme-switch!
-    let mut path = glib::user_config_dir();
-    path.push("theme-switch");
-    path.push("current.conf");
-    let file = gtk4::gio::File::for_path(&path);
-    
+    // Watch external theme file if configured
+    let watch_path = config::expand_path(&config::get().paths.theme_conf_file);
+    let file = gtk4::gio::File::for_path(&watch_path);
     if let Ok(monitor) = file.monitor_file(gtk4::gio::FileMonitorFlags::NONE, gtk4::gio::Cancellable::NONE) {
+        let cb = update_css.clone();
         monitor.connect_changed(move |_, _, _, event| {
             if event == gtk4::gio::FileMonitorEvent::ChangesDoneHint || event == gtk4::gio::FileMonitorEvent::Created {
-                update_css();
+                cb();
             }
         });
-        
-        // Fix 2: Explicitly tell Rust to use the memory Box, not the GTK UI Box!
-        std::boxed::Box::leak(std::boxed::Box::new(monitor)); 
+        std::boxed::Box::leak(std::boxed::Box::new(monitor));
     }
+
+    update_css
 }
 
 fn update_input_region(window: &ApplicationWindow, is_open: bool, dash_width: i32) {
@@ -388,7 +408,11 @@ fn move_to_monitor(window: &ApplicationWindow, target: Option<&str>) {
         }
     }
 }
-fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) -> Button {
+fn build_ui(
+    app: &Application,
+    media_handle: media_popout::MediaPopoutHandle,
+    reload_theme: Rc<dyn Fn()>,
+) -> Button {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Lily Dashboard")
@@ -490,6 +514,7 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
     ];
 
     let mut nav_buttons: Vec<(&'static str, Button)> = Vec::new();
+    let mut nav_seps: Vec<(usize, Box)> = Vec::new();
     for (gi, group) in nav_groups.iter().enumerate() {
         if gi > 0 {
             let sep = Box::builder()
@@ -498,6 +523,7 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
                 .css_classes(vec!["sidebar-sep".to_string()])
                 .build();
             sidebar_nav.append(&sep);
+            nav_seps.push((gi, sep));
         }
         for &(id, title) in *group {
             let lbl = Label::builder()
@@ -518,6 +544,36 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
         }
     }
 
+    let apply_tab_visibility: Rc<dyn Fn()> = {
+        let btns = nav_buttons.clone();
+        let seps = nav_seps.clone();
+        Rc::new(move || {
+            let vis = config::get().visible_tabs;
+            let is_vis = |id: &str| match id {
+                "favs" => vis.favorites,
+                "clipboard" => vis.clipboard,
+                "plans" => vis.plans,
+                "calendar" => vis.calendar,
+                "timers" => vis.timers,
+                "music" => vis.music,
+                "drive" => vis.drive,
+                "passwords" => vis.passwords,
+                "locker" => vis.locker,
+                _ => true,
+            };
+            for (id, btn) in &btns {
+                btn.set_visible(is_vis(id));
+            }
+            for (gi, sep) in &seps {
+                let any_in_group = nav_groups[*gi].iter().any(|(id, _)| is_vis(id));
+                sep.set_visible(any_in_group);
+            }
+            favorites::set_scoring_enabled(vis.favorites);
+            clipboard::set_watcher_enabled(vis.clipboard);
+        })
+    };
+    apply_tab_visibility();
+
     let reload_lbl = Label::builder()
         .label("Reload Dashboard")
         .halign(gtk4::Align::Start)
@@ -528,16 +584,33 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
         .child(&reload_lbl)
         .halign(gtk4::Align::Start)
         .css_classes(vec!["sidebar-footer-btn".to_string()])
-        .tooltip_text("Recompile release binary and restart Lily Dashboard")
+        .tooltip_text("Rebuild (if source repo configured) and restart Lily Dashboard")
         .build();
 
     let app_for_reload = app.clone();
     let lbl_for_reload = reload_lbl.clone();
     reload_btn.connect_clicked(move |btn| {
+        let repo_dir_str = config::get().paths.source_repo_dir;
+        let repo_path = config::expand_path(&repo_dir_str);
+        let can_build = !repo_dir_str.trim().is_empty() && repo_path.join("Cargo.toml").is_file();
+
+        if !can_build {
+            // Prebuilt binary install: simply restart the current executable cleanly
+            if let Ok(exe) = std::env::current_exe() {
+                let exe_str = exe.to_string_lossy().replace('\'', "'\\''");
+                let _ = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("sleep 0.2 && '{}' &", exe_str))
+                    .spawn();
+                app_for_reload.quit();
+            }
+            return;
+        }
+
         btn.set_sensitive(false);
         lbl_for_reload.set_label("Building...");
 
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<std::path::PathBuf, String>>();
 
         std::thread::spawn(move || {
             let run_cargo = |offline: bool| {
@@ -546,13 +619,14 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
                 if offline {
                     cmd.arg("--offline");
                 }
-                cmd.current_dir("/home/lilypersilly/lily-dashboard").output()
+                cmd.current_dir(&repo_path).output()
             };
 
+            let target_bin = repo_path.join("target/release/lily-dashboard");
             let res = match run_cargo(false) {
-                Ok(out) if out.status.success() => Ok(()),
+                Ok(out) if out.status.success() => Ok(target_bin),
                 first => match run_cargo(true) {
-                    Ok(out) if out.status.success() => Ok(()),
+                    Ok(out) if out.status.success() => Ok(target_bin),
                     Ok(out) => {
                         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
                         let _ = std::fs::write("/tmp/lily-reload.log", &stderr);
@@ -581,10 +655,11 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
         glib::timeout_add_local(Duration::from_millis(100), move || {
             if let Ok(result) = rx.try_recv() {
                 match result {
-                    Ok(()) => {
+                    Ok(bin_path) => {
+                        let bin_str = bin_path.to_string_lossy().replace('\'', "'\\''");
                         let _ = std::process::Command::new("sh")
                             .arg("-c")
-                            .arg("sleep 0.2 && /home/lilypersilly/lily-dashboard/target/release/lily-dashboard &")
+                            .arg(format!("sleep 0.2 && '{}' &", bin_str))
                             .spawn();
                         app_quit.quit();
                     }
@@ -842,7 +917,12 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
             .and_then(|dt| dt.format("%a %d %b %Y").ok())
             .map(|s| s.to_string())
             .unwrap_or_default();
-        format!("{}\nLeft-click: Toggle Nixie Clock | Right-click: Open Calendar", date_str)
+        let cfg = config::get();
+        if cfg.tools.clock_click_mode == "custom" && !cfg.tools.clock_click_cmd.trim().is_empty() {
+            format!("{}\nLeft-click: Custom clock action | Right-click: Open Calendar", date_str)
+        } else {
+            format!("{}\nClick: Open Calendar", date_str)
+        }
     };
 
     let clock_lbl = Label::builder()
@@ -859,15 +939,22 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
         .tooltip_text(&format_today_tip())
         .build();
 
-    // Left-click clock: toggle Steins;Gate Nixie divergence-popup!
-    clock_btn.connect_clicked(move |_| {
-        let _ = std::process::Command::new("sh")
-            .args([
-                "-c",
-                "if pgrep -f 'divergence-popup' >/dev/null; then pkill -f 'divergence-popup'; else ~/.local/bin/divergence-popup & fi",
-            ])
-            .spawn();
-    });
+    // Left-click clock: run configured custom command or open built-in Calendar tab
+    {
+        let stack_clk = stack.clone();
+        clock_btn.connect_clicked(move |_| {
+            let cfg = config::get();
+            if cfg.tools.clock_click_mode == "custom"
+                && !cfg.tools.clock_click_cmd.trim().is_empty()
+            {
+                let _ = std::process::Command::new("sh")
+                    .args(["-c", &cfg.tools.clock_click_cmd])
+                    .spawn();
+            } else {
+                stack_clk.set_visible_child_name("calendar");
+            }
+        });
+    }
 
     // Right-click clock: jump straight to the Calendar tab
     {
@@ -1029,6 +1116,8 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
     }
 
     let close_for_sys = close_drawer_cb.clone();
+    let reload_theme_for_sys = reload_theme.clone();
+    let apply_tabs_for_sys = apply_tab_visibility.clone();
     let run_slot_c = run_slot.clone();
     let passwords_slot_c = passwords_slot.clone();
     let drive_slot_c = drive_slot.clone();
@@ -1146,7 +1235,11 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
             }
             Some("system") => {
                 if system_ui_c.borrow().is_none() {
-                    let sys_ui = system::build_system_ui(close_for_sys.clone());
+                    let sys_ui = system::build_system_ui(
+                        close_for_sys.clone(),
+                        reload_theme_for_sys.clone(),
+                        apply_tabs_for_sys.clone(),
+                    );
                     system_slot_c.append(&sys_ui.list_view);
                     dash_for_sys.append(&sys_ui.detail_view);
                     *system_ui_c.borrow_mut() = Some(sys_ui);

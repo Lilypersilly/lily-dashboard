@@ -34,14 +34,10 @@ enum FormatKind {
 }
 
 fn get_plans_dir() -> PathBuf {
-    let home = glib::home_dir();
-    let lower = home.join("documents").join("plans");
-    if lower.exists() {
-        return lower;
-    }
-    let upper = home.join("Documents").join("plans");
-    let _ = fs::create_dir_all(&upper);
-    upper
+    let configured = crate::config::get().paths.plans_dir;
+    let dir = crate::config::expand_path(&configured);
+    let _ = fs::create_dir_all(&dir);
+    dir
 }
 
 fn style_wrapped_label(lbl: &Label, edit_mode: bool) {
