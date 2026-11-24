@@ -1,3 +1,8 @@
+//! Cloud upload tab wrapping `rclone copy`.
+//!
+//! Lets the user pick a file or directory, set a remote path and optional bandwidth
+//! limit, stream live transfer progress into a progress bar, and cancel in-flight jobs.
+
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
@@ -130,7 +135,7 @@ pub fn build_drive_ui() -> Box {
 
     let action_btn = Button::builder()
         .label("Start Upload")
-        .css_classes(vec!["fav-item-btn".to_string()])
+        .css_classes(vec!["primary-btn".to_string()])
         .build();
 
     content.append(&progress_bar);

@@ -1,16 +1,118 @@
+//! System tab and 400px slide-out detail pane.
+//!
+//! Hosts Sound (`pactl`), Network (`nmcli`), Themes (`theme-switch`), Wallpapers
+//! (`swww` with paired vertical crops and RAM-only thumbnails), Displays (`hyprctl`),
+//! Keybinds (live parser for `~/.config/hypr/binds.lua`), and Overview (CPU/RAM/GPU
+//! stats, `lumine-capture` screenshots, and a `slurp`+`grim` screen color picker).
+
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box, Button, DrawingArea, Entry, Label, Orientation, PolicyType, ProgressBar, Scale,
-    ScrolledWindow, Stack, StackTransitionType,
+    Align, Box, Button, DrawingArea, Entry, FlowBox, Label, Orientation, Overflow, Picture,
+    PolicyType, ProgressBar, Scale, ScrolledWindow, SelectionMode, Stack, StackTransitionType,
 };
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
 use std::fs;
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
+
+static LAST_PICKED_COLOR: Mutex<Option<(u8, u8, u8)>> = Mutex::new(None);
+
+#[derive(Clone, Copy, Debug)]
+pub enum CaptureMode {
+    RegionEditor,
+    Monitor,
+    Full,
+    RegionOcr,
+}
+
+/// Closes the dashboard drawer, waits for the 350ms slide-out animation, then runs `lumine-capture`.
+pub fn launch_capture(mode: CaptureMode, close_drawer: &Rc<dyn Fn()>) {
+    close_drawer();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(380));
+        let mut cmd = Command::new("lumine-capture");
+        match mode {
+            CaptureMode::RegionEditor => {}
+            CaptureMode::Monitor => {
+                cmd.arg("-m");
+            }
+            CaptureMode::Full => {
+                cmd.arg("-f");
+            }
+            CaptureMode::RegionOcr => {
+                cmd.args(["-r", "ocr", "-t", "c"]);
+            }
+        }
+        let _ = cmd.spawn();
+    });
+}
+
+/// Native Wayland color picker using `slurp -p` + `grim -t ppm -` + `wl-copy`.
+pub fn launch_color_picker(close_drawer: &Rc<dyn Fn()>) {
+    launch_color_picker_inner(close_drawer, None);
+}
+
+fn launch_color_picker_inner(
+    close_drawer: &Rc<dyn Fn()>,
+    on_picked: Option<mpsc::Sender<SystemMsg>>,
+) {
+    close_drawer();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(380));
+        let Ok(slurp_out) = Command::new("slurp").arg("-p").output() else {
+            return;
+        };
+        if !slurp_out.status.success() {
+            return;
+        }
+        let geom = String::from_utf8_lossy(&slurp_out.stdout).trim().to_string();
+        if geom.is_empty() {
+            return;
+        }
+        let Ok(grim_out) = Command::new("grim")
+            .args(["-g", &geom, "-t", "ppm", "-"])
+            .output()
+        else {
+            return;
+        };
+        if !grim_out.status.success()
+            || !grim_out.stdout.starts_with(b"P6")
+            || grim_out.stdout.len() < 3
+        {
+            return;
+        }
+        let len = grim_out.stdout.len();
+        let (r, g, b) = (
+            grim_out.stdout[len - 3],
+            grim_out.stdout[len - 2],
+            grim_out.stdout[len - 1],
+        );
+        let hex = format!("#{:02x}{:02x}{:02x}", r, g, b);
+        let rgb = format!("rgb({}, {}, {})", r, g, b);
+
+        if let Ok(mut guard) = LAST_PICKED_COLOR.lock() {
+            *guard = Some((r, g, b));
+        }
+
+        let _ = Command::new("wl-copy").args(["--", &hex]).status();
+        let _ = Command::new("notify-send")
+            .args([
+                "-a",
+                "Lily Dashboard",
+                "Color Picked (Copied)",
+                &format!("{}  •  {}", hex, rgb),
+            ])
+            .spawn();
+
+        if let Some(tx) = on_picked {
+            let _ = tx.send(SystemMsg::ColorPicked);
+        }
+    });
+}
 
 pub struct SystemUi {
     pub list_view: Box,
@@ -115,14 +217,42 @@ struct ThemeEntry {
     is_active: bool,
 }
 
+#[derive(Clone, Debug)]
+struct WallpaperEntry {
+    path: String,
+    name: String,
+    has_vertical_pair: bool,
+    is_active: bool,
+}
+
+#[derive(Clone, Debug)]
+struct KeybindEntry {
+    group: String,
+    keys: String,
+    desc: String,
+    raw: String,
+}
+
 enum SystemMsg {
     Audio(AudioSnapshot),
     Network(NetworkSnapshot),
     NetworkAction(String),
     Displays(Vec<MonitorInfo>),
+    Keybinds(Vec<KeybindEntry>),
     Overview(OverviewSnapshot),
+    ColorPicked,
     Themes(Vec<ThemeEntry>),
     ThemeApplied(String),
+    Wallpapers(Vec<WallpaperEntry>),
+    WallpaperThumb {
+        path: String,
+        bytes: glib::Bytes,
+        has_alpha: bool,
+        rowstride: usize,
+        width: i32,
+        height: i32,
+    },
+    WallpaperApplied(String),
 }
 
 // ==========================================
@@ -645,11 +775,539 @@ fn fetch_themes_snapshot() -> Vec<ThemeEntry> {
     themes
 }
 
+const WALL_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+
+fn wallpaper_dir() -> std::path::PathBuf {
+    glib::home_dir().join("Pictures").join("Wallpapers")
+}
+
+fn wallpaper_state_file() -> std::path::PathBuf {
+    glib::user_config_dir()
+        .join("hypr")
+        .join(".current_wallpaper")
+}
+
+/// Finds a paired vertical wallpaper in `~/Pictures/Wallpapers/vertical/` (adapted from wallpaper-carousel.py)
+fn find_vertical_pair(img_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let vert_dir = wallpaper_dir().join("vertical");
+    if !vert_dir.is_dir() {
+        return None;
+    }
+    if let Some(base) = img_path.file_name() {
+        let exact = vert_dir.join(base);
+        if exact.is_file() {
+            return Some(exact);
+        }
+    }
+    if let Some(stem) = img_path.file_stem().and_then(|s| s.to_str()) {
+        for ext in WALL_EXTS {
+            let alt = vert_dir.join(format!("{}.{}", stem, ext));
+            if alt.is_file() {
+                return Some(alt);
+            }
+        }
+    }
+    None
+}
+
+fn fetch_wallpapers_snapshot() -> Vec<WallpaperEntry> {
+    let dir = wallpaper_dir();
+    let current = fs::read_to_string(wallpaper_state_file())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut list = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        if !WALL_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        let path_str = path.to_string_lossy().to_string();
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Wallpaper")
+            .to_string();
+        let has_vertical_pair = find_vertical_pair(&path).is_some();
+        let is_active = !current.is_empty() && current == path_str;
+        list.push(WallpaperEntry {
+            path: path_str,
+            name,
+            has_vertical_pair,
+            is_active,
+        });
+    }
+    list.sort_by(|a, b| {
+        match (a.name.parse::<u64>(), b.name.parse::<u64>()) {
+            (Ok(na), Ok(nb)) => na.cmp(&nb),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Err(_)) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        }
+    });
+    list
+}
+
+fn decode_wallpaper_thumb(path: &str) -> Option<(glib::Bytes, bool, usize, i32, i32)> {
+    use gtk4::gdk_pixbuf::{InterpType, Pixbuf};
+    let pix = Pixbuf::from_file(path).ok()?;
+    let pw = pix.width();
+    let ph = pix.height();
+    if pw <= 0 || ph <= 0 {
+        return None;
+    }
+    let target_w = 166;
+    let target_h = 94;
+    let scale = (target_w as f64 / pw as f64).max(target_h as f64 / ph as f64);
+    let sw = ((pw as f64 * scale).round() as i32).max(target_w);
+    let sh = ((ph as f64 * scale).round() as i32).max(target_h);
+    let scaled = pix.scale_simple(sw, sh, InterpType::Bilinear)?;
+    let ox = ((sw - target_w) / 2).max(0);
+    let oy = ((sh - target_h) / 2).max(0);
+    let cropped = scaled.new_subpixbuf(ox, oy, target_w, target_h);
+    Some((
+        cropped.read_pixel_bytes(),
+        cropped.has_alpha(),
+        cropped.rowstride() as usize,
+        cropped.width(),
+        cropped.height(),
+    ))
+}
+
+/// Applies wallpaper natively via `swww img` with per-monitor orientation & vertical pairs
+/// (adapted directly from wallpaper-carousel.py).
+fn apply_wallpaper_native(path: &str) -> Result<String, String> {
+    let p = std::path::Path::new(path);
+    if !p.is_file() {
+        return Err("Wallpaper file not found".to_string());
+    }
+    let state_path = wallpaper_state_file();
+    if let Some(parent) = state_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&state_path, path);
+
+    let vert_path = find_vertical_pair(p)
+        .map(|vp| vp.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+
+    // Ensure swww-daemon / awww-daemon is running
+    let daemon_running = Command::new("pgrep")
+        .args(["-x", "swww-daemon"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        || Command::new("pgrep")
+            .args(["-x", "awww-daemon"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    if !daemon_running {
+        let _ = Command::new("swww-daemon")
+            .args(["--format", "xrgb"])
+            .spawn();
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let mut applied_any = false;
+    if let Ok(out) = Command::new("hyprctl").args(["monitors", "-j"]).output() {
+        if let Ok(arr) = serde_json::from_slice::<Vec<Value>>(&out.stdout) {
+            for m in arr {
+                let Some(name) = m.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let transform = m.get("transform").and_then(|v| v.as_i64()).unwrap_or(0);
+                let width = m.get("width").and_then(|v| v.as_i64()).unwrap_or(1920);
+                let height = m.get("height").and_then(|v| v.as_i64()).unwrap_or(1080);
+                let is_vert = transform == 1 || transform == 3 || height > width;
+                let pos = if is_vert { "top-left" } else { "top-right" };
+                let target_img = if is_vert { vert_path.as_str() } else { path };
+
+                let _ = Command::new("swww")
+                    .args([
+                        "img",
+                        "-o",
+                        name,
+                        target_img,
+                        "--resize",
+                        "crop",
+                        "--transition-type",
+                        "grow",
+                        "--transition-pos",
+                        pos,
+                        "--transition-fps",
+                        "144",
+                        "--transition-step",
+                        "200",
+                        "--transition-bezier",
+                        ".25,.1,.25,1",
+                        "--transition-duration",
+                        "1.4",
+                    ])
+                    .spawn();
+                applied_any = true;
+            }
+        }
+    }
+
+    if !applied_any {
+        let _ = Command::new("swww")
+            .args([
+                "img",
+                path,
+                "--resize",
+                "crop",
+                "--transition-type",
+                "grow",
+                "--transition-pos",
+                "top-right",
+                "--transition-fps",
+                "144",
+            ])
+            .spawn();
+    }
+
+    let label = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("wallpaper")
+        .to_string();
+    Ok(format!("Applied {}", label))
+}
+
 // ==========================================
 // UI BUILDER
 // ==========================================
 
-pub fn build_system_ui() -> SystemUi {
+fn parse_quoted_str(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] != b'"' && bytes[i] != b'\'' {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let quote = bytes[i];
+    i += 1;
+    let mut out = String::new();
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            out.push(bytes[i + 1] as char);
+            i += 2;
+            continue;
+        }
+        if bytes[i] == quote {
+            return Some(out);
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    None
+}
+
+fn prettify_key_combo(raw: &str) -> String {
+    let mut s = raw
+        .replace("Super_L", "(Tap)")
+        .replace("mouse:272", "Left Drag")
+        .replace("mouse:273", "Right Drag")
+        .replace("mouse_down", "Scroll Down")
+        .replace("mouse_up", "Scroll Up")
+        .replace("XF86AudioRaiseVolume", "Vol Up")
+        .replace("XF86AudioLowerVolume", "Vol Down")
+        .replace("XF86AudioMute", "Audio Mute")
+        .replace("XF86AudioMicMute", "Mic Mute")
+        .replace("XF86MonBrightnessUp", "Brightness Up")
+        .replace("XF86MonBrightnessDown", "Brightness Down")
+        .replace("XF86AudioNext", "Media Next")
+        .replace("XF86AudioPrev", "Media Prev")
+        .replace("XF86AudioPause", "Media Pause")
+        .replace("XF86AudioPlay", "Media Play")
+        .replace(" + (Tap)", " (Tap)")
+        .trim()
+        .to_string();
+    // Uppercase single vim/letter keys cleanly after '+'
+    if let Some((prefix, last)) = s.rsplit_once(" + ") {
+        if last.len() == 1 && last.chars().all(|c| c.is_ascii_lowercase()) {
+            s = format!("{} + {}", prefix, last.to_uppercase());
+        }
+    }
+    s
+}
+
+fn describe_bind_action(action: &str) -> (String, String) {
+    let a = action.trim();
+    if let Some(rest) = a.strip_prefix("hl.dsp.exec_cmd(") {
+        let cmd = parse_quoted_str(rest).unwrap_or_else(|| rest.to_string());
+        if cmd.contains("lumine-capture") {
+            let desc = if cmd.contains("-m") {
+                "Screenshot active monitor".to_string()
+            } else if cmd.contains("-f") {
+                "Screenshot all monitors".to_string()
+            } else if cmd.contains("ocr") {
+                "Region OCR to clipboard".to_string()
+            } else {
+                "Screenshot region / editor".to_string()
+            };
+            return ("CAPTURE & SCREENSHOTS".to_string(), desc);
+        }
+        if cmd.contains("swayosd-client") || cmd.contains("playerctl") {
+            let desc = if cmd.contains("output-volume raise") {
+                "Volume up".to_string()
+            } else if cmd.contains("output-volume lower") {
+                "Volume down".to_string()
+            } else if cmd.contains("output-volume mute") {
+                "Toggle audio mute".to_string()
+            } else if cmd.contains("input-volume mute") {
+                "Toggle mic mute".to_string()
+            } else if cmd.contains("brightness raise") {
+                "Brightness up".to_string()
+            } else if cmd.contains("brightness lower") {
+                "Brightness down".to_string()
+            } else if cmd.contains("playerctl next") {
+                "Next track".to_string()
+            } else if cmd.contains("playerctl previous") {
+                "Previous track".to_string()
+            } else if cmd.contains("playerctl play-pause") {
+                "Play / pause media".to_string()
+            } else {
+                cmd.clone()
+            };
+            return ("MEDIA & HARDWARE".to_string(), desc);
+        }
+        let desc = if cmd.contains("lily-dashboard") {
+            "Toggle Lily Dashboard".to_string()
+        } else if cmd.contains("kitty") {
+            "Open terminal (kitty)".to_string()
+        } else if cmd.contains("dolphin") {
+            "Open file manager (dolphin)".to_string()
+        } else if cmd.contains("wofi") {
+            "Toggle app launcher (wofi)".to_string()
+        } else if cmd.contains("hyprlauncher") {
+            "Open hyprlauncher".to_string()
+        } else if cmd.contains("power-menu") {
+            "Open power menu".to_string()
+        } else if cmd.contains("wallpaper-carousel") {
+            "Open wallpaper carousel".to_string()
+        } else if cmd.contains("waybar") {
+            "Restart Waybar".to_string()
+        } else {
+            format!("Run: {}", cmd)
+        };
+        return ("APPS & LAUNCHERS".to_string(), desc);
+    }
+
+    if a.starts_with("hl.dsp.window.close") {
+        return ("WINDOW MANAGEMENT".to_string(), "Close active window".to_string());
+    }
+    if a.starts_with("hl.dsp.window.float") {
+        return ("WINDOW MANAGEMENT".to_string(), "Toggle floating window".to_string());
+    }
+    if a.starts_with("hl.dsp.window.fullscreen") {
+        return ("WINDOW MANAGEMENT".to_string(), "Toggle fullscreen".to_string());
+    }
+    if a.starts_with("hl.dsp.window.drag") {
+        return ("WINDOW MANAGEMENT".to_string(), "Move window (mouse drag)".to_string());
+    }
+    if a.starts_with("hl.dsp.window.resize") {
+        return ("WINDOW MANAGEMENT".to_string(), "Resize window (mouse drag)".to_string());
+    }
+    if a.starts_with("hl.dsp.layout(") {
+        let mode = parse_quoted_str(a).unwrap_or_else(|| "layout".to_string());
+        let desc = if mode == "togglesplit" {
+            "Toggle dwindle split direction".to_string()
+        } else {
+            format!("Layout: {}", mode)
+        };
+        return ("WINDOW MANAGEMENT".to_string(), desc);
+    }
+    if a.starts_with("hl.dsp.focus(") {
+        if let Some(dir_pos) = a.find("direction") {
+            if let Some(dir) = parse_quoted_str(&a[dir_pos..]) {
+                return ("WINDOW MANAGEMENT".to_string(), format!("Focus {}", dir));
+            }
+        }
+        if a.contains("e+1") {
+            return ("WORKSPACES & SCRATCHPADS".to_string(), "Next workspace".to_string());
+        }
+        if a.contains("e-1") {
+            return ("WORKSPACES & SCRATCHPADS".to_string(), "Previous workspace".to_string());
+        }
+        if a.contains("workspace") {
+            return ("WORKSPACES & SCRATCHPADS".to_string(), "Switch workspace".to_string());
+        }
+    }
+    if a.starts_with("hl.dsp.window.move(") {
+        if let Some(dir_pos) = a.find("direction") {
+            if let Some(dir) = parse_quoted_str(&a[dir_pos..]) {
+                return ("WINDOW MANAGEMENT".to_string(), format!("Move window {}", dir));
+            }
+        }
+        if let Some(ws_pos) = a.find("workspace") {
+            if let Some(ws) = parse_quoted_str(&a[ws_pos..]) {
+                if let Some(sp) = ws.strip_prefix("special:") {
+                    return (
+                        "WORKSPACES & SCRATCHPADS".to_string(),
+                        format!("Send window to '{}' scratchpad", sp),
+                    );
+                }
+                return (
+                    "WORKSPACES & SCRATCHPADS".to_string(),
+                    format!("Move window to workspace {}", ws),
+                );
+            }
+            return (
+                "WORKSPACES & SCRATCHPADS".to_string(),
+                "Move window to workspace".to_string(),
+            );
+        }
+    }
+    if a.starts_with("hl.dsp.workspace.toggle_special(") {
+        let name = parse_quoted_str(a).unwrap_or_else(|| "special".to_string());
+        return (
+            "WORKSPACES & SCRATCHPADS".to_string(),
+            format!("Toggle '{}' scratchpad", name),
+        );
+    }
+    ("OTHER".to_string(), a.to_string())
+}
+
+fn eval_lua_key_expr(expr: &str, vars: &std::collections::HashMap<String, String>) -> String {
+    let mut out = String::new();
+    for part in expr.split("..") {
+        let p = part.trim();
+        if let Some(lit) = parse_quoted_str(p) {
+            out.push_str(&lit);
+        } else if let Some(val) = vars.get(p) {
+            out.push_str(val);
+        } else if p == "key" || p == "i" {
+            out.push_str("1..0");
+        } else {
+            out.push_str(p);
+        }
+    }
+    prettify_key_combo(&out)
+}
+
+fn split_top_level_args(s: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut in_quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in s.chars() {
+        if escaped {
+            cur.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_quote.is_some() {
+            cur.push(ch);
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = in_quote {
+            cur.push(ch);
+            if ch == q {
+                in_quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                in_quote = Some(ch);
+                cur.push(ch);
+            }
+            '(' | '{' | '[' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' | '}' | ']' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if depth == 0 => {
+                args.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.trim().is_empty() {
+        args.push(cur.trim().to_string());
+    }
+    args
+}
+
+fn fetch_keybinds_snapshot() -> Vec<KeybindEntry> {
+    let path = glib::user_config_dir().join("hypr").join("binds.lua");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+
+    let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut entries = Vec::new();
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("--") {
+            continue;
+        }
+        // Track local string variables like `local mainMod = "SUPER"`
+        if let Some(rest) = line.strip_prefix("local ") {
+            if let Some((lhs, rhs)) = rest.split_once('=') {
+                if let Some(val) = parse_quoted_str(rhs) {
+                    vars.insert(lhs.trim().to_string(), val);
+                }
+            }
+            continue;
+        }
+        let Some(bind_start) = line.find("hl.bind(") else {
+            continue;
+        };
+        let after = &line[bind_start + "hl.bind(".len()..];
+        let Some(end_idx) = after.rfind(')') else {
+            continue;
+        };
+        let inner = &after[..end_idx];
+        let args = split_top_level_args(inner);
+        if args.len() < 2 {
+            continue;
+        }
+        let keys = eval_lua_key_expr(&args[0], &vars);
+        let (group, mut desc) = describe_bind_action(&args[1]);
+        if keys.contains("1..0") {
+            if desc == "Switch workspace" {
+                desc = "Switch to workspace 1–10".to_string();
+            } else if desc == "Move window to workspace" {
+                desc = "Move active window to workspace 1–10".to_string();
+            }
+        }
+        entries.push(KeybindEntry {
+            group,
+            keys,
+            desc,
+            raw: args[1].clone(),
+        });
+    }
+
+    entries
+}
+
+pub fn build_system_ui(close_drawer: Rc<dyn Fn()>) -> SystemUi {
     let (tx, rx) = mpsc::channel::<SystemMsg>();
 
     // --- LEFT MENU (inside main stack, 288px) ---
@@ -729,13 +1387,17 @@ pub fn build_system_ui() -> SystemUi {
     let sound_cat_btn = make_cat_btn("", "Sound", "Outputs, mics & app volumes");
     let net_cat_btn = make_cat_btn("󰤨", "Network", "Connections, Wi-Fi & VPNs");
     let theme_cat_btn = make_cat_btn("󰏘", "Themes", "Live desktop color palettes");
+    let wall_cat_btn = make_cat_btn("󰸉", "Wallpapers", "Multi-monitor swww picker");
     let disp_cat_btn = make_cat_btn("󰍹", "Displays", "Monitors, refresh & focus");
-    let over_cat_btn = make_cat_btn("󰍛", "Overview", "CPU, RAM, GPU & quick toggles");
+    let kbd_cat_btn = make_cat_btn("󰌌", "Keybinds", "Live binds.lua cheat sheet");
+    let over_cat_btn = make_cat_btn("󰍛", "Overview", "Stats, capture & quick tools");
 
     list_view.append(&sound_cat_btn);
     list_view.append(&net_cat_btn);
     list_view.append(&theme_cat_btn);
+    list_view.append(&wall_cat_btn);
     list_view.append(&disp_cat_btn);
+    list_view.append(&kbd_cat_btn);
     list_view.append(&over_cat_btn);
 
     // Quick summary badges in the left pane (spacer pushes it neatly to bottom)
@@ -800,8 +1462,8 @@ pub fn build_system_ui() -> SystemUi {
         .build();
 
     let detail_close_btn = Button::builder()
-        .label("x")
-        .css_classes(vec!["plan-close-btn".to_string()])
+        .label("×")
+        .css_classes(vec!["plan-line-del-btn".to_string()])
         .tooltip_text("Close System panel")
         .build();
 
@@ -874,11 +1536,59 @@ pub fn build_system_ui() -> SystemUi {
     theme_box.append(&theme_content_box);
     detail_stack.add_named(&theme_scroll, Some("themes"));
 
-    // PAGE 4: DISPLAYS
+    // PAGE 4: WALLPAPERS
+    let (wall_scroll, wall_box) = make_scroll_page();
+    let wall_status_lbl = Label::builder()
+        .label("")
+        .halign(Align::Start)
+        .wrap(true)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .visible(false)
+        .build();
+    let wall_content_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .build();
+    wall_box.append(&wall_status_lbl);
+    wall_box.append(&wall_content_box);
+    detail_stack.add_named(&wall_scroll, Some("wallpapers"));
+
+    // PAGE 5: DISPLAYS
     let (disp_scroll, disp_box) = make_scroll_page();
     detail_stack.add_named(&disp_scroll, Some("displays"));
 
-    // PAGE 5: OVERVIEW
+    // PAGE 6: KEYBINDS (live binds.lua parser + instant filter)
+    let kbd_page = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .margin_top(6)
+        .margin_start(14)
+        .margin_end(14)
+        .margin_bottom(10)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    let kbd_search = Entry::builder()
+        .placeholder_text("Search keybinds, keys, or apps...")
+        .css_classes(vec!["fav-search".to_string()])
+        .build();
+    let kbd_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    let kbd_list_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .margin_bottom(8)
+        .build();
+    kbd_scroll.set_child(Some(&kbd_list_box));
+    kbd_page.append(&kbd_search);
+    kbd_page.append(&kbd_scroll);
+    detail_stack.add_named(&kbd_page, Some("keybinds"));
+
+    // PAGE 7: OVERVIEW
     let (over_scroll, over_box) = make_scroll_page();
     detail_stack.add_named(&over_scroll, Some("overview"));
 
@@ -886,12 +1596,20 @@ pub fn build_system_ui() -> SystemUi {
     let active_section: Rc<RefCell<String>> = Rc::new(RefCell::new("sound".to_string()));
     let cpu_state: Rc<RefCell<Option<(u64, u64)>>> = Rc::new(RefCell::new(None));
     let wifi_pw_target: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let keybinds_cache: Rc<RefCell<Vec<KeybindEntry>>> = Rc::new(RefCell::new(Vec::new()));
+    let last_overview_snap: Rc<RefCell<Option<OverviewSnapshot>>> = Rc::new(RefCell::new(None));
+    let wall_thumb_cache: Rc<RefCell<std::collections::HashMap<String, gtk4::gdk::Texture>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
+    let wall_img_slots: Rc<RefCell<std::collections::HashMap<String, Picture>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
 
     let cat_buttons = vec![
         ("sound", sound_cat_btn.clone()),
         ("network", net_cat_btn.clone()),
         ("themes", theme_cat_btn.clone()),
+        ("wallpapers", wall_cat_btn.clone()),
         ("displays", disp_cat_btn.clone()),
+        ("keybinds", kbd_cat_btn.clone()),
         ("overview", over_cat_btn.clone()),
     ];
 
@@ -916,9 +1634,19 @@ pub fn build_system_ui() -> SystemUi {
                         let _ = tx_bg.send(SystemMsg::Themes(fetch_themes_snapshot()));
                     });
                 }
+                "wallpapers" => {
+                    std::thread::spawn(move || {
+                        let _ = tx_bg.send(SystemMsg::Wallpapers(fetch_wallpapers_snapshot()));
+                    });
+                }
                 "displays" => {
                     std::thread::spawn(move || {
                         let _ = tx_bg.send(SystemMsg::Displays(fetch_displays_snapshot()));
+                    });
+                }
+                "keybinds" => {
+                    std::thread::spawn(move || {
+                        let _ = tx_bg.send(SystemMsg::Keybinds(fetch_keybinds_snapshot()));
                     });
                 }
                 "overview" => {
@@ -953,8 +1681,10 @@ pub fn build_system_ui() -> SystemUi {
                 "sound" => "SOUND",
                 "network" => "NETWORK",
                 "themes" => "THEME SWITCH",
+                "wallpapers" => "WALLPAPERS",
                 "displays" => "DISPLAYS",
-                "overview" => "OVERVIEW & CONTROLS",
+                "keybinds" => "KEYBINDS",
+                "overview" => "OVERVIEW & TOOLS",
                 _ => "SYSTEM",
             });
             for (name, btn) in &cats {
@@ -983,11 +1713,29 @@ pub fn build_system_ui() -> SystemUi {
     }
     {
         let open_s = open_section.clone();
+        wall_cat_btn.connect_clicked(move |_| open_s("wallpapers"));
+    }
+    {
+        let open_s = open_section.clone();
         disp_cat_btn.connect_clicked(move |_| open_s("displays"));
     }
     {
         let open_s = open_section.clone();
+        kbd_cat_btn.connect_clicked(move |_| open_s("keybinds"));
+    }
+    {
+        let open_s = open_section.clone();
         over_cat_btn.connect_clicked(move |_| open_s("overview"));
+    }
+
+    // Live search filtering for Keybinds
+    {
+        let kbd_cache_f = keybinds_cache.clone();
+        let kbd_box_f = kbd_list_box.clone();
+        kbd_search.connect_changed(move |entry| {
+            let query = entry.text().to_string();
+            render_keybinds_page(&kbd_box_f, &kbd_cache_f.borrow(), &query);
+        });
     }
 
     {
@@ -1037,8 +1785,17 @@ pub fn build_system_ui() -> SystemUi {
     let net_status_r = net_status_lbl.clone();
     let theme_box_r = theme_content_box.clone();
     let theme_status_r = theme_status_lbl.clone();
+    let wall_box_r = wall_content_box.clone();
+    let wall_status_r = wall_status_lbl.clone();
+    let wall_cache_r = wall_thumb_cache.clone();
+    let wall_slots_r = wall_img_slots.clone();
     let disp_box_r = disp_box.clone();
+    let kbd_box_r = kbd_list_box.clone();
+    let kbd_search_r = kbd_search.clone();
+    let kbd_cache_r = keybinds_cache.clone();
     let over_box_r = over_box.clone();
+    let last_ov_r = last_overview_snap.clone();
+    let close_for_ui = close_drawer.clone();
     let quick_audio_r = quick_audio_lbl.clone();
     let quick_net_r = quick_net_lbl.clone();
     let refresh_for_ui = trigger_refresh.clone();
@@ -1094,11 +1851,72 @@ pub fn build_system_ui() -> SystemUi {
                     theme_status_r.set_visible(true);
                     refresh_for_ui("themes", false);
                 }
+                SystemMsg::Wallpapers(walls) => {
+                    render_wallpapers_page(
+                        &wall_box_r,
+                        &wall_status_r,
+                        &walls,
+                        &wall_cache_r,
+                        &wall_slots_r,
+                        &tx_for_ui,
+                    );
+                }
+                SystemMsg::WallpaperThumb {
+                    path,
+                    bytes,
+                    has_alpha,
+                    rowstride,
+                    width,
+                    height,
+                } => {
+                    let fmt = if has_alpha {
+                        gtk4::gdk::MemoryFormat::R8g8b8a8
+                    } else {
+                        gtk4::gdk::MemoryFormat::R8g8b8
+                    };
+                    let mem_tex =
+                        gtk4::gdk::MemoryTexture::new(width, height, fmt, &bytes, rowstride);
+                    let tex: gtk4::gdk::Texture = mem_tex.upcast();
+                    wall_cache_r.borrow_mut().insert(path.clone(), tex.clone());
+                    if let Some(img) = wall_slots_r.borrow().get(&path) {
+                        img.set_paintable(Some(&tex));
+                    }
+                }
+                SystemMsg::WallpaperApplied(status) => {
+                    wall_status_r.set_label(&status);
+                    wall_status_r.set_visible(true);
+                    refresh_for_ui("wallpapers", false);
+                }
                 SystemMsg::Displays(monitors) => {
                     render_displays_page(&disp_box_r, &monitors, &refresh_for_ui);
                 }
+                SystemMsg::Keybinds(binds) => {
+                    *kbd_cache_r.borrow_mut() = binds;
+                    let q = kbd_search_r.text().to_string();
+                    render_keybinds_page(&kbd_box_r, &kbd_cache_r.borrow(), &q);
+                }
                 SystemMsg::Overview(snap) => {
-                    render_overview_page(&over_box_r, &snap, &suspend_armed, &refresh_for_ui);
+                    *last_ov_r.borrow_mut() = Some(snap.clone());
+                    render_overview_page(
+                        &over_box_r,
+                        &snap,
+                        &suspend_armed,
+                        &refresh_for_ui,
+                        &close_for_ui,
+                        &tx_for_ui,
+                    );
+                }
+                SystemMsg::ColorPicked => {
+                    if let Some(snap) = last_ov_r.borrow().as_ref() {
+                        render_overview_page(
+                            &over_box_r,
+                            snap,
+                            &suspend_armed,
+                            &refresh_for_ui,
+                            &close_for_ui,
+                            &tx_for_ui,
+                        );
+                    }
                 }
             }
         }
@@ -1964,6 +2782,201 @@ fn render_themes_page(
     }
 }
 
+fn render_wallpapers_page(
+    container: &Box,
+    status_lbl: &Label,
+    walls: &[WallpaperEntry],
+    thumb_cache: &Rc<RefCell<std::collections::HashMap<String, gtk4::gdk::Texture>>>,
+    img_slots: &Rc<RefCell<std::collections::HashMap<String, Picture>>>,
+    tx: &mpsc::Sender<SystemMsg>,
+) {
+    clear_box(container);
+    img_slots.borrow_mut().clear();
+
+    let top_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let hdr = Label::builder()
+        .label(&format!("WALLPAPERS ({})", walls.len()))
+        .halign(Align::Start)
+        .hexpand(true)
+        .css_classes(vec!["fav-group-header".to_string()])
+        .build();
+    let rand_btn = Button::builder()
+        .label("Random")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .sensitive(!walls.is_empty())
+        .build();
+    top_row.append(&hdr);
+    top_row.append(&rand_btn);
+    container.append(&top_row);
+
+    if walls.is_empty() {
+        let empty = Label::builder()
+            .label("No wallpapers found in ~/Pictures/Wallpapers")
+            .halign(Align::Start)
+            .wrap(true)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build();
+        container.append(&empty);
+        return;
+    }
+
+    // Random wallpaper button
+    {
+        let all_paths: Vec<String> = walls.iter().map(|w| w.path.clone()).collect();
+        let tx_r = tx.clone();
+        let st_r = status_lbl.clone();
+        rand_btn.connect_clicked(move |_| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as usize)
+                .unwrap_or(0);
+            let chosen = all_paths[nanos % all_paths.len()].clone();
+            st_r.set_label("Applying random wallpaper...");
+            st_r.set_visible(true);
+            let tx_bg = tx_r.clone();
+            std::thread::spawn(move || {
+                let msg = match apply_wallpaper_native(&chosen) {
+                    Ok(m) => m,
+                    Err(e) => e,
+                };
+                let _ = tx_bg.send(SystemMsg::WallpaperApplied(msg));
+            });
+        });
+    }
+
+    let grid = FlowBox::builder()
+        .selection_mode(SelectionMode::None)
+        .homogeneous(true)
+        .max_children_per_line(2)
+        .min_children_per_line(2)
+        .column_spacing(8)
+        .row_spacing(8)
+        .build();
+
+    let mut to_decode: Vec<String> = Vec::new();
+
+    for wall in walls {
+        let mut classes = vec!["wall-tile-btn".to_string()];
+        if wall.is_active {
+            classes.push("active".to_string());
+        }
+        let btn = Button::builder()
+            .css_classes(classes)
+            .tooltip_text(&if wall.has_vertical_pair {
+                format!("{} (paired vertical crop available)", wall.name)
+            } else {
+                wall.name.clone()
+            })
+            .build();
+
+        let card = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(4)
+            .build();
+
+        let frame = Box::builder()
+            .width_request(166)
+            .height_request(94)
+            .overflow(Overflow::Hidden)
+            .css_classes(vec!["media-art-box".to_string()])
+            .build();
+
+        let img = Picture::builder()
+            .can_shrink(true)
+            .width_request(166)
+            .height_request(94)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+
+        if let Some(tex) = thumb_cache.borrow().get(&wall.path) {
+            img.set_paintable(Some(tex));
+        } else {
+            img_slots.borrow_mut().insert(wall.path.clone(), img.clone());
+            to_decode.push(wall.path.clone());
+        }
+        frame.append(&img);
+
+        let meta_row = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(4)
+            .build();
+        let name_lbl = Label::builder()
+            .label(&wall.name)
+            .halign(Align::Start)
+            .hexpand(true)
+            .width_chars(1)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build();
+        meta_row.append(&name_lbl);
+
+        if wall.is_active {
+            let act = Label::builder()
+                .label("ON")
+                .css_classes(vec!["fav-score-badge".to_string()])
+                .build();
+            meta_row.append(&act);
+        } else if wall.has_vertical_pair {
+            let vtag = Label::builder()
+                .label("V")
+                .css_classes(vec!["fav-score-badge".to_string()])
+                .build();
+            meta_row.append(&vtag);
+        }
+
+        card.append(&frame);
+        card.append(&meta_row);
+        btn.set_child(Some(&card));
+
+        let path_c = wall.path.clone();
+        let name_c = wall.name.clone();
+        let tx_c = tx.clone();
+        let st_c = status_lbl.clone();
+        btn.connect_clicked(move |_| {
+            st_c.set_label(&format!("Applying {}...", name_c));
+            st_c.set_visible(true);
+            let p = path_c.clone();
+            let tx_bg = tx_c.clone();
+            std::thread::spawn(move || {
+                let msg = match apply_wallpaper_native(&p) {
+                    Ok(m) => m,
+                    Err(e) => e,
+                };
+                let _ = tx_bg.send(SystemMsg::WallpaperApplied(msg));
+            });
+        });
+
+        grid.insert(&btn, -1);
+    }
+
+    container.append(&grid);
+
+    // Decode uncached thumbnails sequentially on one background worker thread (pure RAM, zero SSD cache!)
+    if !to_decode.is_empty() {
+        let tx_th = tx.clone();
+        std::thread::spawn(move || {
+            for p in to_decode {
+                if let Some((bytes, has_alpha, rowstride, width, height)) =
+                    decode_wallpaper_thumb(&p)
+                {
+                    let _ = tx_th.send(SystemMsg::WallpaperThumb {
+                        path: p,
+                        bytes,
+                        has_alpha,
+                        rowstride,
+                        width,
+                        height,
+                    });
+                }
+            }
+        });
+    }
+}
+
 fn render_displays_page(
     container: &Box,
     monitors: &[MonitorInfo],
@@ -2030,8 +3043,9 @@ fn render_displays_page(
             let mname = m.name.clone();
             let ref_c = refresh_cb.clone();
             focus_btn.connect_clicked(move |_| {
+                let lua = format!("hl.dsp.focus({{ monitor = \"{}\" }})", mname);
                 let _ = Command::new("hyprctl")
-                    .args(["dispatch", "focusmonitor", &mname])
+                    .args(["dispatch", &lua])
                     .status();
                 ref_c("displays", false);
             });
@@ -2063,11 +3077,109 @@ fn render_displays_page(
     container.append(&reload_hypr_btn);
 }
 
+fn render_keybinds_page(container: &Box, binds: &[KeybindEntry], query: &str) {
+    clear_box(container);
+    let q = query.trim().to_lowercase();
+
+    let filtered: Vec<&KeybindEntry> = binds
+        .iter()
+        .filter(|b| {
+            if q.is_empty() {
+                return true;
+            }
+            b.keys.to_lowercase().contains(&q)
+                || b.desc.to_lowercase().contains(&q)
+                || b.group.to_lowercase().contains(&q)
+                || b.raw.to_lowercase().contains(&q)
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        let empty = Label::builder()
+            .label(if binds.is_empty() {
+                "Could not read ~/.config/hypr/binds.lua"
+            } else {
+                "No matching keybinds."
+            })
+            .halign(Align::Start)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build();
+        container.append(&empty);
+        return;
+    }
+
+    let group_order = [
+        "APPS & LAUNCHERS",
+        "CAPTURE & SCREENSHOTS",
+        "WINDOW MANAGEMENT",
+        "WORKSPACES & SCRATCHPADS",
+        "MEDIA & HARDWARE",
+        "OTHER",
+    ];
+
+    for group_name in group_order {
+        let items: Vec<&&KeybindEntry> = filtered
+            .iter()
+            .filter(|b| b.group == group_name)
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
+
+        let hdr = Label::builder()
+            .label(group_name)
+            .halign(Align::Start)
+            .css_classes(vec!["fav-group-header".to_string()])
+            .margin_top(4)
+            .build();
+        container.append(&hdr);
+
+        let card = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(6)
+            .css_classes(vec!["plan-check-row".to_string()])
+            .build();
+
+        for b in items {
+            let row = Box::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(8)
+                .tooltip_text(&b.raw)
+                .build();
+
+            let key_pill = Label::builder()
+                .label(&b.keys)
+                .halign(Align::Start)
+                .valign(Align::Center)
+                .css_classes(vec!["kbd-pill".to_string()])
+                .build();
+
+            let desc_lbl = Label::builder()
+                .label(&b.desc)
+                .halign(Align::Start)
+                .valign(Align::Center)
+                .hexpand(true)
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(vec!["plan-body".to_string()])
+                .build();
+
+            row.append(&key_pill);
+            row.append(&desc_lbl);
+            card.append(&row);
+        }
+
+        container.append(&card);
+    }
+}
+
 fn render_overview_page(
     container: &Box,
     snap: &OverviewSnapshot,
     suspend_armed: &Rc<Cell<bool>>,
     refresh_cb: &Rc<dyn Fn(&str, bool)>,
+    close_drawer: &Rc<dyn Fn()>,
+    tx: &mpsc::Sender<SystemMsg>,
 ) {
     clear_box(container);
 
@@ -2173,7 +3285,157 @@ fn render_overview_page(
 
     container.append(&sys_card);
 
-    // 2. QUICK CONTROLS
+    // 2. CAPTURE & COLOR PICKER
+    let cap_hdr = Label::builder()
+        .label("CAPTURE & COLOR PICKER")
+        .halign(Align::Start)
+        .css_classes(vec!["fav-group-header".to_string()])
+        .margin_top(6)
+        .build();
+    container.append(&cap_hdr);
+
+    let cap_row1 = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .homogeneous(true)
+        .build();
+
+    let cap_region_btn = Button::builder()
+        .label("󰩭 Region")
+        .css_classes(vec!["primary-btn".to_string()])
+        .tooltip_text("Capture region / editor (lumine-capture)")
+        .build();
+    {
+        let close_c = close_drawer.clone();
+        cap_region_btn.connect_clicked(move |_| {
+            launch_capture(CaptureMode::RegionEditor, &close_c);
+        });
+    }
+
+    let cap_mon_btn = Button::builder()
+        .label("󰍹 Monitor")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .tooltip_text("Capture active monitor (lumine-capture -m)")
+        .build();
+    {
+        let close_c = close_drawer.clone();
+        cap_mon_btn.connect_clicked(move |_| {
+            launch_capture(CaptureMode::Monitor, &close_c);
+        });
+    }
+
+    let cap_full_btn = Button::builder()
+        .label("󰹑 Full")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .tooltip_text("Capture all monitors (lumine-capture -f)")
+        .build();
+    {
+        let close_c = close_drawer.clone();
+        cap_full_btn.connect_clicked(move |_| {
+            launch_capture(CaptureMode::Full, &close_c);
+        });
+    }
+
+    cap_row1.append(&cap_region_btn);
+    cap_row1.append(&cap_mon_btn);
+    cap_row1.append(&cap_full_btn);
+    container.append(&cap_row1);
+
+    let cap_row2 = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .homogeneous(true)
+        .build();
+
+    let cap_ocr_btn = Button::builder()
+        .label("󰗊 Region OCR")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .tooltip_text("Drag region to OCR text straight to clipboard")
+        .build();
+    {
+        let close_c = close_drawer.clone();
+        cap_ocr_btn.connect_clicked(move |_| {
+            launch_capture(CaptureMode::RegionOcr, &close_c);
+        });
+    }
+
+    let pick_color_btn = Button::builder()
+        .label("󰈊 Pick Color")
+        .css_classes(vec!["primary-btn".to_string()])
+        .tooltip_text("Pick any screen pixel and copy #hex to clipboard")
+        .build();
+    {
+        let close_c = close_drawer.clone();
+        let tx_c = tx.clone();
+        pick_color_btn.connect_clicked(move |_| {
+            launch_color_picker_inner(&close_c, Some(tx_c.clone()));
+        });
+    }
+
+    cap_row2.append(&cap_ocr_btn);
+    cap_row2.append(&pick_color_btn);
+    container.append(&cap_row2);
+
+    if let Ok(guard) = LAST_PICKED_COLOR.lock() {
+        if let Some((r, g, b)) = *guard {
+            let hex = format!("#{:02x}{:02x}{:02x}", r, g, b);
+            let rgb = format!("rgb({}, {}, {})", r, g, b);
+            let swatch_row = Box::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(8)
+                .css_classes(vec!["plan-check-row".to_string()])
+                .build();
+
+            let swatch = DrawingArea::builder()
+                .content_width(28)
+                .content_height(28)
+                .valign(Align::Center)
+                .build();
+            let (rf, gf, bf) = (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
+            swatch.set_draw_func(move |_, cr, w, h| {
+                let rad = 7.0;
+                let wf = w as f64;
+                let hf = h as f64;
+                cr.new_sub_path();
+                cr.arc(wf - rad, rad, rad, -std::f64::consts::FRAC_PI_2, 0.0);
+                cr.arc(wf - rad, hf - rad, rad, 0.0, std::f64::consts::FRAC_PI_2);
+                cr.arc(rad, hf - rad, rad, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
+                cr.arc(rad, rad, rad, std::f64::consts::PI, 3.0 * std::f64::consts::FRAC_PI_2);
+                cr.close_path();
+                cr.set_source_rgb(rf, gf, bf);
+                let _ = cr.fill();
+            });
+
+            let hex_btn = Button::builder()
+                .label(&hex)
+                .css_classes(vec!["plan-fmt-btn".to_string()])
+                .tooltip_text("Click to copy hex")
+                .hexpand(true)
+                .build();
+            let hex_copy = hex.clone();
+            hex_btn.connect_clicked(move |_| {
+                let _ = Command::new("wl-copy").args(["--", &hex_copy]).spawn();
+            });
+
+            let rgb_btn = Button::builder()
+                .label(&rgb)
+                .css_classes(vec!["plan-fmt-btn".to_string()])
+                .tooltip_text("Click to copy RGB")
+                .hexpand(true)
+                .build();
+            let rgb_copy = rgb.clone();
+            rgb_btn.connect_clicked(move |_| {
+                let _ = Command::new("wl-copy").args(["--", &rgb_copy]).spawn();
+            });
+
+            swatch_row.append(&swatch);
+            swatch_row.append(&hex_btn);
+            swatch_row.append(&rgb_btn);
+            container.append(&swatch_row);
+        }
+    }
+
+    // 3. QUICK CONTROLS
     let ctrl_hdr = Label::builder()
         .label("QUICK CONTROLS")
         .halign(Align::Start)
@@ -2251,17 +3513,15 @@ fn render_overview_page(
         });
     });
 
-    let waybar_btn = Button::builder()
-        .label("Reload Waybar")
+    let hypr_reload_btn = Button::builder()
+        .label("󰑓 Reload Hyprland")
         .css_classes(vec!["plan-fmt-btn".to_string()])
         .build();
-    waybar_btn.connect_clicked(move |_| {
-        let _ = Command::new("sh")
-            .args(["-c", "killall waybar; waybar &"])
-            .spawn();
+    hypr_reload_btn.connect_clicked(move |_| {
+        let _ = Command::new("hyprctl").arg("reload").spawn();
     });
 
     row2.append(&suspend_btn);
-    row2.append(&waybar_btn);
+    row2.append(&hypr_reload_btn);
     container.append(&row2);
 }

@@ -1,3 +1,9 @@
+//! Encrypted local file locker tab.
+//!
+//! Uses Argon2id + HKDF-SHA256 + streaming AES-256-GCM (1 MB chunks) packed into
+//! `.lilar` block files up to 10 GB each. Temporary previews extract into RAM at
+//! `/dev/shm/lily-locker` and are wiped when locking.
+
 use aead::stream::{DecryptorBE32, EncryptorBE32};
 use aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -837,7 +843,7 @@ pub fn build_locker_ui(popover_guard: Rc<Cell<usize>>) -> Box {
         .build();
 
     let cap_cancel_btn = Button::builder()
-        .label("x")
+        .label("×")
         .css_classes(vec!["plan-line-del-btn".to_string()])
         .build();
 

@@ -1,3 +1,8 @@
+//! Monthly calendar tab with per-day notes and reminders.
+//!
+//! Dates with entries are marked on the GTK calendar widget and persisted to
+//! `~/.config/lily-dashboard/calendar_events.json`.
+
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
@@ -146,7 +151,7 @@ pub fn build_calendar_ui() -> Box {
         .build();
     let add_btn = Button::builder()
         .label("+")
-        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .css_classes(vec!["primary-btn".to_string()])
         .build();
     add_row.append(&add_entry);
     add_row.append(&add_btn);
@@ -202,7 +207,7 @@ pub fn build_calendar_ui() -> Box {
                         .css_classes(vec!["plan-body".to_string()])
                         .build();
                     let del_btn = Button::builder()
-                        .label("x")
+                        .label("×")
                         .css_classes(vec!["plan-line-del-btn".to_string()])
                         .valign(Align::Center)
                         .build();

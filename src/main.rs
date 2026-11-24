@@ -1,3 +1,10 @@
+//! Entry point and main layer-shell window for Lily Dashboard.
+//!
+//! Sets up the left-edge slide-out drawer, dynamic pointer input region (click-through
+//! when closed), live CSS reloading from `~/.config/theme-switch/current.conf`,
+//! lazy/stateless tab lifecycle management, sidebar footer widgets, and top-bar
+//! quick capture/color-picker actions.
+
 mod favorites;
 mod launcher;
 mod passwords;
@@ -33,7 +40,23 @@ const TRIGGER_WIDTH: i32 = 56;
 const SLIDE_DURATION_MS: u64 = 350;
 
 fn main() {
-    
+    // Let Hyprland's native GPU layer_rule blur handle our surfaces instead of
+    // GTK 4.24's ext-background-effect-v1 / CSS backdrop-filter (which lags during slide).
+    let disable_iface = "ext_background_effect_manager_v1";
+    let new_val = match std::env::var("GDK_WAYLAND_DISABLE") {
+        Ok(existing) if !existing.is_empty() => {
+            if existing.split(',').any(|s| s.trim() == disable_iface) {
+                existing
+            } else {
+                format!("{},{}", existing, disable_iface)
+            }
+        }
+        _ => disable_iface.to_string(),
+    };
+    #[allow(unused_unsafe)]
+    unsafe {
+        std::env::set_var("GDK_WAYLAND_DISABLE", new_val);
+    }
 
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| init_theme());
@@ -117,20 +140,28 @@ fn init_theme() {
                 format!("rgba(128, 128, 128, {})", alpha)
             };
 
+            let bg_main_glass = hex_to_rgba(bg_main, 0.65);
+            let bg_recessed_glass = hex_to_rgba(bg_recessed, 0.72);
+            let bg_pill_glass = hex_to_rgba(bg_pill, 0.72);
             let accent1_15 = hex_to_rgba(accent1, 0.15);
+            let accent1_24 = hex_to_rgba(accent1, 0.24);
             let accent1_35 = hex_to_rgba(accent1, 0.35);
+            let accent1_38 = hex_to_rgba(accent1, 0.38);
+            let accent1_55 = hex_to_rgba(accent1, 0.55);
             let fg_main_06 = hex_to_rgba(fg_main, 0.06);
-            let bg_contrast_50 = hex_to_rgba(bg_contrast, 0.50);
-            let bg_contrast_80 = hex_to_rgba(bg_contrast, 0.80);
+            let fg_main_08 = hex_to_rgba(fg_main, 0.08);
+            let fg_main_15 = hex_to_rgba(fg_main, 0.15);
+            let bg_contrast_65 = hex_to_rgba(bg_contrast, 0.65);
+            let bg_contrast_88 = hex_to_rgba(bg_contrast, 0.88);
 
             let css = format!(
                 r#"
                 window {{ background-color: transparent; }}
-                .drawer-container {{ transform: translateX(-415px); transition: transform 0.35s cubic-bezier(0.25, 0.8, 0.25, 1); opacity: 0.95; }}
-                .drawer-container.open {{ transform: translateX(0px); opacity: 0.95; }}
+                .drawer-container {{ transform: translateX(-415px); transition: transform 0.35s cubic-bezier(0.25, 0.8, 0.25, 1); }}
+                .drawer-container.open {{ transform: translateX(0px); }}
                 
-                .dash-box {{ background-color: #{bg_main}; border: 2px solid #{accent1}; border-left: none; border-top-right-radius: 16px; border-bottom-right-radius: 16px; min-width: 398px; }}
-                .sidebar-column {{ background-color: #{bg_recessed}; border-right: 1px solid #{accent1}; }}
+                .dash-box {{ background-color: {bg_main_glass}; border: 2px solid #{accent1}; border-left: none; border-top-right-radius: 16px; border-bottom-right-radius: 16px; min-width: 398px; }}
+                .sidebar-column {{ background-color: {bg_recessed_glass}; border-right: 1px solid #{accent1}; }}
                 
                 .sidebar-nav-btn {{ background-color: transparent; border: none; border-radius: 10px; padding: 6px 10px; margin: 1px 4px; box-shadow: none; transition: background-color 0.18s ease, color 0.18s ease; }}
                 .sidebar-nav-btn:hover {{ background-color: {accent1_15}; }}
@@ -145,26 +176,36 @@ fn init_theme() {
                 
                 .music-art-frame {{ background-color: transparent; border: none; border-radius: 8px; min-width: 36px; min-height: 36px; box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.15); }}
                 
-                .fav-search {{ background-color: {bg_contrast_50}; border: 1px solid #{accent1}; border-radius: 12px; color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; padding: 6px 12px; }}
-                .fav-search:focus {{ background-color: {bg_contrast_80}; }}
+                .fav-search {{ background-color: {bg_contrast_65}; border: 1px solid transparent; border-radius: 10px; color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; padding: 7px 12px; transition: background-color 0.16s ease, border-color 0.16s ease; }}
+                .fav-search:focus {{ background-color: {bg_contrast_88}; border-color: {accent1_55}; }}
                 
                 .fav-group-header {{ color: #{accent2}; font-weight: bold; font-size: 13px; font-family: 'MesloLGL Nerd Font', monospace; margin-left: 4px; letter-spacing: 1px; }}
                 .fav-score-badge {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 12px; font-weight: bold; }}
                 
-                .plan-fmt-btn, .plan-close-btn {{ background-color: #{bg_pill}; border: 1px solid #{accent1}; border-radius: 8px; padding: 4px 10px; color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-weight: bold; transition: all 0.15s ease; }}
-                .plan-fmt-btn:hover, .plan-close-btn:hover {{ background-color: #{selection}; }}
-                .plan-fmt-btn.active, .plan-close-btn.active {{ background-color: #{accent2}; border-color: #{accent2}; color: #{bg_contrast}; }}
-                .plan-fmt-btn.active label, .plan-close-btn.active label {{ color: #{bg_contrast}; }}
+                .plan-fmt-btn, .plan-close-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: 10px; padding: 6px 11px; color: #{fg_main}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-weight: bold; box-shadow: none; transition: background-color 0.16s ease, color 0.16s ease; }}
+                .plan-fmt-btn label, .plan-close-btn label {{ color: #{fg_main}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-size: 14px; font-weight: bold; }}
+                .plan-fmt-btn:hover, .plan-close-btn:hover {{ background-color: {fg_main_15}; }}
+                .plan-fmt-btn.active, .plan-close-btn.active {{ background-color: {accent1_24}; border-color: transparent; color: #{accent2}; }}
+                .plan-fmt-btn.active label, .plan-close-btn.active label {{ color: #{accent2}; }}
+                .plan-fmt-btn.active:hover, .plan-close-btn.active:hover {{ background-color: {accent1_38}; }}
+
+                .primary-btn {{ background-color: {accent1_24}; border: 1px solid transparent; border-radius: 10px; padding: 7px 14px; color: #{accent2}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-weight: bold; box-shadow: none; transition: background-color 0.16s ease, color 0.16s ease; }}
+                .primary-btn label {{ color: #{accent2}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-size: 14px; font-weight: bold; }}
+                .primary-btn:hover {{ background-color: {accent1_38}; color: #{fg_main}; }}
+                .primary-btn:hover label {{ color: #{fg_main}; }}
+                .primary-btn.active {{ background-color: rgba(243, 139, 168, 0.22); color: #f38ba8; }}
+                .primary-btn.active label {{ color: #f38ba8; }}
+                .primary-btn.active:hover {{ background-color: rgba(243, 139, 168, 0.34); }}
                 
-                .session-restore-btn {{ background-color: transparent; border: 1px solid #{accent1}; border-radius: 10px; padding: 8px 6px; margin: 4px 8px; transition: background-color 0.15s ease; }}
-                .session-restore-btn:hover {{ background-color: {accent1_15}; }}
+                .session-restore-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: 10px; padding: 7px 6px; margin: 4px 8px; box-shadow: none; transition: background-color 0.16s ease; }}
+                .session-restore-btn:hover {{ background-color: {fg_main_15}; }}
                 .session-restore-lbl {{ color: #{accent2}; font-size: 12px; font-weight: bold; }}
 
-                .power-btn {{ background-color: transparent; border: 1px solid #{accent1}; border-radius: 10px; padding: 5px 2px; min-height: 28px; transition: background-color 0.15s ease, border-color 0.15s ease; }}
-                .power-btn:hover {{ background-color: {accent1_15}; }}
+                .power-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: 10px; padding: 5px 2px; min-height: 28px; box-shadow: none; transition: background-color 0.16s ease; }}
+                .power-btn:hover {{ background-color: {fg_main_15}; }}
                 .power-btn-lbl {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', 'Josefin Sans', sans-serif; font-size: 14px; font-weight: bold; }}
-                .power-btn.armed {{ background-color: #{accent2}; border-color: #{accent2}; }}
-                .power-btn.armed .power-btn-lbl {{ color: #{bg_contrast}; font-family: 'Josefin Sans', sans-serif; font-size: 11px; }}
+                .power-btn.armed {{ background-color: rgba(243, 139, 168, 0.24); border-color: transparent; }}
+                .power-btn.armed .power-btn-lbl {{ color: #f38ba8; font-family: 'Josefin Sans', sans-serif; font-size: 11px; }}
 
                 .sidebar-footer-btn {{ background-color: transparent; border: none; border-radius: 6px; padding: 2px 3px; margin: 0px; min-height: 0px; min-width: 0px; box-shadow: none; transition: background-color 0.15s ease; }}
                 .sidebar-footer-btn:hover {{ background-color: {accent1_15}; }}
@@ -176,23 +217,32 @@ fn init_theme() {
                 .sidebar-status-lbl.bat-low {{ color: #f38ba8; }}
                 .notif-unread .sidebar-status-lbl {{ color: #{accent2}; }}
 
-                .ws-top-bar {{ background-color: #{bg_recessed}; border-bottom: 1px solid #{accent1}; padding: 6px 10px; }}
-                .ws-pill-btn {{ background-color: transparent; border: 1px solid #{accent1}; border-radius: 10px; padding: 2px 9px; min-width: 24px; min-height: 22px; transition: all 0.15s ease; }}
+                .ws-top-bar {{ background-color: {bg_recessed_glass}; border-bottom: 1px solid {accent1_35}; padding: 6px 10px; }}
+                .ws-pill-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: 10px; padding: 2px 9px; min-width: 24px; min-height: 22px; box-shadow: none; transition: all 0.15s ease; }}
                 .ws-pill-btn label {{ color: #{fg_muted}; font-family: 'MesloLGL Nerd Font', sans-serif; font-size: 12px; font-weight: bold; }}
-                .ws-pill-btn:hover {{ background-color: {accent1_15}; }}
-                .ws-pill-btn.active {{ background-color: #{accent2}; border-color: #{accent2}; }}
-                .ws-pill-btn.active label {{ color: #{bg_contrast}; }}
+                .ws-pill-btn:hover {{ background-color: {fg_main_15}; }}
+                .ws-pill-btn.active {{ background-color: {accent1_24}; border-color: transparent; }}
+                .ws-pill-btn.active label {{ color: #{accent2}; }}
+                .ws-preview-map {{ border-radius: 8px; }}
+                .top-tool-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: 9px; padding: 2px 7px; min-width: 24px; min-height: 22px; box-shadow: none; transition: background-color 0.15s ease; }}
+                .top-tool-btn label {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', sans-serif; font-size: 13px; }}
+                .top-tool-btn:hover {{ background-color: {fg_main_15}; }}
+                .kbd-pill {{ background-color: {fg_main_08}; border-radius: 7px; padding: 3px 8px; color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 11px; font-weight: bold; }}
 
-                .tray-icon-btn {{ background-color: transparent; border: 1px solid {accent1_15}; border-radius: 7px; padding: 2px; min-width: 22px; min-height: 22px; transition: background-color 0.15s ease; }}
-                .tray-icon-btn:hover {{ background-color: {accent1_15}; }}
+                .wall-tile-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: 10px; padding: 4px; box-shadow: none; transition: all 0.15s ease; }}
+                .wall-tile-btn:hover {{ background-color: {fg_main_15}; }}
+                .wall-tile-btn.active {{ border: 2px solid #{accent2}; background-color: {accent1_24}; }}
+
+                .tray-icon-btn {{ background-color: transparent; border: 1px solid transparent; border-radius: 7px; padding: 2px; min-width: 22px; min-height: 22px; box-shadow: none; transition: background-color 0.15s ease; }}
+                .tray-icon-btn:hover {{ background-color: {fg_main_15}; }}
 
                 .media-edge-sliver {{ background-color: #{accent2}; border-radius: 4px; opacity: 0.85; transition: all 0.18s ease; }}
                 .media-edge-sliver.paused {{ background-color: #{accent1}; opacity: 0.55; }}
                 .media-edge-sliver.active {{ opacity: 0.35; }}
-                .media-popout-pill {{ background-color: #{bg_main}; border: 2px solid #{accent1}; border-radius: 16px; padding: 6px 12px; opacity: 0.95; transition: background-color 0.15s ease; }}
-                .media-popout-pill:hover {{ background-color: #{bg_pill}; }}
+                .media-popout-pill {{ background-color: {bg_main_glass}; border: 2px solid #{accent1}; border-radius: 16px; padding: 6px 12px; transition: background-color 0.15s ease; }}
+                .media-popout-pill:hover {{ background-color: {bg_pill_glass}; }}
                 .media-pill-lbl {{ color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 13px; font-weight: bold; }}
-                .media-popout-card {{ background-color: #{bg_main}; border: 2px solid #{accent1}; border-radius: 16px; padding: 12px 14px; opacity: 0.96; }}
+                .media-popout-card {{ background-color: {bg_main_glass}; border: 2px solid #{accent1}; border-radius: 16px; padding: 12px 14px; }}
                 .media-popout-title {{ color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 15px; font-weight: bold; }}
                 .media-art-box {{ background-color: #{bg_recessed}; border: 1px solid #{selection}; border-radius: 10px; }}
 
@@ -210,11 +260,11 @@ fn init_theme() {
                 .trigger-btn {{ background-color: #{bg_pill}; border: 2px solid #{accent1}; border-left: none; border-top-right-radius: 100px; border-bottom-right-radius: 100px; min-width: 50px; min-height: 100px; padding: 0; transform: translateX(-36px); transition-property: transform, background-color; transition-duration: 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1); }}
                 .trigger-btn.peeking, .trigger-btn.riding {{ background-color: #{selection}; transform: translateX(0px); }}
                 
-                popover.fav-popover > contents {{ background-color: #{bg_main}; border: 2px solid #{accent1}; border-radius: 12px; padding: 6px; }}
-                .fav-hide-btn {{ background-color: #{bg_pill}; border: none; border-radius: 8px; padding: 6px 12px; color: #{fg_main}; }}
-                .fav-hide-btn:hover {{ background-color: #{selection}; }}
+                popover.fav-popover > contents {{ background-color: {bg_main_glass}; border: 1px solid {accent1_35}; border-radius: 12px; padding: 6px; }}
+                .fav-hide-btn {{ background-color: {fg_main_08}; border: none; border-radius: 9px; padding: 6px 12px; color: #{fg_main}; box-shadow: none; transition: background-color 0.15s ease; }}
+                .fav-hide-btn:hover {{ background-color: {fg_main_15}; }}
                 
-                .plan-detail-pane {{ background-color: #{bg_main}; border-left: 2px solid #{selection}; min-width: 400px; }}
+                .plan-detail-pane {{ background-color: {bg_main_glass}; border-left: 2px solid #{selection}; min-width: 400px; }}
                 .plan-divider {{ background-color: #{selection}; border-radius: 1px; }}
                 .plan-h1 {{ color: #{accent2}; font-weight: bold; font-size: 19px; }}
                 .plan-h2 {{ color: #{accent2}; font-weight: bold; font-size: 16px; }}
@@ -226,11 +276,13 @@ fn init_theme() {
                 checkbutton.plan-checkbox > check {{ background-color: #{bg_pill}; border: 2px solid #{accent1}; border-radius: 5px; min-width: 18px; min-height: 18px; }}
                 checkbutton.plan-checkbox:checked > check {{ background-color: #{accent2}; border-color: #{accent2}; color: #{bg_main}; }}
                 
-                .plan-composer-dock {{ background-color: #{bg_recessed}; border-top: 2px solid #{selection}; padding: 10px 14px; }}
-                .plan-delete-menu-btn {{ background-color: #{bg_pill}; border: none; border-radius: 8px; padding: 6px 12px; color: #{accent2}; font-weight: bold; }}
-                .plan-delete-menu-btn:hover {{ background-color: #{selection}; }}
-                .plan-line-del-btn {{ background-color: #{bg_pill}; border: 1px solid #{accent1}; border-radius: 6px; padding: 1px 6px; color: #{accent2}; font-size: 11px; min-width: 22px; min-height: 22px; }}
-                .plan-line-del-btn:hover {{ background-color: #{selection}; }}
+                .plan-composer-dock {{ background-color: {bg_recessed_glass}; border-top: 1px solid {accent1_35}; padding: 10px 14px; }}
+                .plan-delete-menu-btn {{ background-color: rgba(243, 139, 168, 0.14); border: none; border-radius: 9px; padding: 6px 12px; color: #f38ba8; font-weight: bold; box-shadow: none; transition: background-color 0.15s ease; }}
+                .plan-delete-menu-btn:hover {{ background-color: rgba(243, 139, 168, 0.26); }}
+                .plan-line-del-btn {{ background-color: transparent; border: 1px solid transparent; border-radius: 7px; padding: 0px 5px; color: #{fg_muted}; font-family: 'Josefin Sans', sans-serif; font-size: 14px; font-weight: bold; min-width: 24px; min-height: 24px; box-shadow: none; transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease; }}
+                .plan-line-del-btn label {{ color: #{fg_muted}; font-size: 14px; font-weight: bold; }}
+                .plan-line-del-btn:hover {{ background-color: rgba(243, 139, 168, 0.16); border-color: rgba(243, 139, 168, 0.42); color: #f38ba8; }}
+                .plan-line-del-btn:hover label {{ color: #f38ba8; }}
                 
                 .plan-drag-handle {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 13px; font-weight: bold; padding: 2px 4px; opacity: 0.7; }}
                 .plan-edit-row {{ border: 1px solid transparent; border-radius: 8px; padding: 2px 4px; transition: background-color 0.1s ease, border-color 0.1s ease; }}
@@ -239,12 +291,12 @@ fn init_theme() {
                 .plan-edit-row.drop-target {{ border: 2px dashed #{accent2}; background-color: #{bg_pill}; }}
                 
                 scale.music-seek {{ padding: 2px 0px; }}
-                scale.music-seek > trough {{ background-color: #{bg_pill}; border: 1px solid #{accent1}; border-radius: 6px; min-height: 6px; }}
+                scale.music-seek > trough {{ background-color: {fg_main_08}; border: none; border-radius: 6px; min-height: 6px; }}
                 scale.music-seek > trough > highlight {{ background-color: #{accent2}; border-radius: 6px; }}
                 scale.music-seek > trough > slider {{ background-color: #{bg_main}; border: 2px solid #{accent2}; border-radius: 50%; min-width: 12px; min-height: 12px; margin: -4px 0px; }}
                 
-                progressbar.drive-progress > trough {{ background-color: #{bg_pill}; border: 1px solid #{accent1}; border-radius: 6px; min-height: 12px; }}
-                progressbar.drive-progress > trough > progress {{ background-color: #{accent2}; border-radius: 5px; min-height: 12px; }}
+                progressbar.drive-progress > trough {{ background-color: {fg_main_08}; border: none; border-radius: 6px; min-height: 10px; }}
+                progressbar.drive-progress > trough > progress {{ background-color: #{accent2}; border-radius: 6px; min-height: 10px; }}
                 "#
             );
             
@@ -343,6 +395,7 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
     window.set_size_request(TOTAL_DASH_WIDTH + TRIGGER_WIDTH, -1);
 
     window.init_layer_shell();
+    window.set_namespace("lily-dashboard");
     window.set_layer(Layer::Top);
     window.set_keyboard_mode(KeyboardMode::None);
 
@@ -852,6 +905,57 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
     let guard_lazy = popover_guard.clone();
     let btn_on_launch = trigger_btn.clone();
     let open_on_launch = is_open.clone();
+    let close_drawer_cb: Rc<dyn Fn()> = {
+        let btn_c = trigger_btn.clone();
+        let open_c = is_open.clone();
+        Rc::new(move || {
+            if open_c.get() {
+                btn_c.emit_clicked();
+            }
+        })
+    };
+
+    // Quick Capture & Color Picker buttons on the right side of the top Workspaces bar
+    {
+        let top_tools = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(5)
+            .halign(gtk4::Align::End)
+            .valign(gtk4::Align::Center)
+            .build();
+
+        let cap_btn = Button::builder()
+            .label("󰄀")
+            .css_classes(vec!["top-tool-btn".to_string()])
+            .tooltip_text("Screenshot\nLeft-click: Region / Editor  •  Right-click: Active Monitor")
+            .build();
+        let close_cap_l = close_drawer_cb.clone();
+        cap_btn.connect_clicked(move |_| {
+            system::launch_capture(system::CaptureMode::RegionEditor, &close_cap_l);
+        });
+        let cap_rc = GestureClick::builder().button(3).build();
+        let close_cap_r = close_drawer_cb.clone();
+        cap_rc.connect_pressed(move |_, _, _, _| {
+            system::launch_capture(system::CaptureMode::Monitor, &close_cap_r);
+        });
+        cap_btn.add_controller(cap_rc);
+
+        let picker_btn = Button::builder()
+            .label("󰈊")
+            .css_classes(vec!["top-tool-btn".to_string()])
+            .tooltip_text("Color Picker (copies #hex to clipboard)")
+            .build();
+        let close_pick = close_drawer_cb.clone();
+        picker_btn.connect_clicked(move |_| {
+            system::launch_color_picker(&close_pick);
+        });
+
+        top_tools.append(&cap_btn);
+        top_tools.append(&picker_btn);
+        workspaces_widget.append(&top_tools);
+    }
+
+    let close_for_sys = close_drawer_cb.clone();
     let run_slot_c = run_slot.clone();
     let passwords_slot_c = passwords_slot.clone();
     let drive_slot_c = drive_slot.clone();
@@ -969,7 +1073,7 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
             }
             Some("system") => {
                 if system_ui_c.borrow().is_none() {
-                    let sys_ui = system::build_system_ui();
+                    let sys_ui = system::build_system_ui(close_for_sys.clone());
                     system_slot_c.append(&sys_ui.list_view);
                     dash_for_sys.append(&sys_ui.detail_view);
                     *system_ui_c.borrow_mut() = Some(sys_ui);

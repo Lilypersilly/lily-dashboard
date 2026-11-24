@@ -1,3 +1,8 @@
+//! Simple local password list tab.
+//!
+//! Stores entries in `~/.config/lily-dashboard/passwords.txt` with `0600` permissions
+//! and provides search, click-to-copy, and inline add/delete.
+
 use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;

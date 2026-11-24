@@ -1,3 +1,9 @@
+//! Hyprland window session tracker and restorer.
+//!
+//! Periodically records mapped windows (workspace, geometry, float/fullscreen flags,
+//! and `/proc/<pid>/cmdline`) so the sidebar footer's "Load previous session" button
+//! can relaunch and place them back on their workspaces.
+
 use gtk4::glib;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

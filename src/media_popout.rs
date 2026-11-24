@@ -1,9 +1,15 @@
+//! Standalone bottom-right layer-shell window (`lily-media-popout`) for live media.
+//!
+//! Polls MPRIS playback via `playerctl`. Collapses to a thin edge sliver when idle,
+//! pops up a compact pill when the dashboard opens or the sliver is hovered, and
+//! expands on click into a card with cover art and previous/play-pause/next controls.
+
 use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box, Button, EventControllerMotion, GestureClick, Image,
-    Label, Orientation, Overflow, Revealer, RevealerTransitionType,
+    Align, Application, ApplicationWindow, Box, Button, EventControllerMotion, GestureClick, Label,
+    Orientation, Overflow, Picture, Revealer, RevealerTransitionType,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::cell::{Cell, RefCell};
@@ -162,6 +168,7 @@ pub fn init_media_popout(app: &Application) -> MediaPopoutHandle {
         .build();
 
     win.init_layer_shell();
+    win.set_namespace("lily-media-popout");
     win.set_layer(Layer::Top);
     win.set_keyboard_mode(KeyboardMode::None);
     win.set_anchor(Edge::Bottom, true);
@@ -222,9 +229,12 @@ pub fn init_media_popout(app: &Application) -> MediaPopoutHandle {
         .css_classes(vec!["media-art-box".to_string()])
         .visible(false)
         .build();
-    let art_img = Image::builder()
-        .halign(Align::Center)
-        .valign(Align::Center)
+    let art_img = Picture::builder()
+        .can_shrink(true)
+        .width_request(220)
+        .height_request(124)
+        .hexpand(true)
+        .vexpand(true)
         .build();
     art_frame.append(&art_img);
 
@@ -256,7 +266,7 @@ pub fn init_media_popout(app: &Application) -> MediaPopoutHandle {
         .build();
     let play_btn = Button::builder()
         .label("󰏤")
-        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .css_classes(vec!["primary-btn".to_string()])
         .tooltip_text("Play / Pause")
         .build();
     let next_btn = Button::builder()

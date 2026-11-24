@@ -1,3 +1,8 @@
+//! YouTube Music player tab backed by `yt-dlp` and a local `mpv` IPC socket.
+//!
+//! Handles playlists, search, play-next / queue management, seek and volume controls,
+//! MPRIS media-key integration via `souvlaki`, and a bounded in-memory cover-art cache.
+
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
@@ -1698,7 +1703,7 @@ pub fn build_music_ui() -> Box {
         .hexpand(true)
         .build();
     let limit_save_btn = Button::builder().label("Save").css_classes(vec!["plan-close-btn".to_string()]).build();
-    let limit_cancel_btn = Button::builder().label("x").css_classes(vec!["plan-line-del-btn".to_string()]).build();
+    let limit_cancel_btn = Button::builder().label("×").css_classes(vec!["plan-line-del-btn".to_string()]).build();
     limit_edit_row.append(&limit_lbl);
     limit_edit_row.append(&limit_entry);
     limit_edit_row.append(&limit_save_btn);
@@ -1849,9 +1854,9 @@ pub fn build_music_ui() -> Box {
     seek_scale.set_css_classes(&["music-seek"]);
 
     let controls_row = Box::builder().orientation(Orientation::Horizontal).spacing(6).build();
-    let prev_btn = Button::builder().label("|<").css_classes(vec!["plan-fmt-btn".to_string()]).hexpand(true).build();
-    let play_pause_btn = Button::builder().label("Play / Pause").css_classes(vec!["plan-close-btn".to_string()]).hexpand(true).build();
-    let next_btn = Button::builder().label(">|").css_classes(vec!["plan-fmt-btn".to_string()]).hexpand(true).build();
+    let prev_btn = Button::builder().label("󰒮").css_classes(vec!["plan-fmt-btn".to_string()]).hexpand(true).build();
+    let play_pause_btn = Button::builder().label("Play / Pause").css_classes(vec!["primary-btn".to_string()]).hexpand(true).build();
+    let next_btn = Button::builder().label("󰒭").css_classes(vec!["plan-fmt-btn".to_string()]).hexpand(true).build();
     controls_row.append(&prev_btn);
     controls_row.append(&play_pause_btn);
     controls_row.append(&next_btn);
@@ -3342,7 +3347,7 @@ fn render_queue_view(
         });
 
         let del_btn = Button::builder()
-            .label("x")
+            .label("×")
             .valign(Align::Center)
             .css_classes(vec!["plan-line-del-btn".to_string()])
             .tooltip_text("Remove from queue")

@@ -1,3 +1,8 @@
+//! Compact sidebar weather badge and forecast popover.
+//!
+//! Queries Open-Meteo for current conditions, daily/hourly forecasts, and city search,
+//! saving the selected coordinates in `~/.config/lily-dashboard/weather.json`.
+
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{

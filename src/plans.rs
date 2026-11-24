@@ -1,3 +1,9 @@
+//! Notes and checklist editor (`Plans` tab + 400px slide-out detail pane).
+//!
+//! Reads and writes plain-text/markdown plan files in `~/Documents/plans` (or
+//! `~/documents/plans`) with interactive checkboxes, formatting prefixes, inline
+//! editing, and drag-and-drop line reordering.
+
 use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -297,7 +303,7 @@ fn populate_plan_buttons(
                 .build();
 
             let cancel_btn = Button::builder()
-                .label("x")
+                .label("×")
                 .css_classes(vec!["plan-line-del-btn".to_string()])
                 .build();
 
@@ -762,7 +768,7 @@ fn render_plan_file(
                 .build();
 
             let cancel_btn = Button::builder()
-                .label("x")
+                .label("×")
                 .css_classes(vec!["plan-line-del-btn".to_string()])
                 .build();
 
@@ -940,7 +946,7 @@ fn render_plan_file(
                 .build();
 
             let del_line_btn = Button::builder()
-                .label("x")
+                .label("×")
                 .valign(Align::Center)
                 .css_classes(vec!["plan-line-del-btn".to_string()])
                 .tooltip_text("Delete this line")

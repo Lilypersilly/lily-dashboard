@@ -1,3 +1,8 @@
+//! Countdown timers and process-watcher alerts tab.
+//!
+//! Supports simple durations (`15m`, `2h`, `45s`) as well as watching a running PID
+//! until it exits or sits at 0% CPU, firing `notify-send` + `paplay` on completion.
+
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
@@ -140,7 +145,7 @@ pub fn build_timers_ui() -> Box {
         .css_classes(vec!["fav-search".to_string()])
         .hexpand(true)
         .build();
-    let timer_start_btn = Button::builder().label("Start Timer").css_classes(vec!["plan-close-btn".to_string()]).build();
+    let timer_start_btn = Button::builder().label("Start Timer").css_classes(vec!["primary-btn".to_string()]).build();
     timer_input_row.append(&timer_entry);
     timer_input_row.append(&timer_start_btn);
     timers_page.append(&timer_input_row);
@@ -243,7 +248,7 @@ pub fn build_timers_ui() -> Box {
             let cond = if job.condition == WatchCondition::OnClose { "Until Closed" } else { "Until Idle" };
             let cond_lbl = Label::builder().label(cond).css_classes(vec!["plan-subnote".to_string()]).build();
             
-            let cancel_btn = Button::builder().label("x").css_classes(vec!["plan-line-del-btn".to_string()]).build();
+            let cancel_btn = Button::builder().label("×").css_classes(vec!["plan-line-del-btn".to_string()]).build();
             
             // Fix: Cleanly remove by PID and delete the row without firing fake signals
             let s_del = s_proc.clone();
@@ -404,7 +409,7 @@ pub fn build_timers_ui() -> Box {
                     let remaining = job.end_time.saturating_duration_since(now);
                     let time_lbl = Label::builder().label(&format_duration(remaining)).css_classes(vec!["plan-h2".to_string()]).build();
                     
-                    let cancel_btn = Button::builder().label("x").css_classes(vec!["plan-line-del-btn".to_string()]).build();
+                    let cancel_btn = Button::builder().label("×").css_classes(vec!["plan-line-del-btn".to_string()]).build();
                     let s_del_timer = state_ticker.clone();
                     cancel_btn.connect_clicked(move |_| {
                         s_del_timer.borrow_mut().timer_jobs.remove(idx);

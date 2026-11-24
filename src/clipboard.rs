@@ -1,3 +1,9 @@
+//! Clipboard history tab backed by background `wl-paste --watch` listeners.
+//!
+//! Tracks up to 200 text entries and 20 PNG images (15 MB cap) entirely in RAM so
+//! normal copying never touches the SSD. Only explicitly pinned entries are saved
+//! to `~/.config/lily-dashboard/clipboard_pins.json`.
+
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{

@@ -1,3 +1,8 @@
+//! Frequently-used files and folders tab.
+//!
+//! Watches user directories via `notify`, scores access frequency, supports pinning
+//! and ignoring paths, and only builds row widgets while the tab is active.
+
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;

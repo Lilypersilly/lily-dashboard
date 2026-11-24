@@ -1,3 +1,8 @@
+//! Default `Run` application launcher tab.
+//!
+//! Reads installed `.desktop` entries via `gio::AppInfo`, supports instant filtering,
+//! pinning favorites, and optional page-cache preloading for selected binaries.
+
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
