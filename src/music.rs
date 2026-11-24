@@ -2137,7 +2137,7 @@ pub fn build_music_ui() -> Box {
         })
     };
 
-    let render_virtual_window: Rc<dyn Fn(usize)>;
+    let render_virtual_window: Rc<dyn Fn(usize, bool)>;
     {
         const ROW_HEIGHT_PX: i32 = 60;
         const WINDOW_SIZE: usize = 35;
@@ -2159,12 +2159,39 @@ pub fn build_music_ui() -> Box {
         let q_btn_pop = queue_view_btn.clone();
         let filter_pop = track_filter_query.clone();
 
+        // Rendered DOM invariant inside `track_list_box`:
+        //   [top_spacer (height = win_start * ROW_HEIGHT_PX)]
+        //   [rendered_rows: exact rows for filtered indices win_start..win_end]
+        //   [bottom_spacer (height = (total - win_end) * ROW_HEIGHT_PX)]
         let win_start = Rc::new(Cell::new(0usize));
         let win_end = Rc::new(Cell::new(0usize));
+        let target_win_start = Rc::new(Cell::new(0usize));
         let last_gen_seen = Rc::new(Cell::new(0u64));
-        let scroll_cascade_queue: Rc<RefCell<VecDeque<(usize, TrackItem)>>> = Rc::new(RefCell::new(VecDeque::new()));
+        // Tuple: (orig_idx, track, prepend_top)
+        //   prepend_top = false -> append below existing rows (waterfall down)
+        //   prepend_top = true  -> insert right after top_spacer (waterfall up from bottom)
+        let scroll_cascade_queue: Rc<RefCell<VecDeque<(usize, TrackItem, bool)>>> =
+            Rc::new(RefCell::new(VecDeque::new()));
+        let top_spacer_ref: Rc<RefCell<Option<Box>>> = Rc::new(RefCell::new(None));
         let bottom_spacer_ref: Rc<RefCell<Option<Box>>> = Rc::new(RefCell::new(None));
+        let rendered_rows: Rc<RefCell<VecDeque<Box>>> = Rc::new(RefCell::new(VecDeque::new()));
         let total_filtered_count = Rc::new(Cell::new(0usize));
+
+        let ensure_spacers = |container: &Box,
+                              top_ref: &Rc<RefCell<Option<Box>>>,
+                              bot_ref: &Rc<RefCell<Option<Box>>>| {
+            if top_ref.borrow().is_none() || bot_ref.borrow().is_none() {
+                while let Some(child) = container.first_child() {
+                    container.remove(&child);
+                }
+                let ts = Box::builder().height_request(0).build();
+                let bs = Box::builder().height_request(0).build();
+                container.append(&ts);
+                container.append(&bs);
+                *top_ref.borrow_mut() = Some(ts);
+                *bot_ref.borrow_mut() = Some(bs);
+            }
+        };
 
         render_virtual_window = {
             let tr_box_v = track_list_box.clone();
@@ -2172,67 +2199,178 @@ pub fn build_music_ui() -> Box {
             let filter_v = track_filter_query.clone();
             let ws_v = win_start.clone();
             let we_v = win_end.clone();
+            let tws_v = target_win_start.clone();
             let cascade_q_v = scroll_cascade_queue.clone();
+            let t_spacer_v = top_spacer_ref.clone();
             let b_spacer_v = bottom_spacer_ref.clone();
+            let rows_v = rendered_rows.clone();
             let total_cnt_v = total_filtered_count.clone();
 
-            Rc::new(move |requested_start: usize| {
+            Rc::new(move |requested_start: usize, force_reset: bool| {
                 let all_snapshot = cur_tracks_v.borrow();
                 let fq = filter_v.borrow().clone();
                 let filtered: Vec<(usize, TrackItem)> = all_snapshot
                     .iter()
                     .enumerate()
-                    .filter(|(_, t)| fq.is_empty() || t.title.to_lowercase().contains(&fq) || t.uploader.to_lowercase().contains(&fq))
+                    .filter(|(_, t)| {
+                        fq.is_empty()
+                            || t.title.to_lowercase().contains(&fq)
+                            || t.uploader.to_lowercase().contains(&fq)
+                    })
                     .map(|(i, t)| (i, t.clone()))
                     .collect();
 
                 let total = filtered.len();
                 total_cnt_v.set(total);
                 cascade_q_v.borrow_mut().clear();
-                while let Some(child) = tr_box_v.first_child() {
-                    tr_box_v.remove(&child);
-                }
+
                 if total == 0 {
+                    rows_v.borrow_mut().clear();
+                    while let Some(child) = tr_box_v.first_child() {
+                        tr_box_v.remove(&child);
+                    }
+                    *t_spacer_v.borrow_mut() = None;
                     *b_spacer_v.borrow_mut() = None;
+                    ws_v.set(0);
+                    we_v.set(0);
+                    tws_v.set(0);
                     return;
                 }
 
-                let start = requested_start.min(total.saturating_sub(WINDOW_SIZE));
-                let end = (start + WINDOW_SIZE).min(total);
-                ws_v.set(start);
-                we_v.set(start);
+                let new_start = requested_start.min(total.saturating_sub(WINDOW_SIZE));
+                let new_end = (new_start + WINDOW_SIZE).min(total);
+                let prev_target = tws_v.get();
+                tws_v.set(new_start);
 
-                if start > 0 {
-                    tr_box_v.append(&Box::builder().height_request((start as i32) * ROW_HEIGHT_PX).build());
+                // Ensure top/bottom spacers exist (they may have been wiped on playlist switch)
+                let spacers_intact = t_spacer_v.borrow().is_some()
+                    && b_spacer_v.borrow().is_some()
+                    && t_spacer_v.borrow().as_ref().and_then(|s| s.parent()).is_some();
+
+                let cur_start = ws_v.get();
+                let cur_end = we_v.get();
+                let has_rows = !rows_v.borrow().is_empty() && cur_end > cur_start && spacers_intact;
+
+                // Incremental infill if new window overlaps currently mounted rows!
+                let overlaps = !force_reset
+                    && has_rows
+                    && new_start < cur_end
+                    && new_end > cur_start;
+
+                if overlaps {
+                    let mut rows = rows_v.borrow_mut();
+
+                    // 1. Trim off-screen rows from top if scrolling down
+                    let mut live_start = cur_start;
+                    while live_start < new_start {
+                        if let Some(w) = rows.pop_front() {
+                            tr_box_v.remove(&w);
+                        }
+                        live_start += 1;
+                    }
+
+                    // 2. Trim off-screen rows from bottom if scrolling up
+                    let mut live_end = cur_end;
+                    while live_end > new_end {
+                        if let Some(w) = rows.pop_back() {
+                            tr_box_v.remove(&w);
+                        }
+                        live_end -= 1;
+                    }
+
+                    ws_v.set(live_start);
+                    we_v.set(live_end);
+
+                    if let Some(ref ts) = *t_spacer_v.borrow() {
+                        ts.set_height_request((live_start as i32) * ROW_HEIGHT_PX);
+                    }
+                    if let Some(ref bs) = *b_spacer_v.borrow() {
+                        bs.set_height_request(
+                            (total.saturating_sub(live_end) as i32) * ROW_HEIGHT_PX,
+                        );
+                    }
+
+                    let mut q = cascade_q_v.borrow_mut();
+                    // Infill below existing rows (scrolling down): top-to-bottom from live_end..new_end
+                    if new_end > live_end {
+                        for (orig_idx, track) in filtered
+                            .iter()
+                            .skip(live_end)
+                            .take(new_end - live_end)
+                        {
+                            q.push_back((*orig_idx, track.clone(), false));
+                        }
+                    }
+                    // Infill above existing rows (scrolling up): bottom-to-top from (live_start-1)..=new_start
+                    if new_start < live_start {
+                        for (orig_idx, track) in filtered[new_start..live_start].iter().rev() {
+                            q.push_back((*orig_idx, track.clone(), true));
+                        }
+                    }
+                    return;
                 }
-                let bottom_spacer = Box::builder().height_request(((total - start) as i32) * ROW_HEIGHT_PX).build();
-                tr_box_v.append(&bottom_spacer);
-                *b_spacer_v.borrow_mut() = Some(bottom_spacer);
 
+                // Full reset (filter change, initial load, or non-overlapping scrollbar jump)
+                rows_v.borrow_mut().clear();
+                while let Some(child) = tr_box_v.first_child() {
+                    tr_box_v.remove(&child);
+                }
+                *t_spacer_v.borrow_mut() = None;
+                *b_spacer_v.borrow_mut() = None;
+                ensure_spacers(&tr_box_v, &t_spacer_v, &b_spacer_v);
+
+                let jumped_up = !force_reset && new_start < prev_target;
                 let mut q = cascade_q_v.borrow_mut();
-                for item in filtered.into_iter().skip(start).take(end - start) {
-                    q.push_back(item);
+                if jumped_up {
+                    // Fill from bottom of the target window upward!
+                    ws_v.set(new_end);
+                    we_v.set(new_end);
+                    if let Some(ref ts) = *t_spacer_v.borrow() {
+                        ts.set_height_request((new_end as i32) * ROW_HEIGHT_PX);
+                    }
+                    if let Some(ref bs) = *b_spacer_v.borrow() {
+                        bs.set_height_request(
+                            (total.saturating_sub(new_end) as i32) * ROW_HEIGHT_PX,
+                        );
+                    }
+                    for (orig_idx, track) in filtered[new_start..new_end].iter().rev() {
+                        q.push_back((*orig_idx, track.clone(), true));
+                    }
+                } else {
+                    // Fill from top of the target window downward!
+                    ws_v.set(new_start);
+                    we_v.set(new_start);
+                    if let Some(ref ts) = *t_spacer_v.borrow() {
+                        ts.set_height_request((new_start as i32) * ROW_HEIGHT_PX);
+                    }
+                    if let Some(ref bs) = *b_spacer_v.borrow() {
+                        bs.set_height_request(
+                            (total.saturating_sub(new_start) as i32) * ROW_HEIGHT_PX,
+                        );
+                    }
+                    for (orig_idx, track) in filtered[new_start..new_end].iter() {
+                        q.push_back((*orig_idx, track.clone(), false));
+                    }
                 }
             })
         };
 
         let ws_timer = win_start.clone();
         let we_timer = win_end.clone();
+        let tws_timer = target_win_start.clone();
         let last_gen_timer = last_gen_seen.clone();
         let cascade_q_timer = scroll_cascade_queue.clone();
+        let t_spacer_timer = top_spacer_ref.clone();
         let b_spacer_timer = bottom_spacer_ref.clone();
+        let rows_timer = rendered_rows.clone();
         let total_cnt_timer = total_filtered_count.clone();
 
         glib::timeout_add_local(Duration::from_millis(10), move || {
             let next_scroll_card = cascade_q_timer.borrow_mut().pop_front();
-            if let Some((orig_idx, track)) = next_scroll_card {
+            if let Some((orig_idx, track, prepend_top)) = next_scroll_card {
                 let is_search = view_title_pop.borrow().starts_with("SEARCH:");
                 let cur_gen = gen_pop.load(Ordering::Relaxed);
-                if let Some(ref spacer) = *b_spacer_timer.borrow() {
-                    tr_box_pop.remove(spacer);
-                }
-                append_single_track_row(
-                    &tr_box_pop,
+                let row = build_single_track_row(
                     orig_idx,
                     cur_gen,
                     track,
@@ -2246,13 +2384,37 @@ pub fn build_music_ui() -> Box {
                     &refresh_q_pop,
                     &open_pl_pop,
                 );
-                let new_end = we_timer.get() + 1;
-                we_timer.set(new_end);
-                let remaining_below = total_cnt_timer.get().saturating_sub(new_end);
-                if remaining_below > 0 {
-                    if let Some(ref spacer) = *b_spacer_timer.borrow() {
-                        spacer.set_height_request((remaining_below as i32) * ROW_HEIGHT_PX);
-                        tr_box_pop.append(spacer);
+                if prepend_top {
+                    // Insert right after top_spacer (bottom-up waterfall when scrolling up!)
+                    if let Some(ref ts) = *t_spacer_timer.borrow() {
+                        tr_box_pop.insert_child_after(&row, Some(ts));
+                    } else {
+                        tr_box_pop.prepend(&row);
+                    }
+                    rows_timer.borrow_mut().push_front(row);
+                    let new_start = ws_timer.get().saturating_sub(1);
+                    ws_timer.set(new_start);
+                    if let Some(ref ts) = *t_spacer_timer.borrow() {
+                        ts.set_height_request((new_start as i32) * ROW_HEIGHT_PX);
+                    }
+                } else {
+                    // Insert right after the last rendered row (above bottom_spacer)
+                    let prev_sibling = rows_timer
+                        .borrow()
+                        .back()
+                        .cloned()
+                        .or_else(|| t_spacer_timer.borrow().clone());
+                    if let Some(ref anchor) = prev_sibling {
+                        tr_box_pop.insert_child_after(&row, Some(anchor));
+                    } else {
+                        tr_box_pop.append(&row);
+                    }
+                    rows_timer.borrow_mut().push_back(row);
+                    let new_end = we_timer.get() + 1;
+                    we_timer.set(new_end);
+                    let remaining_below = total_cnt_timer.get().saturating_sub(new_end);
+                    if let Some(ref bs) = *b_spacer_timer.borrow() {
+                        bs.set_height_request((remaining_below as i32) * ROW_HEIGHT_PX);
                     }
                 }
             }
@@ -2271,7 +2433,10 @@ pub fn build_music_ui() -> Box {
                     last_gen_timer.set(current_gen);
                     ws_timer.set(0);
                     we_timer.set(0);
+                    tws_timer.set(0);
                     cascade_q_timer.borrow_mut().clear();
+                    rows_timer.borrow_mut().clear();
+                    *t_spacer_timer.borrow_mut() = None;
                     *b_spacer_timer.borrow_mut() = None;
                 }
                 let idx = {
@@ -2282,9 +2447,8 @@ pub fn build_music_ui() -> Box {
                 };
                 let fq = filter_pop.borrow().clone();
                 if idx < WINDOW_SIZE && ws_timer.get() == 0 && fq.is_empty() {
-                    we_timer.set(idx + 1);
-                    append_single_track_row(
-                        &tr_box_pop,
+                    ensure_spacers(&tr_box_pop, &t_spacer_timer, &b_spacer_timer);
+                    let row = build_single_track_row(
                         idx,
                         item_gen,
                         track.clone(),
@@ -2298,6 +2462,19 @@ pub fn build_music_ui() -> Box {
                         &refresh_q_pop,
                         &open_pl_pop,
                     );
+                    let prev_sibling = rows_timer
+                        .borrow()
+                        .back()
+                        .cloned()
+                        .or_else(|| t_spacer_timer.borrow().clone());
+                    if let Some(ref anchor) = prev_sibling {
+                        tr_box_pop.insert_child_after(&row, Some(anchor));
+                    } else {
+                        tr_box_pop.append(&row);
+                    }
+                    rows_timer.borrow_mut().push_back(row);
+                    we_timer.set(idx + 1);
+                    total_cnt_timer.set(idx + 1);
                 } else {
                     added_beyond_window = true;
                 }
@@ -2333,32 +2510,32 @@ pub fn build_music_ui() -> Box {
                 let total = cur_tracks_pop.borrow().len();
                 total_cnt_timer.set(total);
                 let remaining = total.saturating_sub(we_timer.get());
-                if remaining > 0 && b_spacer_timer.borrow().is_none() {
-                    let spacer = Box::builder().height_request((remaining as i32) * ROW_HEIGHT_PX).build();
-                    tr_box_pop.append(&spacer);
-                    *b_spacer_timer.borrow_mut() = Some(spacer);
+                if let Some(ref bs) = *b_spacer_timer.borrow() {
+                    bs.set_height_request((remaining as i32) * ROW_HEIGHT_PX);
                 }
             }
             glib::ControlFlow::Continue
         });
 
         let vadj = tr_scroll.vadjustment();
-        let ws_scroll = win_start.clone();
+        let tws_scroll = target_win_start.clone();
         let render_win_scroll = render_virtual_window.clone();
         let scroll_seq = Rc::new(Cell::new(0u32));
 
         vadj.connect_value_changed(move |adj| {
             let scroll_y = adj.value().max(0.0) as usize;
             let desired_start = (scroll_y / (ROW_HEIGHT_PX as usize)).saturating_sub(6);
-            let current_start = ws_scroll.get();
-            if desired_start.abs_diff(current_start) >= 8 || (desired_start == 0 && current_start != 0) {
+            let current_target = tws_scroll.get();
+            if desired_start.abs_diff(current_target) >= 4
+                || (desired_start == 0 && current_target != 0)
+            {
                 let seq = scroll_seq.get().wrapping_add(1);
                 scroll_seq.set(seq);
                 let seq_check = scroll_seq.clone();
                 let render_cb = render_win_scroll.clone();
-                glib::timeout_add_local_once(Duration::from_millis(55), move || {
+                glib::timeout_add_local_once(Duration::from_millis(25), move || {
                     if seq_check.get() == seq {
-                        render_cb(desired_start);
+                        render_cb(desired_start, false);
                     }
                 });
             }
@@ -2414,7 +2591,7 @@ pub fn build_music_ui() -> Box {
                 render_playlists_list(&pl_box_chg, &all_pl_chg.borrow(), &q, &open_pl_chg);
             } else if page == "tracks" && !view_title_chg.borrow().starts_with("SEARCH:") {
                 *filter_chg.borrow_mut() = q;
-                render_win_chg(0);
+                render_win_chg(0, true);
             }
         });
     }
@@ -2942,8 +3119,7 @@ fn render_home_view(
     } else {
         let dummy_tracks: Rc<RefCell<Vec<TrackItem>>> = Rc::new(RefCell::new(top_songs.iter().map(|(_, t)| t.clone()).collect()));
         for (idx, (_, track)) in top_songs.into_iter().enumerate() {
-            append_single_track_row(
-                container,
+            let row = build_single_track_row(
                 idx,
                 0,
                 track,
@@ -2957,6 +3133,7 @@ fn render_home_view(
                 refresh_queue_ui,
                 open_playlist_cb,
             );
+            container.append(&row);
         }
     }
 }
@@ -3000,8 +3177,7 @@ fn render_playlists_list(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_single_track_row(
-    container: &Box,
+fn build_single_track_row(
     idx: usize,
     stream_gen: u64,
     track: TrackItem,
@@ -3014,7 +3190,7 @@ fn append_single_track_row(
     pp_btn: &Button,
     refresh_queue_ui: &Rc<dyn Fn()>,
     open_playlist_cb: &Rc<dyn Fn(PlaylistItem)>,
-) {
+) -> Box {
     let row_box = Box::builder().orientation(Orientation::Horizontal).build();
     let card_class = match track.kind {
         MediaKind::Song => "fav-item-btn",
@@ -3228,7 +3404,7 @@ fn append_single_track_row(
     }
 
     row_box.append(&btn);
-    container.append(&row_box);
+    row_box
 }
 
 #[allow(clippy::too_many_arguments)]
