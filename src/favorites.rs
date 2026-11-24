@@ -1,7 +1,8 @@
 //! Frequently-used files and folders tab.
 //!
-//! Watches user directories via `notify`, scores access frequency, supports pinning
-//! and ignoring paths, and only builds row widgets while the tab is active.
+//! Watches user directories via `notify`, scores access frequency in RAM (flushing
+//! `ignore.json` at most once every 60s), supports pinning and ignoring paths, and
+//! only builds row widgets while the tab is active.
 
 use gtk4::gio;
 use gtk4::glib;
@@ -47,6 +48,7 @@ pub struct FavoritesState {
     pinned: HashSet<String>,
     search_query: String,
     is_active: bool,
+    dirty: bool,
     list_container: Box,
     popover_guard: Rc<Cell<usize>>,
 }
@@ -87,10 +89,15 @@ impl FavoritesState {
         }
     }
 
+    pub fn save_config_and_clear_dirty(&mut self) {
+        self.save_config();
+        self.dirty = false;
+    }
+
     pub fn ignore_file(&mut self, path_str: String) {
         self.pinned.remove(&path_str);
         self.ignored.insert(path_str);
-        self.save_config();
+        self.save_config_and_clear_dirty();
     }
 
     pub fn toggle_pin(&mut self, path_str: String) {
@@ -99,7 +106,7 @@ impl FavoritesState {
         } else {
             self.pinned.insert(path_str);
         }
-        self.save_config();
+        self.save_config_and_clear_dirty();
     }
 
     pub fn record_event(&mut self, path: PathBuf, weight: u32, persist: bool) {
@@ -112,7 +119,9 @@ impl FavoritesState {
         if path.is_file() && path.extension().is_some() {
             *self.scores.entry(path).or_insert(0) += weight;
             if persist {
-                self.save_config();
+                self.save_config_and_clear_dirty();
+            } else {
+                self.dirty = true;
             }
         }
     }
@@ -152,7 +161,9 @@ impl FavoritesState {
             }
         }
 
-        self.save_config();
+        if self.dirty {
+            self.save_config_and_clear_dirty();
+        }
     }
 }
 
@@ -196,6 +207,7 @@ pub fn build_favorites_ui(popover_guard: Rc<Cell<usize>>) -> FavoritesUi {
         pinned: cfg.pinned_paths,
         search_query: String::new(),
         is_active: false,
+        dirty: false,
         list_container,
         popover_guard,
     }));
@@ -286,6 +298,7 @@ fn start_notify_daemon(state: Rc<RefCell<FavoritesState>>) {
         }
     });
 
+    let state_flush = state.clone();
     glib::timeout_add_local(Duration::from_millis(500), move || {
         let mut updated = false;
         while let Ok(path) = rx.try_recv() {
@@ -293,14 +306,19 @@ fn start_notify_daemon(state: Rc<RefCell<FavoritesState>>) {
             updated = true;
         }
         if updated {
-            let active = {
-                let st = state.borrow();
-                st.save_config();
-                st.is_active
-            };
+            let active = state.borrow().is_active;
             if active {
                 refresh_list(&state);
             }
+        }
+        glib::ControlFlow::Continue
+    });
+
+    // Debounced disk flush: write accumulated score updates at most once every 60s
+    glib::timeout_add_seconds_local(60, move || {
+        let mut st = state_flush.borrow_mut();
+        if st.dirty {
+            st.save_config_and_clear_dirty();
         }
         glib::ControlFlow::Continue
     });

@@ -1,8 +1,8 @@
-//! Hyprland window session tracker and restorer.
+//! Hyprland window session saver and restorer.
 //!
-//! Periodically records mapped windows (workspace, geometry, float/fullscreen flags,
-//! and `/proc/<pid>/cmdline`) so the sidebar footer's "Load previous session" button
-//! can relaunch and place them back on their workspaces.
+//! Saves and restores mapped windows (workspace, geometry, float/fullscreen flags,
+//! and `/proc/<pid>/cmdline`). Controlled by the sidebar's Load / Save / Auto-save
+//! buttons; auto-save defaults to off and ignores window-title changes when enabled.
 
 use gtk4::glib;
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,16 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+static AUTO_SAVE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Serialize, Deserialize, Default)]
+struct SessionPrefs {
+    #[serde(default)]
+    auto_save: bool,
+}
 
 #[derive(Deserialize)]
 struct HyprWorkspace {
@@ -65,44 +74,114 @@ fn previous_session_path() -> PathBuf {
     config_dir().join("previous_session.json")
 }
 
-pub fn init_session_tracker() {
-    let curr = current_session_path();
-    let prev = previous_session_path();
+fn prefs_path() -> PathBuf {
+    config_dir().join("session_prefs.json")
+}
 
-    // Only rotate current_session.json -> previous_session.json if this is a fresh boot/login
-    // (i.e., current_session.json was last modified more than 30 seconds ago).
-    // That way, clicking "Reload dashboard" won't overwrite your previous boot's session!
-    let should_rotate = if let Ok(meta) = fs::metadata(&curr) {
-        if let Ok(modified) = meta.modified() {
-            modified.elapsed().unwrap_or(Duration::from_secs(0)) > Duration::from_secs(30)
-        } else {
-            true
+fn load_prefs() -> SessionPrefs {
+    if let Ok(data) = fs::read_to_string(prefs_path()) {
+        if let Ok(p) = serde_json::from_str::<SessionPrefs>(&data) {
+            return p;
         }
-    } else {
-        false
-    };
+    }
+    SessionPrefs::default()
+}
 
-    if should_rotate {
-        if let Ok(data) = fs::read_to_string(&curr) {
-            if let Ok(parsed) = serde_json::from_str::<SessionData>(&data) {
-                if !parsed.windows.is_empty() {
-                    let _ = fs::copy(&curr, &prev);
+pub fn is_auto_save_enabled() -> bool {
+    AUTO_SAVE_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_auto_save_enabled(enabled: bool) {
+    AUTO_SAVE_ENABLED.store(enabled, Ordering::Relaxed);
+    let prefs = SessionPrefs { auto_save: enabled };
+    if let Ok(json) = serde_json::to_string_pretty(&prefs) {
+        let _ = fs::write(prefs_path(), json);
+    }
+}
+
+/// Captures the current Hyprland windows and writes them as the saved session immediately.
+pub fn save_session_now() -> usize {
+    let Some(session) = capture_hyprland_clients() else {
+        return 0;
+    };
+    if session.windows.is_empty() {
+        return 0;
+    }
+    let count = session.windows.len();
+    if let Ok(json) = serde_json::to_string_pretty(&session) {
+        let _ = fs::write(current_session_path(), &json);
+        let _ = fs::write(previous_session_path(), &json);
+    }
+    count
+}
+
+/// Title-independent layout signature so browser tabs / song titles / editor filenames
+/// changing never trigger unnecessary SSD writes.
+fn layout_signature(session: &SessionData) -> Vec<(i32, bool, bool, [i32; 2], [i32; 2], String, String)> {
+    let mut sig: Vec<_> = session
+        .windows
+        .iter()
+        .map(|w| {
+            (
+                w.workspace_id,
+                w.floating,
+                w.fullscreen,
+                w.at,
+                w.size,
+                w.class.clone(),
+                w.command.clone(),
+            )
+        })
+        .collect();
+    sig.sort();
+    sig
+}
+
+pub fn init_session_tracker() {
+    let prefs = load_prefs();
+    AUTO_SAVE_ENABLED.store(prefs.auto_save, Ordering::Relaxed);
+
+    // Only rotate current_session.json -> previous_session.json when auto-save is enabled
+    // and this looks like a fresh boot (>30s since last write), so manual saves and
+    // "Reload Dashboard" never overwrite your saved session.
+    if prefs.auto_save {
+        let curr = current_session_path();
+        let prev = previous_session_path();
+        let should_rotate = if let Ok(meta) = fs::metadata(&curr) {
+            if let Ok(modified) = meta.modified() {
+                modified.elapsed().unwrap_or(Duration::from_secs(0)) > Duration::from_secs(30)
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+
+        if should_rotate {
+            if let Ok(data) = fs::read_to_string(&curr) {
+                if let Ok(parsed) = serde_json::from_str::<SessionData>(&data) {
+                    if !parsed.windows.is_empty() {
+                        let _ = fs::copy(&curr, &prev);
+                    }
                 }
             }
         }
     }
 
     std::thread::spawn(move || {
-        let mut last_saved_json = String::new();
+        let mut last_sig: Option<Vec<(i32, bool, bool, [i32; 2], [i32; 2], String, String)>> = None;
         loop {
-            std::thread::sleep(Duration::from_secs(5));
+            std::thread::sleep(Duration::from_secs(30));
+            if !AUTO_SAVE_ENABLED.load(Ordering::Relaxed) {
+                continue;
+            }
             if let Some(session) = capture_hyprland_clients() {
                 if !session.windows.is_empty() {
-                    if let Ok(json) = serde_json::to_string_pretty(&session) {
-                        // Only write to the SSD if the open windows/positions actually changed!
-                        if json != last_saved_json {
+                    let sig = layout_signature(&session);
+                    if last_sig.as_ref() != Some(&sig) {
+                        if let Ok(json) = serde_json::to_string_pretty(&session) {
                             if fs::write(current_session_path(), &json).is_ok() {
-                                last_saved_json = json;
+                                last_sig = Some(sig);
                             }
                         }
                     }

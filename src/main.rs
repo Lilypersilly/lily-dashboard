@@ -204,6 +204,8 @@ fn init_theme() {
                 .power-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: 10px; padding: 5px 2px; min-height: 28px; box-shadow: none; transition: background-color 0.16s ease; }}
                 .power-btn:hover {{ background-color: {fg_main_15}; }}
                 .power-btn-lbl {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', 'Josefin Sans', sans-serif; font-size: 14px; font-weight: bold; }}
+                .power-btn.active {{ background-color: {accent1_24}; }}
+                .power-btn.active:hover {{ background-color: {accent1_38}; }}
                 .power-btn.armed {{ background-color: rgba(243, 139, 168, 0.24); border-color: transparent; }}
                 .power-btn.armed .power-btn-lbl {{ color: #f38ba8; font-family: 'Josefin Sans', sans-serif; font-size: 11px; }}
 
@@ -605,31 +607,102 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
         });
     });
 
-    let session_lbl = Label::builder()
-        .label("Load previous\nsession")
-        .justify(gtk4::Justification::Center)
-        .css_classes(vec!["session-restore-lbl".to_string()])
+    // 3-button Session row: Load | Save | Auto-save toggle (OFF by default to avoid SSD wear)
+    let session_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(4)
+        .homogeneous(true)
+        .margin_start(8)
+        .margin_end(8)
+        .margin_top(4)
+        .margin_bottom(2)
         .build();
 
-    let session_btn = Button::builder()
-        .child(&session_lbl)
-        .css_classes(vec!["session-restore-btn".to_string()])
-        .tooltip_text("Restore windows and workspaces from your previous Hyprland session")
+    let sess_load_lbl = Label::builder()
+        .label("󰦛")
+        .css_classes(vec!["power-btn-lbl".to_string()])
         .build();
-
-    let lbl_feedback = session_lbl.clone();
-    session_btn.connect_clicked(move |_| {
-        let count = session::restore_previous_session();
-        if count > 0 {
-            lbl_feedback.set_label(&format!("Restored {}!", count));
-        } else {
-            lbl_feedback.set_label("No session\nfound");
-        }
-        let lbl_reset = lbl_feedback.clone();
-        glib::timeout_add_local_once(Duration::from_millis(1500), move || {
-            lbl_reset.set_label("Load previous\nsession");
+    let sess_load_btn = Button::builder()
+        .child(&sess_load_lbl)
+        .css_classes(vec!["power-btn".to_string()])
+        .tooltip_text("Load saved session")
+        .build();
+    {
+        let lbl_fb = sess_load_lbl.clone();
+        sess_load_btn.connect_clicked(move |_| {
+            let count = session::restore_previous_session();
+            if count > 0 {
+                lbl_fb.set_label(&format!("{}✓", count));
+            } else {
+                lbl_fb.set_label("–");
+            }
+            let lbl_reset = lbl_fb.clone();
+            glib::timeout_add_local_once(Duration::from_millis(1400), move || {
+                lbl_reset.set_label("󰦛");
+            });
         });
+    }
+
+    let sess_save_lbl = Label::builder()
+        .label("󰆓")
+        .css_classes(vec!["power-btn-lbl".to_string()])
+        .build();
+    let sess_save_btn = Button::builder()
+        .child(&sess_save_lbl)
+        .css_classes(vec!["power-btn".to_string()])
+        .tooltip_text("Save current session now")
+        .build();
+    {
+        let lbl_fb = sess_save_lbl.clone();
+        sess_save_btn.connect_clicked(move |_| {
+            let count = session::save_session_now();
+            if count > 0 {
+                lbl_fb.set_label(&format!("{}✓", count));
+            } else {
+                lbl_fb.set_label("–");
+            }
+            let lbl_reset = lbl_fb.clone();
+            glib::timeout_add_local_once(Duration::from_millis(1400), move || {
+                lbl_reset.set_label("󰆓");
+            });
+        });
+    }
+
+    let auto_on_init = session::is_auto_save_enabled();
+    let sess_auto_lbl = Label::builder()
+        .label("󰁪")
+        .css_classes(vec!["power-btn-lbl".to_string()])
+        .build();
+    let sess_auto_btn = Button::builder()
+        .child(&sess_auto_lbl)
+        .css_classes(if auto_on_init {
+            vec!["power-btn".to_string(), "active".to_string()]
+        } else {
+            vec!["power-btn".to_string()]
+        })
+        .tooltip_text(if auto_on_init {
+            "Auto-save session: ON (saves every 30s on layout change)"
+        } else {
+            "Auto-save session: OFF (manual save only)"
+        })
+        .build();
+    sess_auto_btn.connect_clicked(move |btn| {
+        let next = !session::is_auto_save_enabled();
+        session::set_auto_save_enabled(next);
+        if next {
+            btn.add_css_class("active");
+            btn.set_tooltip_text(Some(
+                "Auto-save session: ON (saves every 30s on layout change)",
+            ));
+        } else {
+            btn.remove_css_class("active");
+            btn.set_tooltip_text(Some("Auto-save session: OFF (manual save only)"));
+        }
     });
+
+    session_row.append(&sess_load_btn);
+    session_row.append(&sess_save_btn);
+    session_row.append(&sess_auto_btn);
 
     // Two-button Power / Restart row with two-step "Sure?" confirmation
     let power_row = Box::builder()
@@ -836,7 +909,7 @@ fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) ->
     sidebar_column.append(&sidebar_nav);
     sidebar_column.append(&tray_widget);
     sidebar_column.append(&status_strip);
-    sidebar_column.append(&session_btn);
+    sidebar_column.append(&session_row);
     sidebar_column.append(&power_row);
     sidebar_column.append(&footer_box);
 

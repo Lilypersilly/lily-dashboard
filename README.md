@@ -12,14 +12,16 @@ It sits on the left edge of the active monitor, replaces Waybar (workspaces, sys
 - **Live theming**: `init_theme()` watches `~/.config/theme-switch/current.conf` via `gio::FileMonitor` and reloads the GTK CSS whenever the theme changes.
 - **Hyprland blur**: On startup, `main()` adds `ext_background_effect_manager_v1` to `GDK_WAYLAND_DISABLE`. GTK 4.24 otherwise sends an empty Wayland blur region that overrides Hyprland's `layer_rule` blur, and using GTK CSS `backdrop-filter` causes frame drops during the slide animation. Disabling that protocol lets Hyprland's GPU Dual-Kawase blur handle the surfaces directly.
 
+- **Low SSD wear**: Normal clipboard history and wallpaper thumbnails live only in RAM; music thumbnails/logs (`/tmp`) and decrypted locker previews (`/dev/shm`) use `tmpfs`; session auto-save defaults to off (and ignores window-title changes when enabled); and `Favorites` batches watcher score writes to at most once every 60 seconds.
+
 ## Code layout (`src/`)
 
 | File | What it does |
 | --- | --- |
-| `main.rs` | Window setup, layer-shell config, slide animation, dynamic input region, live CSS theming, sidebar navigation, footer (session restore, power/restart, weather, Nixie clock, self-rebuild button), and top-bar quick capture/color-picker buttons. |
+| `main.rs` | Window setup, layer-shell config, slide animation, dynamic input region, live CSS theming, sidebar navigation, footer (session load/save/auto-save, power/restart, weather, Nixie clock, self-rebuild button), and top-bar quick capture/color-picker buttons. |
 | `tray.rs` | Top workspace bar (Hyprland socket listener, click to switch, scroll to cycle, hover popover with a proportional window layout mini-map + focus/close actions), D-Bus `StatusNotifierWatcher` system tray, mouse battery reader (`/sys/class/power_supply`), and SwayNC notification badge + right-click DND toggle. |
 | `launcher.rs` | `Run` tab (default). Scans `.desktop` entries via `gio::AppInfo`, supports fuzzy filtering, pinning, and optional background binary preloading (`cat <bin> > /dev/null`) to warm page cache. |
-| `favorites.rs` | `Favorites` tab. Tracks frequently accessed files/folders via `notify` filesystem watcher, scores usage, lets you pin or ignore paths, and opens items with `xdg-open`. |
+| `favorites.rs` | `Favorites` tab. Tracks frequently accessed files/folders via `notify` filesystem watcher, scores usage in RAM (flushing `ignore.json` at most once every 60s), lets you pin or ignore paths, and opens items with `xdg-open`. |
 | `clipboard.rs` | `Clipboard` tab. Runs background `wl-paste --watch` listeners for text (up to 200 items) and PNG images (up to 20 items, 15 MB cap). Normal history lives only in RAM; pinned items persist to `clipboard_pins.json`. |
 | `plans.rs` | `Plans` tab. Plain-text/markdown checklist and notes editor backed by `~/Documents/plans` (or `~/documents/plans`), with a 400px slide-out detail pane, checkboxes, drag-and-drop line reordering, and inline editing. |
 | `calendar.rs` | `Calendar` tab. Monthly GTK calendar with per-day notes saved in `calendar_events.json`. |
@@ -31,7 +33,7 @@ It sits on the left edge of the active monitor, replaces Waybar (workspaces, sys
 | `locker.rs` | `Locker` tab. Encrypted file vault using Argon2id + HKDF-SHA256 + streaming AES-256-GCM (`1 MB` chunks) packed into `.lilar` block files (up to 10 GB per block). Decrypted previews extract to `/dev/shm/lily-locker` (RAM tmpfs) and are cleaned up on lock. |
 | `system.rs` | `System` tab with a 400px slide-out detail pane covering: **Sound** (`pactl` sinks, sources, per-app streams), **Network** (`nmcli` active connections, Wi-Fi scan/connect, VPNs), **Themes** (`theme-switch` palette previews), **Wallpapers** (`swww` multi-monitor picker with vertical crop pairs in `~/Pictures/Wallpapers/vertical/`, RAM-only thumbnails), **Displays** (`hyprctl monitors`), **Keybinds** (live parser for `~/.config/hypr/binds.lua` with search), and **Overview** (CPU/RAM/GPU stats, `lumine-capture` screenshot modes, `slurp` + `grim` color picker, DND, Suspend, Reload Hyprland). |
 | `weather.rs` | Compact sidebar weather badge + click-to-open forecast popover backed by Open-Meteo (location search + daily/hourly forecast). |
-| `session.rs` | Periodically snapshots mapped Hyprland windows (workspace, geometry, float/fullscreen state, command line) and restores the previous session on demand from the sidebar footer. |
+| `session.rs` | Saves and restores mapped Hyprland windows (workspace, geometry, float/fullscreen state, command line). Controlled by the sidebar's Load / Save / Auto-save buttons (auto-save defaults to off to avoid background SSD writes; when enabled it checks every 30s and ignores window-title changes). |
 
 ## Files & state on disk
 
@@ -39,7 +41,7 @@ It sits on the left edge of the active monitor, replaces Waybar (workspaces, sys
   - `clipboard_pins.json` — pinned clipboard entries only (normal history stays in RAM)
   - `calendar_events.json` — per-day calendar notes
   - `passwords.txt` — owner-only (`0600`) password entries
-  - `favorites.json` / `launcher.json` / `weather.json` / `session.json` — module preferences and snapshots
+  - `ignore.json` / `launcher.json` / `weather.json` / `current_session.json` / `previous_session.json` / `session_prefs.json` — module preferences and snapshots
 - `~/.config/theme-switch/current.conf` — active color palette (watched live)
 - `~/.config/hypr/binds.lua` — parsed live by `System -> Keybinds`
 - `~/.config/hypr/.current_wallpaper` — active wallpaper path shared with startup scripts
