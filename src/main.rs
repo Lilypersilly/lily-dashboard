@@ -8,13 +8,17 @@ mod drive;
 mod locker;
 mod weather;
 mod timers;
+mod system;
+mod clipboard;
+mod calendar;
+mod media_popout;
+mod tray;
 
 use gtk4::cairo::{RectangleInt, Region};
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box, Button, CssProvider, EventControllerKey,
-    EventControllerMotion, GestureClick, Label, Orientation, Overflow, Stack, StackSidebar, gdk,
-    glib,
+    EventControllerMotion, GestureClick, Label, Orientation, Overflow, Stack, gdk, glib,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::cell::{Cell, RefCell};
@@ -33,6 +37,7 @@ fn main() {
 
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| init_theme());
+    app.connect_shutdown(|_| clipboard::shutdown_watchers());
 
     // Store the trigger button so re-running `lily-dashboard` (e.g. via SUPER keybind)
     // toggles the already-running dashboard open/closed instead of spawning a second window!
@@ -44,8 +49,10 @@ fn main() {
         }
 
         session::init_session_tracker();
+        clipboard::init_clipboard_watcher();
+        let media_handle = media_popout::init_media_popout(app);
 
-        let btn = build_ui(app);
+        let btn = build_ui(app, media_handle);
         *existing_trigger.borrow_mut() = Some(btn);
     });
 
@@ -111,6 +118,7 @@ fn init_theme() {
             };
 
             let accent1_15 = hex_to_rgba(accent1, 0.15);
+            let accent1_35 = hex_to_rgba(accent1, 0.35);
             let fg_main_06 = hex_to_rgba(fg_main, 0.06);
             let bg_contrast_50 = hex_to_rgba(bg_contrast, 0.50);
             let bg_contrast_80 = hex_to_rgba(bg_contrast, 0.80);
@@ -124,13 +132,12 @@ fn init_theme() {
                 .dash-box {{ background-color: #{bg_main}; border: 2px solid #{accent1}; border-left: none; border-top-right-radius: 16px; border-bottom-right-radius: 16px; min-width: 398px; }}
                 .sidebar-column {{ background-color: #{bg_recessed}; border-right: 1px solid #{accent1}; }}
                 
-                stacksidebar {{ background-color: transparent; }}
-                stacksidebar list {{ background-color: transparent; }}
-                stacksidebar row {{ padding: 8px 10px; border-radius: 12px; margin: 2px 4px; transition: background-color 0.2s ease, color 0.2s ease; }}
-                stacksidebar row:hover {{ background-color: {accent1_15}; }}
-                stacksidebar row:checked, stacksidebar row.selected {{ background-color: {fg_main_06}; }}
-                stacksidebar label {{ color: #{fg_muted}; font-family: 'Josefin Sans', sans-serif; font-size: 16px; font-weight: bold; }}
-                stacksidebar row:checked label, stacksidebar row.selected label {{ color: #{fg_main}; }}
+                .sidebar-nav-btn {{ background-color: transparent; border: none; border-radius: 10px; padding: 6px 10px; margin: 1px 4px; box-shadow: none; transition: background-color 0.18s ease, color 0.18s ease; }}
+                .sidebar-nav-btn:hover {{ background-color: {accent1_15}; }}
+                .sidebar-nav-btn.selected {{ background-color: {fg_main_06}; }}
+                .sidebar-nav-btn label {{ color: #{fg_muted}; font-family: 'Josefin Sans', sans-serif; font-size: 15px; font-weight: bold; }}
+                .sidebar-nav-btn.selected label {{ color: #{fg_main}; }}
+                .sidebar-sep {{ background-color: {accent1_35}; min-height: 1px; margin: 4px 10px; }}
                 
                 .fav-item-btn, .music-item-album, .music-item-playlist {{ background-color: transparent; border: none; border-radius: 12px; padding: 6px 8px; transition: background-color 0.15s ease; box-shadow: none; }}
                 .fav-item-btn:hover, .music-item-album:hover, .music-item-playlist:hover {{ background-color: {accent1_15}; }}
@@ -147,10 +154,55 @@ fn init_theme() {
                 .plan-fmt-btn, .plan-close-btn {{ background-color: #{bg_pill}; border: 1px solid #{accent1}; border-radius: 8px; padding: 4px 10px; color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-weight: bold; transition: all 0.15s ease; }}
                 .plan-fmt-btn:hover, .plan-close-btn:hover {{ background-color: #{selection}; }}
                 .plan-fmt-btn.active, .plan-close-btn.active {{ background-color: #{accent2}; border-color: #{accent2}; color: #{bg_contrast}; }}
+                .plan-fmt-btn.active label, .plan-close-btn.active label {{ color: #{bg_contrast}; }}
                 
                 .session-restore-btn {{ background-color: transparent; border: 1px solid #{accent1}; border-radius: 10px; padding: 8px 6px; margin: 4px 8px; transition: background-color 0.15s ease; }}
                 .session-restore-btn:hover {{ background-color: {accent1_15}; }}
                 .session-restore-lbl {{ color: #{accent2}; font-size: 12px; font-weight: bold; }}
+
+                .power-btn {{ background-color: transparent; border: 1px solid #{accent1}; border-radius: 10px; padding: 5px 2px; min-height: 28px; transition: background-color 0.15s ease, border-color 0.15s ease; }}
+                .power-btn:hover {{ background-color: {accent1_15}; }}
+                .power-btn-lbl {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', 'Josefin Sans', sans-serif; font-size: 14px; font-weight: bold; }}
+                .power-btn.armed {{ background-color: #{accent2}; border-color: #{accent2}; }}
+                .power-btn.armed .power-btn-lbl {{ color: #{bg_contrast}; font-family: 'Josefin Sans', sans-serif; font-size: 11px; }}
+
+                .sidebar-footer-btn {{ background-color: transparent; border: none; border-radius: 6px; padding: 2px 3px; margin: 0px; min-height: 0px; min-width: 0px; box-shadow: none; transition: background-color 0.15s ease; }}
+                .sidebar-footer-btn:hover {{ background-color: {accent1_15}; }}
+                .sidebar-weather-lbl {{ color: #{accent2}; font-family: 'Josefin Sans', sans-serif; font-size: 13px; font-weight: bold; }}
+                .sidebar-clock-lbl {{ color: #{fg_main}; font-family: 'MesloLGL Nerd Font', 'Josefin Sans', sans-serif; font-size: 12px; font-weight: bold; }}
+                .sidebar-reload-lbl {{ color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 11px; font-weight: bold; }}
+
+                .sidebar-status-lbl {{ color: #{fg_muted}; font-family: 'MesloLGL Nerd Font', 'Josefin Sans', sans-serif; font-size: 11px; font-weight: bold; }}
+                .sidebar-status-lbl.bat-low {{ color: #f38ba8; }}
+                .notif-unread .sidebar-status-lbl {{ color: #{accent2}; }}
+
+                .ws-top-bar {{ background-color: #{bg_recessed}; border-bottom: 1px solid #{accent1}; padding: 6px 10px; }}
+                .ws-pill-btn {{ background-color: transparent; border: 1px solid #{accent1}; border-radius: 10px; padding: 2px 9px; min-width: 24px; min-height: 22px; transition: all 0.15s ease; }}
+                .ws-pill-btn label {{ color: #{fg_muted}; font-family: 'MesloLGL Nerd Font', sans-serif; font-size: 12px; font-weight: bold; }}
+                .ws-pill-btn:hover {{ background-color: {accent1_15}; }}
+                .ws-pill-btn.active {{ background-color: #{accent2}; border-color: #{accent2}; }}
+                .ws-pill-btn.active label {{ color: #{bg_contrast}; }}
+
+                .tray-icon-btn {{ background-color: transparent; border: 1px solid {accent1_15}; border-radius: 7px; padding: 2px; min-width: 22px; min-height: 22px; transition: background-color 0.15s ease; }}
+                .tray-icon-btn:hover {{ background-color: {accent1_15}; }}
+
+                .media-edge-sliver {{ background-color: #{accent2}; border-radius: 4px; opacity: 0.85; transition: all 0.18s ease; }}
+                .media-edge-sliver.paused {{ background-color: #{accent1}; opacity: 0.55; }}
+                .media-edge-sliver.active {{ opacity: 0.35; }}
+                .media-popout-pill {{ background-color: #{bg_main}; border: 2px solid #{accent1}; border-radius: 16px; padding: 6px 12px; opacity: 0.95; transition: background-color 0.15s ease; }}
+                .media-popout-pill:hover {{ background-color: #{bg_pill}; }}
+                .media-pill-lbl {{ color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 13px; font-weight: bold; }}
+                .media-popout-card {{ background-color: #{bg_main}; border: 2px solid #{accent1}; border-radius: 16px; padding: 12px 14px; opacity: 0.96; }}
+                .media-popout-title {{ color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 15px; font-weight: bold; }}
+                .media-art-box {{ background-color: #{bg_recessed}; border: 1px solid #{selection}; border-radius: 10px; }}
+
+                calendar.lily-calendar {{ background-color: #{bg_recessed}; border: 1px solid #{accent1}; border-radius: 12px; color: #{fg_main}; padding: 4px; font-family: 'Josefin Sans', sans-serif; font-size: 13px; }}
+                calendar.lily-calendar > header {{ color: #{accent2}; font-weight: bold; border-bottom: 1px solid #{selection}; padding-bottom: 4px; }}
+                calendar.lily-calendar > grid > label.day-name {{ color: #{fg_muted}; font-weight: bold; }}
+                calendar.lily-calendar > grid > label.day-number {{ border-radius: 8px; padding: 3px; }}
+                calendar.lily-calendar > grid > label.day-number:selected {{ background-color: #{accent2}; color: #{bg_contrast}; font-weight: bold; }}
+                calendar.lily-calendar > grid > label.day-number.today {{ border: 1px solid #{accent1}; font-weight: bold; }}
+                calendar.lily-calendar > grid > label.day-number.other-month {{ opacity: 0.35; }}
                 
                 label {{ color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 16px; }}
                 
@@ -191,8 +243,8 @@ fn init_theme() {
                 scale.music-seek > trough > highlight {{ background-color: #{accent2}; border-radius: 6px; }}
                 scale.music-seek > trough > slider {{ background-color: #{bg_main}; border: 2px solid #{accent2}; border-radius: 50%; min-width: 12px; min-height: 12px; margin: -4px 0px; }}
                 
-                progressbar.drive-progress > trough {{ background-color: #{bg_pill}; border: 1px solid #{accent1}; border-radius: 6px; min-height: 14px; }}
-                progressbar.drive-progress > trough > progress {{ background-color: #{accent2}; border-radius: 5px; }}
+                progressbar.drive-progress > trough {{ background-color: #{bg_pill}; border: 1px solid #{accent1}; border-radius: 6px; min-height: 12px; }}
+                progressbar.drive-progress > trough > progress {{ background-color: #{accent2}; border-radius: 5px; min-height: 12px; }}
                 "#
             );
             
@@ -282,7 +334,7 @@ fn move_to_monitor(window: &ApplicationWindow, target: Option<&str>) {
         }
     }
 }
-fn build_ui(app: &Application) -> Button {
+fn build_ui(app: &Application, media_handle: media_popout::MediaPopoutHandle) -> Button {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Lily Dashboard")
@@ -366,19 +418,61 @@ fn build_ui(app: &Application) -> Button {
         .child(&sidebar_column)
         .build();
 
-    let sidebar = StackSidebar::new();
-    sidebar.set_stack(&stack);
-    sidebar.set_vexpand(true);
+    // Grouped sidebar navigation with 1px horizontal dividers between groups
+    let sidebar_nav = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(1)
+        .margin_top(4)
+        .vexpand(true)
+        .build();
+
+    let nav_groups: &[&[(&str, &str)]] = &[
+        &[("run", "Run"), ("favs", "Favorites"), ("clipboard", "Clipboard")],
+        &[("plans", "Plans"), ("calendar", "Calendar"), ("timers", "Timers")],
+        &[("music", "Music")],
+        &[("drive", "Drive"), ("passwords", "Passwords"), ("locker", "Locker")],
+        &[("system", "System")],
+    ];
+
+    let mut nav_buttons: Vec<(&'static str, Button)> = Vec::new();
+    for (gi, group) in nav_groups.iter().enumerate() {
+        if gi > 0 {
+            let sep = Box::builder()
+                .orientation(Orientation::Horizontal)
+                .height_request(1)
+                .css_classes(vec!["sidebar-sep".to_string()])
+                .build();
+            sidebar_nav.append(&sep);
+        }
+        for &(id, title) in *group {
+            let lbl = Label::builder()
+                .label(title)
+                .halign(gtk4::Align::Start)
+                .hexpand(true)
+                .build();
+            let btn = Button::builder()
+                .child(&lbl)
+                .css_classes(vec!["sidebar-nav-btn".to_string()])
+                .build();
+            let stack_click = stack.clone();
+            btn.connect_clicked(move |_| {
+                stack_click.set_visible_child_name(id);
+            });
+            sidebar_nav.append(&btn);
+            nav_buttons.push((id, btn));
+        }
+    }
 
     let reload_lbl = Label::builder()
-        .label("Reload\ndashboard")
-        .justify(gtk4::Justification::Center)
-        .css_classes(vec!["session-restore-lbl".to_string()])
+        .label("Reload Dashboard")
+        .halign(gtk4::Align::Start)
+        .css_classes(vec!["sidebar-reload-lbl".to_string()])
         .build();
 
     let reload_btn = Button::builder()
         .child(&reload_lbl)
-        .css_classes(vec!["session-restore-btn".to_string()])
+        .halign(gtk4::Align::Start)
+        .css_classes(vec!["sidebar-footer-btn".to_string()])
         .tooltip_text("Recompile release binary and restart Lily Dashboard")
         .build();
 
@@ -388,16 +482,41 @@ fn build_ui(app: &Application) -> Button {
         btn.set_sensitive(false);
         lbl_for_reload.set_label("Building...");
 
-        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
         std::thread::spawn(move || {
-            let status = std::process::Command::new("cargo")
-                .args(["build", "--release"])
-                .current_dir("/home/lilypersilly/lily-dashboard")
-                .status();
+            let run_cargo = |offline: bool| {
+                let mut cmd = std::process::Command::new("cargo");
+                cmd.args(["build", "--release"]);
+                if offline {
+                    cmd.arg("--offline");
+                }
+                cmd.current_dir("/home/lilypersilly/lily-dashboard").output()
+            };
 
-            let ok = status.map(|s| s.success()).unwrap_or(false);
-            let _ = tx.send(ok);
+            let res = match run_cargo(false) {
+                Ok(out) if out.status.success() => Ok(()),
+                first => match run_cargo(true) {
+                    Ok(out) if out.status.success() => Ok(()),
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                        let _ = std::fs::write("/tmp/lily-reload.log", &stderr);
+                        let last = stderr
+                            .lines()
+                            .rev()
+                            .find(|l| !l.trim().is_empty())
+                            .unwrap_or("See /tmp/lily-reload.log")
+                            .to_string();
+                        Err(last)
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to invoke cargo ({:?}): {}", first.err(), e);
+                        let _ = std::fs::write("/tmp/lily-reload.log", &msg);
+                        Err(msg)
+                    }
+                },
+            };
+            let _ = tx.send(res);
         });
 
         let app_quit = app_for_reload.clone();
@@ -405,20 +524,27 @@ fn build_ui(app: &Application) -> Button {
         let btn_status = btn.clone();
 
         glib::timeout_add_local(Duration::from_millis(100), move || {
-            if let Ok(success) = rx.try_recv() {
-                if success {
-                    let _ = std::process::Command::new("sh")
-                        .arg("-c")
-                        .arg("sleep 0.2 && /home/lilypersilly/lily-dashboard/target/release/lily-dashboard &")
-                        .spawn();
-                    app_quit.quit();
-                } else {
-                    lbl_status.set_label("Build\nfailed!");
-                    btn_status.set_sensitive(true);
-                    let lbl_reset = lbl_status.clone();
-                    glib::timeout_add_local_once(Duration::from_millis(2000), move || {
-                        lbl_reset.set_label("Reload\ndashboard");
-                    });
+            if let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok(()) => {
+                        let _ = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg("sleep 0.2 && /home/lilypersilly/lily-dashboard/target/release/lily-dashboard &")
+                            .spawn();
+                        app_quit.quit();
+                    }
+                    Err(err_line) => {
+                        lbl_status.set_label("Build failed!");
+                        btn_status.set_tooltip_text(Some(&format!(
+                            "Build failed (log: /tmp/lily-reload.log): {}",
+                            err_line
+                        )));
+                        btn_status.set_sensitive(true);
+                        let lbl_reset = lbl_status.clone();
+                        glib::timeout_add_local_once(Duration::from_millis(2500), move || {
+                            lbl_reset.set_label("Reload Dashboard");
+                        });
+                    }
                 }
                 return glib::ControlFlow::Break;
             }
@@ -452,18 +578,214 @@ fn build_ui(app: &Application) -> Button {
         });
     });
 
-    // Create the weather tab AND the small sidebar widget button
+    // Two-button Power / Restart row with two-step "Sure?" confirmation
+    let power_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .homogeneous(true)
+        .margin_start(8)
+        .margin_end(8)
+        .margin_top(2)
+        .margin_bottom(14)
+        .build();
+
+    let poweroff_lbl = Label::builder()
+        .label("")
+        .css_classes(vec!["power-btn-lbl".to_string()])
+        .build();
+    let poweroff_btn = Button::builder()
+        .child(&poweroff_lbl)
+        .css_classes(vec!["power-btn".to_string()])
+        .tooltip_text("Power off (click again to confirm)")
+        .build();
+
+    let reboot_lbl = Label::builder()
+        .label("󰜉")
+        .css_classes(vec!["power-btn-lbl".to_string()])
+        .build();
+    let reboot_btn = Button::builder()
+        .child(&reboot_lbl)
+        .css_classes(vec!["power-btn".to_string()])
+        .tooltip_text("Restart (click again to confirm)")
+        .build();
+
+    let armed_power: Rc<Cell<Option<u8>>> = Rc::new(Cell::new(None));
+    let armed_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+
+    {
+        let armed_c = armed_power.clone();
+        let gen_c = armed_gen.clone();
+        let po_btn = poweroff_btn.clone();
+        let po_lbl = poweroff_lbl.clone();
+        let rb_btn = reboot_btn.clone();
+        let rb_lbl = reboot_lbl.clone();
+        poweroff_btn.connect_clicked(move |_| {
+            if armed_c.get() == Some(0) {
+                armed_c.set(None);
+                let _ = std::process::Command::new("systemctl")
+                    .arg("poweroff")
+                    .spawn();
+                return;
+            }
+            armed_c.set(Some(0));
+            let my_gen = gen_c.get().wrapping_add(1);
+            gen_c.set(my_gen);
+
+            po_lbl.set_label("Sure?");
+            po_btn.add_css_class("armed");
+            rb_lbl.set_label("󰜉");
+            rb_btn.remove_css_class("armed");
+
+            let armed_r = armed_c.clone();
+            let gen_r = gen_c.clone();
+            let po_btn_r = po_btn.clone();
+            let po_lbl_r = po_lbl.clone();
+            glib::timeout_add_local_once(Duration::from_secs(3), move || {
+                if gen_r.get() == my_gen && armed_r.get() == Some(0) {
+                    armed_r.set(None);
+                    po_lbl_r.set_label("");
+                    po_btn_r.remove_css_class("armed");
+                }
+            });
+        });
+    }
+
+    {
+        let armed_c = armed_power.clone();
+        let gen_c = armed_gen.clone();
+        let po_btn = poweroff_btn.clone();
+        let po_lbl = poweroff_lbl.clone();
+        let rb_btn = reboot_btn.clone();
+        let rb_lbl = reboot_lbl.clone();
+        reboot_btn.connect_clicked(move |_| {
+            if armed_c.get() == Some(1) {
+                armed_c.set(None);
+                let _ = std::process::Command::new("systemctl")
+                    .arg("reboot")
+                    .spawn();
+                return;
+            }
+            armed_c.set(Some(1));
+            let my_gen = gen_c.get().wrapping_add(1);
+            gen_c.set(my_gen);
+
+            rb_lbl.set_label("Sure?");
+            rb_btn.add_css_class("armed");
+            po_lbl.set_label("");
+            po_btn.remove_css_class("armed");
+
+            let armed_r = armed_c.clone();
+            let gen_r = gen_c.clone();
+            let rb_btn_r = rb_btn.clone();
+            let rb_lbl_r = rb_lbl.clone();
+            glib::timeout_add_local_once(Duration::from_secs(3), move || {
+                if gen_r.get() == my_gen && armed_r.get() == Some(1) {
+                    armed_r.set(None);
+                    rb_lbl_r.set_label("󰜉");
+                    rb_btn_r.remove_css_class("armed");
+                }
+            });
+        });
+    }
+
+    power_row.append(&poweroff_btn);
+    power_row.append(&reboot_btn);
+
+    // Create the weather tab AND the compact sidebar weather button
     let (weather_page, weather_sidebar_btn) = weather::build_weather_ui(&stack);
     
     // Add to stack using `add_named`. 
     // Using `add_named` (no title provided) tells GTK to intentionally HIDE it from the default text sidebar list!
     stack.add_named(&weather_page, Some("weather"));
 
+    let weather_clock_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(4)
+        .build();
+
+    let format_now = || {
+        glib::DateTime::now_local()
+            .ok()
+            .and_then(|dt| dt.format("%H:%M").ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "--:--".to_string())
+    };
+    let format_today_tip = || {
+        let date_str = glib::DateTime::now_local()
+            .ok()
+            .and_then(|dt| dt.format("%a %d %b %Y").ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        format!("{}\nLeft-click: Toggle Nixie Clock | Right-click: Open Calendar", date_str)
+    };
+
+    let clock_lbl = Label::builder()
+        .label(&format_now())
+        .css_classes(vec!["sidebar-clock-lbl".to_string()])
+        .build();
+
+    let clock_btn = Button::builder()
+        .child(&clock_lbl)
+        .halign(gtk4::Align::End)
+        .hexpand(true)
+        .valign(gtk4::Align::Center)
+        .css_classes(vec!["sidebar-footer-btn".to_string()])
+        .tooltip_text(&format_today_tip())
+        .build();
+
+    // Left-click clock: toggle Steins;Gate Nixie divergence-popup!
+    clock_btn.connect_clicked(move |_| {
+        let _ = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "if pgrep -f 'divergence-popup' >/dev/null; then pkill -f 'divergence-popup'; else ~/.local/bin/divergence-popup & fi",
+            ])
+            .spawn();
+    });
+
+    // Right-click clock: jump straight to the Calendar tab
+    {
+        let stack_cal = stack.clone();
+        let rc_cal = GestureClick::builder().button(3).build();
+        rc_cal.connect_pressed(move |_, _, _, _| {
+            stack_cal.set_visible_child_name("calendar");
+        });
+        clock_btn.add_controller(rc_cal);
+    }
+
+    let clock_tick_lbl = clock_lbl.clone();
+    let clock_tick_btn = clock_btn.clone();
+    glib::timeout_add_seconds_local(5, move || {
+        clock_tick_lbl.set_label(&format_now());
+        clock_tick_btn.set_tooltip_text(Some(&format_today_tip()));
+        glib::ControlFlow::Continue
+    });
+
+    weather_clock_row.append(&weather_sidebar_btn);
+    weather_clock_row.append(&clock_btn);
+
+    let footer_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(2)
+        .margin_start(6)
+        .margin_end(6)
+        .margin_bottom(8)
+        .build();
+    footer_box.append(&weather_clock_row);
+    footer_box.append(&reload_btn);
+
+    // Waybar replacements inside sidebar: Tray + Mouse Battery/Notifications
+    let workspaces_widget = tray::build_workspaces_widget();
+    let tray_widget = tray::build_system_tray();
+    let status_strip = tray::build_status_strip();
+
     // Add everything to the sidebar column in order
-    sidebar_column.append(&sidebar);
-    sidebar_column.append(&weather_sidebar_btn); // <-- The cute weather widget goes here!
-    sidebar_column.append(&reload_btn);
+    sidebar_column.append(&sidebar_nav);
+    sidebar_column.append(&tray_widget);
+    sidebar_column.append(&status_strip);
     sidebar_column.append(&session_btn);
+    sidebar_column.append(&power_row);
+    sidebar_column.append(&footer_box);
 
     let is_hovered = Rc::new(Cell::new(false));
     let is_open = Rc::new(Cell::new(false));
@@ -518,10 +840,15 @@ fn build_ui(app: &Application) -> Button {
 
     let music_slot = make_lazy_slot();
     let timers_slot = make_lazy_slot();
+    let calendar_slot = make_lazy_slot();
+    let clipboard_slot = make_lazy_slot();
+    let system_slot = make_lazy_slot();
 
     let run_search_slot: Rc<RefCell<Option<gtk4::SearchEntry>>> = Rc::new(RefCell::new(None));
+    let system_ui_slot: Rc<RefCell<Option<system::SystemUi>>> = Rc::new(RefCell::new(None));
 
     let detail_tab = plans_ui.detail_view.clone();
+    let dash_for_sys = dash_box.clone();
     let guard_lazy = popover_guard.clone();
     let btn_on_launch = trigger_btn.clone();
     let open_on_launch = is_open.clone();
@@ -531,14 +858,33 @@ fn build_ui(app: &Application) -> Button {
     let locker_slot_c = locker_slot.clone();
     let music_slot_c = music_slot.clone();
     let timers_slot_c = timers_slot.clone();
+    let calendar_slot_c = calendar_slot.clone();
+    let clipboard_slot_c = clipboard_slot.clone();
+    let system_slot_c = system_slot.clone();
     let run_search_c = run_search_slot.clone();
+    let system_ui_c = system_ui_slot.clone();
+
+    let nav_buttons_sync = nav_buttons.clone();
 
     stack.connect_visible_child_name_notify(move |stk| {
         let current = stk.visible_child_name();
         let name = current.as_deref();
 
+        for (id, btn) in &nav_buttons_sync {
+            if name == Some(*id) {
+                btn.add_css_class("selected");
+            } else {
+                btn.remove_css_class("selected");
+            }
+        }
+
         if name != Some("plans") {
             detail_tab.set_visible(false);
+        }
+        if name != Some("system") {
+            if let Some(sys) = system_ui_c.borrow().as_ref() {
+                sys.detail_view.set_visible(false);
+            }
         }
 
         // Only keep Favorites row widgets built while Favorites is the active tab
@@ -554,6 +900,16 @@ fn build_ui(app: &Application) -> Button {
         if name != Some("passwords") {
             while let Some(child) = passwords_slot_c.first_child() {
                 passwords_slot_c.remove(&child);
+            }
+        }
+        if name != Some("clipboard") {
+            while let Some(child) = clipboard_slot_c.first_child() {
+                clipboard_slot_c.remove(&child);
+            }
+        }
+        if name != Some("calendar") {
+            while let Some(child) = calendar_slot_c.first_child() {
+                calendar_slot_c.remove(&child);
             }
         }
 
@@ -579,6 +935,16 @@ fn build_ui(app: &Application) -> Button {
                     passwords_slot_c.append(&passwords::build_passwords_ui(guard_lazy.clone()));
                 }
             }
+            Some("clipboard") => {
+                if clipboard_slot_c.first_child().is_none() {
+                    clipboard_slot_c.append(&clipboard::build_clipboard_ui(guard_lazy.clone()));
+                }
+            }
+            Some("calendar") => {
+                if calendar_slot_c.first_child().is_none() {
+                    calendar_slot_c.append(&calendar::build_calendar_ui());
+                }
+            }
             // Stateful tabs (active uploads, unlocked vault, playing music, active timers)
             // are lazy-built on first visit and kept alive once opened.
             Some("drive") => {
@@ -601,6 +967,17 @@ fn build_ui(app: &Application) -> Button {
                     timers_slot_c.append(&timers::build_timers_ui());
                 }
             }
+            Some("system") => {
+                if system_ui_c.borrow().is_none() {
+                    let sys_ui = system::build_system_ui();
+                    system_slot_c.append(&sys_ui.list_view);
+                    dash_for_sys.append(&sys_ui.detail_view);
+                    *system_ui_c.borrow_mut() = Some(sys_ui);
+                }
+                if let Some(sys) = system_ui_c.borrow().as_ref() {
+                    sys.open_panel();
+                }
+            }
             _ => {}
         }
     });
@@ -618,12 +995,34 @@ fn build_ui(app: &Application) -> Button {
         .child(&stack)
         .build();
 
-    dash_box.append(&sidebar_clamp);
-    dash_box.append(&stack_clamp);
+    let main_col = Box::builder()
+        .orientation(Orientation::Vertical)
+        .width_request(398)
+        .vexpand(true)
+        .build();
+
+    let body_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .vexpand(true)
+        .build();
+
+    body_row.append(&sidebar_clamp);
+    body_row.append(&stack_clamp);
+
+    main_col.append(&workspaces_widget);
+    main_col.append(&body_row);
+
+    dash_box.append(&main_col);
     dash_box.append(&plans_ui.detail_view);
 
     stack.add_titled(&music_slot, Some("music"), "Music");
     stack.add_titled(&timers_slot, Some("timers"), "Timers");
+    stack.add_titled(&calendar_slot, Some("calendar"), "Calendar");
+    stack.add_titled(&clipboard_slot, Some("clipboard"), "Clipboard");
+    stack.add_titled(&system_slot, Some("system"), "System");
+
+    // Default to the Run tab on startup
+    stack.set_visible_child_name("run");
 
     let win_motion = EventControllerMotion::new();
     let btn_motion = trigger_btn.clone();
@@ -673,6 +1072,10 @@ fn build_ui(app: &Application) -> Button {
 
     let drawer_clone = drawer_container.clone();
     let detail_clone = plans_ui.detail_view.clone();
+    let system_ui_close = system_ui_slot.clone();
+    let media_for_toggle = media_handle.clone();
+    let run_search_open = run_search_slot.clone();
+    let stack_for_open = stack.clone();
     let window_clone = window.clone();
     let hovered_click = is_hovered.clone();
     let open_click = is_open.clone();
@@ -686,6 +1089,7 @@ fn build_ui(app: &Application) -> Button {
             move_to_monitor(&window_clone, None);
             open_click.set(true);
             closing_click.set(false);
+            media_for_toggle.set_dashboard_open(true);
 
             window_clone.set_keyboard_mode(KeyboardMode::OnDemand);
             // Pass the exact width of the dashboard to the hitbox
@@ -694,12 +1098,22 @@ fn build_ui(app: &Application) -> Button {
 
             btn.add_css_class("riding");
             drawer_clone.add_css_class("open");
+
+            if stack_for_open.visible_child_name().as_deref() == Some("run") {
+                if let Some(entry) = run_search_open.borrow().as_ref() {
+                    entry.grab_focus();
+                }
+            }
         } else {
             open_click.set(false);
             closing_click.set(true);
             hovered_click.set(false);
+            media_for_toggle.set_dashboard_open(false);
 
             detail_clone.set_visible(false);
+            if let Some(sys) = system_ui_close.borrow().as_ref() {
+                sys.detail_view.set_visible(false);
+            }
             window_clone.set_keyboard_mode(KeyboardMode::None);
             drawer_clone.remove_css_class("open");
             btn.remove_css_class("peeking");

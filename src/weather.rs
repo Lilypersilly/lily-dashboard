@@ -153,14 +153,15 @@ pub fn build_weather_ui(main_stack: &Stack) -> (Box, Button) {
     // 1. SIDEBAR WIDGET
     // ==========================================
     let sidebar_lbl = Label::builder()
-        .label("Setup\nWeather")
-        .justify(gtk4::Justification::Center)
-        .css_classes(vec!["session-restore-lbl".to_string()])
+        .label("--°C")
+        .halign(Align::Start)
+        .css_classes(vec!["sidebar-weather-lbl".to_string()])
         .build();
 
     let sidebar_btn = Button::builder()
         .child(&sidebar_lbl)
-        .css_classes(vec!["session-restore-btn".to_string()])
+        .halign(Align::Start)
+        .css_classes(vec!["sidebar-footer-btn".to_string()])
         .tooltip_text("Open Weather Forecast")
         .build();
 
@@ -465,14 +466,9 @@ pub fn build_weather_ui(main_stack: &Stack) -> (Box, Button) {
                     // Default to showing Today (idx 0) on load
                     render_details(&data, 0);
 
-                    // Update Sidebar Widget
-                    let (emoji, desc) = wmo_to_text(data.current.weather_code);
-                    let line2 = if data.current.precipitation > 0.0 {
-                        format!("{:.1}mm Rain", data.current.precipitation)
-                    } else {
-                        desc.to_string()
-                    };
-                    sidebar_lbl.set_label(&format!("{:.0}°C {}\n{}", data.current.temperature_2m, emoji, line2));
+                    // Update Sidebar Widget (compact temp + emoji)
+                    let (emoji, _desc) = wmo_to_text(data.current.weather_code);
+                    sidebar_lbl.set_label(&format!("{:.0}°C {}", data.current.temperature_2m, emoji));
 
                     while let Some(child) = daily_list_box.first_child() {
                         daily_list_box.remove(&child);
