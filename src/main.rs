@@ -20,6 +20,7 @@ mod system;
 mod clipboard;
 mod calendar;
 mod media_popout;
+mod stickies;
 mod tray;
 
 use gtk4::cairo::{RectangleInt, Region};
@@ -87,12 +88,13 @@ fn main() {
         session::init_session_tracker();
         clipboard::init_clipboard_watcher();
         let media_handle = media_popout::init_media_popout(app);
+        let stickies_handle = stickies::init_stickies(app);
 
         let reload_theme = reload_theme_act
             .borrow()
             .clone()
             .unwrap_or_else(|| Rc::new(|| {}));
-        let btn = build_ui(app, media_handle, reload_theme);
+        let btn = build_ui(app, media_handle, stickies_handle, reload_theme);
         *existing_trigger.borrow_mut() = Some(btn);
     });
 
@@ -325,6 +327,30 @@ fn init_theme() -> Rc<dyn Fn()> {
                 
                 progressbar.drive-progress > trough {{ background-color: {fg_main_08}; border: none; border-radius: {r_bar}px; min-height: 10px; }}
                 progressbar.drive-progress > trough > progress {{ background-color: #{accent2}; border-radius: {r_bar}px; min-height: 10px; }}
+
+                .sticky-card {{ background-color: {bg_main_glass}; border: 1px solid {accent1_55}; border-radius: {r_lg}px; }}
+                .sticky-tint-0 {{ border-color: rgba(233, 117, 202, 0.55); }}
+                .sticky-tint-1 {{ background-color: rgba(42, 36, 22, 0.72); border-color: rgba(249, 226, 175, 0.55); }}
+                .sticky-tint-2 {{ background-color: rgba(22, 30, 44, 0.72); border-color: rgba(137, 180, 250, 0.55); }}
+                .sticky-tint-3 {{ background-color: rgba(22, 38, 28, 0.72); border-color: rgba(166, 227, 161, 0.55); }}
+                .sticky-tint-4 {{ background-color: rgba(34, 24, 44, 0.72); border-color: rgba(203, 166, 247, 0.55); }}
+                .sticky-header {{ background-color: {bg_recessed_glass}; border-bottom: 1px solid {accent1_35}; border-top-left-radius: {r_lg}px; border-top-right-radius: {r_lg}px; padding: 4px 6px; }}
+                .sticky-mini-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_xxs}px; padding: 2px 7px; min-width: 22px; min-height: 22px; color: #{fg_main}; box-shadow: none; transition: background-color 0.15s ease; }}
+                .sticky-mini-btn label {{ font-family: 'MesloLGL Nerd Font', 'Josefin Sans', sans-serif; font-size: 11px; font-weight: bold; color: #{fg_main}; }}
+                .sticky-mini-btn:hover {{ background-color: {fg_main_15}; }}
+                .sticky-mini-btn.active {{ background-color: {accent1_24}; }}
+                .sticky-mini-btn.active label {{ color: #{accent2}; }}
+                .sticky-dot-0 label {{ color: #e975ca; }}
+                .sticky-dot-1 label {{ color: #f9e2af; }}
+                .sticky-dot-2 label {{ color: #89b4fa; }}
+                .sticky-dot-3 label {{ color: #a6e3a1; }}
+                .sticky-dot-4 label {{ color: #cba6f7; }}
+                .sticky-ink-0 label {{ color: #fee4ff; }}
+                .sticky-ink-1 label {{ color: #e975ca; }}
+                .sticky-ink-2 label {{ color: #89b4fa; }}
+                .sticky-ink-3 label {{ color: #a6e3a1; }}
+                .sticky-ink-4 label {{ color: #fab387; }}
+                textview.sticky-text, textview.sticky-text text {{ background-color: transparent; color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 14px; }}
                 "#
             );
             
@@ -414,6 +440,7 @@ fn move_to_monitor(window: &ApplicationWindow, target: Option<&str>) {
 fn build_ui(
     app: &Application,
     media_handle: media_popout::MediaPopoutHandle,
+    stickies_handle: stickies::StickiesHandle,
     reload_theme: Rc<dyn Fn()>,
 ) -> Button {
     let window = ApplicationWindow::builder()
@@ -1087,6 +1114,16 @@ fn build_ui(
             .valign(gtk4::Align::Center)
             .build();
 
+        let sticky_btn = Button::builder()
+            .label("󰠮")
+            .css_classes(vec!["top-tool-btn".to_string()])
+            .tooltip_text("New Sticky Note (only visible while dashboard is open)")
+            .build();
+        let stickies_new = stickies_handle.clone();
+        sticky_btn.connect_clicked(move |_| {
+            stickies_new.new_sticky();
+        });
+
         let cap_btn = Button::builder()
             .label("󰄀")
             .css_classes(vec!["top-tool-btn".to_string()])
@@ -1113,6 +1150,7 @@ fn build_ui(
             system::launch_color_picker(&close_pick);
         });
 
+        top_tools.append(&sticky_btn);
         top_tools.append(&cap_btn);
         top_tools.append(&picker_btn);
         workspaces_widget.append(&top_tools);
@@ -1347,6 +1385,7 @@ fn build_ui(
     let detail_clone = plans_ui.detail_view.clone();
     let system_ui_close = system_ui_slot.clone();
     let media_for_toggle = media_handle.clone();
+    let stickies_for_toggle = stickies_handle.clone();
     let run_search_open = run_search_slot.clone();
     let stack_for_open = stack.clone();
     let window_clone = window.clone();
@@ -1363,6 +1402,7 @@ fn build_ui(
             open_click.set(true);
             closing_click.set(false);
             media_for_toggle.set_dashboard_open(true);
+            stickies_for_toggle.set_dashboard_open(true);
 
             window_clone.set_keyboard_mode(KeyboardMode::OnDemand);
             // Pass the exact width of the dashboard to the hitbox
@@ -1382,6 +1422,7 @@ fn build_ui(
             closing_click.set(true);
             hovered_click.set(false);
             media_for_toggle.set_dashboard_open(false);
+            stickies_for_toggle.set_dashboard_open(false);
 
             detail_clone.set_visible(false);
             if let Some(sys) = system_ui_close.borrow().as_ref() {
