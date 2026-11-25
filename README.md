@@ -2,7 +2,7 @@
 
 A slide-out Wayland sidebar for Hyprland written in Rust with GTK4 and `gtk4-layer-shell`.
 
-It sits on the left edge of the active monitor, replaces Waybar (workspaces, system tray, notifications, battery, clock, weather, media), and bundles an app launcher, clipboard manager, system settings panel, music player, notes/plans editor, calendar, timers, cloud uploader, password list, and encrypted file locker into a single process.
+It sits on the left edge of the active monitor, replaces Waybar (workspaces, system tray, notifications, battery, clock, weather, media), and bundles an app launcher, clipboard manager, system settings panel, music player, floating sticky notes, notes/plans editor, calendar, timers, cloud uploader, password list, and encrypted file locker into a single process.
 
 ## How it works
 
@@ -12,14 +12,14 @@ It sits on the left edge of the active monitor, replaces Waybar (workspaces, sys
 - **Live theming**: `init_theme()` watches `~/.config/theme-switch/current.conf` via `gio::FileMonitor` and reloads the GTK CSS whenever the theme changes.
 - **Hyprland blur**: On startup, `main()` adds `ext_background_effect_manager_v1` to `GDK_WAYLAND_DISABLE`. GTK 4.24 otherwise sends an empty Wayland blur region that overrides Hyprland's `layer_rule` blur, and using GTK CSS `backdrop-filter` causes frame drops during the slide animation. Disabling that protocol lets Hyprland's GPU Dual-Kawase blur handle the surfaces directly.
 
-- **Low SSD wear**: Normal clipboard history and wallpaper thumbnails live only in RAM; music thumbnails/logs (`/tmp`) and decrypted locker previews (`/dev/shm`) use `tmpfs`; session auto-save defaults to off (and ignores window-title changes when enabled); and `Favorites` batches watcher score writes to at most once every 60 seconds.
+- **Low SSD wear**: Normal clipboard history and wallpaper thumbnails live only in RAM; music thumbnails/logs (`/tmp`) and decrypted locker previews (`/dev/shm`) use `tmpfs`; session auto-save defaults to off (and ignores window-title changes when enabled); sticky note edits/drags/strokes debounce writes to 900ms; and `Favorites` batches watcher score writes to at most once every 60 seconds.
 
 ## Code layout (`src/`)
 
 | File | What it does |
 | --- | --- |
 | `config.rs` | Centralized `~/.config/lily-dashboard/config.json` loader/saver with first-run tool auto-detection, built-in fallback color presets, and Hyprland (Hyprlua + classic) IPC helpers. |
-| `main.rs` | Window setup, layer-shell config, slide animation, dynamic input region, live CSS theming (with mathematically scaled corner rounding & opacity), sidebar navigation, footer (session load/save/auto-save, power/restart, weather, configurable clock click, self-rebuild/restart button), and top-bar quick capture/color-picker buttons. |
+| `main.rs` | Window setup, layer-shell config, slide animation, dynamic input region, live CSS theming (with mathematically scaled corner rounding & opacity), sidebar navigation, footer (session load/save/auto-save, power/restart, weather, configurable clock click, self-rebuild/restart button), and top-bar quick sticky-note, capture, and color-picker buttons. |
 | `tray.rs` | Top workspace bar (Hyprland socket listener, click to switch, scroll to cycle, hover popover with a proportional window layout mini-map + focus/close actions), D-Bus `StatusNotifierWatcher` system tray, mouse battery reader (`/sys/class/power_supply`), and SwayNC notification badge + right-click DND toggle. |
 | `launcher.rs` | `Run` tab (default). Scans `.desktop` entries via `gio::AppInfo`, supports fuzzy filtering, pinning, and optional background binary preloading (`cat <bin> > /dev/null`) to warm page cache. |
 | `favorites.rs` | `Favorites` tab. Tracks frequently accessed files/folders via `notify` filesystem watcher, scores usage in RAM (flushing `ignore.json` at most once every 60s), lets you pin or ignore paths, and opens items with `xdg-open`. |
@@ -27,7 +27,8 @@ It sits on the left edge of the active monitor, replaces Waybar (workspaces, sys
 | `plans.rs` | `Plans` tab. Plain-text/markdown checklist and notes editor backed by `~/Documents/plans` (or `~/documents/plans`), with a 400px slide-out detail pane, checkboxes, drag-and-drop line reordering, and inline editing. |
 | `calendar.rs` | `Calendar` tab. Monthly GTK calendar with per-day notes saved in `calendar_events.json`. |
 | `timers.rs` | `Timers` tab. Countdown timers (`15m`, `2h`, `45s`) and process watchers that alert via `notify-send` + `paplay` when a PID exits or stays idle at 0% CPU. |
-| `music.rs` | `Music` tab. YouTube Music client backed by `yt-dlp` and a local `mpv` IPC socket (`/tmp/lily-ymusic-mpv.sock`), with playlists, search, queue management, seek/volume controls, MPRIS integration via `souvlaki`, and a bounded in-memory thumbnail cache. |
+| `music.rs` | `Music` tab. YouTube Music client backed by `yt-dlp` and a local `mpv` IPC socket (`/tmp/lily-ymusic-mpv.sock`), with playlists, intermixed song/album search (playlists at the bottom), pastel kind-accent tabs, right-click playlist/album queue actions (play next, append, even-spread stratified shuffle), direction-aware incremental scroll infill, seek/volume controls, MPRIS integration via `souvlaki`, and a bounded in-memory thumbnail cache. |
+| `stickies.rs` | Floating sticky notes (`lily-sticky` layer-shell windows) that appear only while the dashboard is open. Each note supports typing and freehand Cairo drawing on the same card (5 ink colors, S/M/L width, undo/clear), 5 pastel tints, header dragging and invisible 4-corner resizing via Hyprland's global cursor IPC, and debounced persistence in `stickies.json`. |
 | `media_popout.rs` | Independent bottom-right layer-shell window (`lily-media-popout`) for MPRIS `playerctl` playback. Collapses to a tiny edge sliver when idle, expands to a compact pill when the dashboard is open or the sliver is hovered, and clicks open to a card with cover art and transport controls. |
 | `drive.rs` | `Drive` tab. GUI wrapper around `rclone copy` with remote path, optional bandwidth limit, native file/folder chooser, live progress parsing, and cancel support. |
 | `passwords.rs` | `Passwords` tab. Simple local credential list stored in `passwords.txt` (`0600` permissions) with search, click-to-copy, and inline add/delete. |
@@ -42,6 +43,7 @@ It sits on the left edge of the active monitor, replaces Waybar (workspaces, sys
   - `config.json` — main user settings (Hyprland appearance, screenshot/color-picker/wallpaper/notification backends, visible tabs, paths, built-in theme preset)
   - `clipboard_pins.json` — pinned clipboard entries only (normal history stays in RAM)
   - `calendar_events.json` — per-day calendar notes
+  - `stickies.json` — floating sticky notes (position, size, tint, text, and drawing strokes)
   - `passwords.txt` — owner-only (`0600`) password entries
   - `ignore.json` / `launcher.json` / `weather.json` / `current_session.json` / `previous_session.json` / `session_prefs.json` — module preferences and snapshots
 - `~/.config/theme-switch/current.conf` — active color palette (watched live)
@@ -72,6 +74,7 @@ In `~/.config/hypr/rules.lua` (frosted glass blur):
 ```lua
 hl.layer_rule({ name = "lily-dashboard-blur", match = { namespace = "^lily-dashboard$" }, blur = true, blur_popups = true, ignore_alpha = 0.25 })
 hl.layer_rule({ name = "lily-media-popout-blur", match = { namespace = "^lily-media-popout$" }, blur = true, ignore_alpha = 0.25 })
+hl.layer_rule({ name = "lily-sticky-blur", match = { namespace = "^lily-sticky$" }, blur = true, ignore_alpha = 0.25 })
 ```
 
 ## Runtime tools used
