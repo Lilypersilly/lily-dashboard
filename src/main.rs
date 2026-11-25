@@ -102,15 +102,26 @@ fn main() {
 }
 
 fn init_theme() -> Rc<dyn Fn()> {
+    let display = gdk::Display::default().expect("Could not connect to a display.");
     let provider = CssProvider::new();
     gtk4::style_context_add_provider_for_display(
-        &gdk::Display::default().expect("Could not connect to a display."),
+        &display,
         &provider,
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
+    // Separate provider above STYLE_PROVIDER_PRIORITY_USER so our hairline scrollbars
+    // beat ~/.config/gtk-4.0/gtk.css without interfering with dynamic_offset_provider
+    let scrollbar_provider = CssProvider::new();
+    gtk4::style_context_add_provider_for_display(
+        &display,
+        &scrollbar_provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_USER + 1,
+    );
+
     let update_css: Rc<dyn Fn()> = {
         let provider = provider.clone();
+        let scrollbar_provider = scrollbar_provider.clone();
         Rc::new(move || {
             let cfg = config::get();
             let map = config::resolve_theme_colors(&cfg);
@@ -158,6 +169,8 @@ fn init_theme() -> Rc<dyn Fn()> {
             let accent1_35 = hex_to_rgba(accent1, 0.35);
             let accent1_38 = hex_to_rgba(accent1, 0.38);
             let accent1_55 = hex_to_rgba(accent1, 0.55);
+            let accent2_28 = hex_to_rgba(accent2, 0.28);
+            let accent2_70 = hex_to_rgba(accent2, 0.70);
             let fg_main_06 = hex_to_rgba(fg_main, 0.06);
             let fg_main_08 = hex_to_rgba(fg_main, 0.08);
             let fg_main_15 = hex_to_rgba(fg_main, 0.15);
@@ -355,6 +368,36 @@ fn init_theme() -> Rc<dyn Fn()> {
             );
             
             provider.load_from_data(&css);
+
+            let scrollbar_css = format!(
+                r#"
+                scrolledwindow > scrollbar, scrolledwindow > scrollbar > range, scrolledwindow > scrollbar > range > trough,
+                scrollbar, scrollbar > range, scrollbar > range > trough {{ background-color: transparent; border: none; margin: 0px; padding: 0px; min-width: 0px; min-height: 0px; box-shadow: none; }}
+                scrolledwindow > scrollbar.vertical > range > trough > slider,
+                scrollbar.vertical.overlay-indicator:not(.dragging):not(.hovering) > range > trough > slider,
+                scrollbar.vertical > range > trough > slider {{ min-width: 2px; min-height: 24px; margin: 2px 0px; padding: 0px; border: none; border-radius: 99px; background-color: {accent2_28}; box-shadow: none; transition: background-color 0.15s ease, min-width 0.15s ease; }}
+                scrolledwindow > scrollbar.vertical.hovering > range > trough > slider,
+                scrolledwindow > scrollbar.vertical:hover > range > trough > slider,
+                scrolledwindow > scrollbar.vertical > range > trough > slider:hover,
+                scrolledwindow > scrollbar.vertical > range > trough > slider:active,
+                scrollbar.vertical.hovering > range > trough > slider,
+                scrollbar.vertical:hover > range > trough > slider,
+                scrollbar.vertical > range > trough > slider:hover,
+                scrollbar.vertical > range > trough > slider:active {{ min-width: 4px; background-color: {accent2_70}; }}
+                scrolledwindow > scrollbar.horizontal > range > trough > slider,
+                scrollbar.horizontal.overlay-indicator:not(.dragging):not(.hovering) > range > trough > slider,
+                scrollbar.horizontal > range > trough > slider {{ min-height: 2px; min-width: 24px; margin: 0px 2px; padding: 0px; border: none; border-radius: 99px; background-color: {accent2_28}; box-shadow: none; transition: background-color 0.15s ease, min-height 0.15s ease; }}
+                scrolledwindow > scrollbar.horizontal.hovering > range > trough > slider,
+                scrolledwindow > scrollbar.horizontal:hover > range > trough > slider,
+                scrolledwindow > scrollbar.horizontal > range > trough > slider:hover,
+                scrolledwindow > scrollbar.horizontal > range > trough > slider:active,
+                scrollbar.horizontal.hovering > range > trough > slider,
+                scrollbar.horizontal:hover > range > trough > slider,
+                scrollbar.horizontal > range > trough > slider:hover,
+                scrollbar.horizontal > range > trough > slider:active {{ min-height: 4px; background-color: {accent2_70}; }}
+                "#
+            );
+            scrollbar_provider.load_from_data(&scrollbar_css);
         })
     };
 
