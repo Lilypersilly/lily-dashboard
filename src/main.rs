@@ -198,6 +198,9 @@ fn init_theme() -> Rc<dyn Fn()> {
                 .fav-item-btn.pinned, .music-item-album.pinned, .music-item-playlist.pinned {{ background-color: #{selection}; border: none; }}
                 
                 .music-art-frame {{ background-color: transparent; border: none; border-radius: {r_xs}px; min-width: 36px; min-height: 36px; box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.15); }}
+                .music-kind-tab-song {{ background-color: #89b4fa; border-radius: 99px; min-width: 3px; min-height: 28px; }}
+                .music-kind-tab-playlist {{ background-color: #fab387; border-radius: 99px; min-width: 3px; min-height: 28px; }}
+                .music-kind-tab-album {{ background-color: #a6e3a1; border-radius: 99px; min-width: 3px; min-height: 28px; }}
                 
                 .fav-search {{ background-color: {bg_contrast_65}; border: 1px solid transparent; border-radius: {r_md}px; color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; padding: 7px 12px; transition: background-color 0.16s ease, border-color 0.16s ease; }}
                 .fav-search:focus {{ background-color: {bg_contrast_88}; border-color: {accent1_55}; }}
