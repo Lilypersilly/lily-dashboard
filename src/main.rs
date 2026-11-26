@@ -17,6 +17,7 @@ mod locker;
 mod weather;
 mod timers;
 mod system;
+mod themes;
 mod clipboard;
 mod calendar;
 mod media_popout;
@@ -361,6 +362,8 @@ fn init_theme() -> Rc<dyn Fn()> {
                 .trigger-btn.peeking, .trigger-btn.riding {{ background-color: #{selection}; transform: translateX(0px); }}
                 
                 popover.fav-popover > contents {{ background-color: {bg_main_glass}; border: 1px solid {accent1_35}; border-radius: {r_lg}px; padding: 6px; }}
+                tooltip, tooltip.background {{ background-color: #{bg_pill}; color: #{fg_main}; border: 1px solid {accent1_35}; border-radius: {r_sm}px; padding: 4px 8px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25); }}
+                tooltip label {{ color: #{fg_main}; font-size: {fs_13}px; }}
                 .fav-hide-btn {{ background-color: {fg_main_08}; border: none; border-radius: {r_sm}px; padding: 6px 12px; color: #{fg_main}; box-shadow: none; transition: background-color 0.15s ease; }}
                 .fav-hide-btn:hover {{ background-color: {fg_main_15}; }}
                 

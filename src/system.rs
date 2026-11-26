@@ -273,15 +273,6 @@ struct OverviewSnapshot {
 }
 
 #[derive(Clone, Debug)]
-struct ThemeEntry {
-    key: String,
-    name: String,
-    mode: String,
-    swatches: [(f64, f64, f64); 4],
-    is_active: bool,
-}
-
-#[derive(Clone, Debug)]
 struct WallpaperEntry {
     path: String,
     name: String,
@@ -307,7 +298,7 @@ enum SystemMsg {
     Keybinds(Vec<KeybindEntry>),
     Overview(OverviewSnapshot),
     ColorPicked,
-    Themes(Vec<ThemeEntry>),
+    Themes(Vec<crate::themes::ThemeDefinition>),
     ThemeApplied(String),
     Wallpapers(Vec<WallpaperEntry>),
     WallpaperThumb {
@@ -765,84 +756,6 @@ fn parse_hex_rgb(hex: &str) -> (f64, f64, f64) {
         }
     }
     (0.5, 0.5, 0.5)
-}
-
-fn parse_theme_conf(path: &std::path::Path) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
-    if let Ok(content) = fs::read_to_string(path) {
-        for line in content.lines() {
-            let clean = line.split('#').next().unwrap_or("").trim();
-            if let Some((k, v)) = clean.split_once('=') {
-                map.insert(k.trim().to_string(), v.trim().to_string());
-            }
-        }
-    }
-    map
-}
-
-fn fetch_themes_snapshot() -> Vec<ThemeEntry> {
-    let cfg = crate::config::get();
-    let theme_conf_path = crate::config::expand_path(&cfg.paths.theme_conf_file);
-    let base = theme_conf_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| glib::user_config_dir().join("theme-switch"));
-    let cur_map = parse_theme_conf(&theme_conf_path);
-    let cur_name = cur_map.get("name").cloned().unwrap_or_default();
-
-    let pal_dir = base.join("palettes");
-    let Ok(entries) = fs::read_dir(&pal_dir) else {
-        return Vec::new();
-    };
-
-    let mut themes = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("conf") {
-            continue;
-        }
-        let Some(key) = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()) else {
-            continue;
-        };
-        let conf = parse_theme_conf(&path);
-        let name = conf.get("name").cloned().unwrap_or_else(|| key.clone());
-        let mode = conf
-            .get("mode")
-            .cloned()
-            .unwrap_or_else(|| "dark".to_string());
-        let bg_main = conf.get("bg_main").map(|s| s.as_str()).unwrap_or("1c161e");
-        let accent = conf
-            .get("accent")
-            .or_else(|| conf.get("accent1"))
-            .map(|s| s.as_str())
-            .unwrap_or("e975ca");
-        let selection = conf
-            .get("selection")
-            .map(|s| s.as_str())
-            .unwrap_or("bf40a1");
-        let magenta = conf
-            .get("magenta")
-            .or_else(|| conf.get("accent2"))
-            .map(|s| s.as_str())
-            .unwrap_or("ffc2ff");
-
-        let is_active = cfg.theme_preset == "auto" && !cur_name.is_empty() && name == cur_name;
-        themes.push(ThemeEntry {
-            key,
-            name,
-            mode,
-            swatches: [
-                parse_hex_rgb(bg_main),
-                parse_hex_rgb(accent),
-                parse_hex_rgb(selection),
-                parse_hex_rgb(magenta),
-            ],
-            is_active,
-        });
-    }
-
-    themes.sort_by(|a, b| a.key.to_lowercase().cmp(&b.key.to_lowercase()));
-    themes
 }
 
 const WALL_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
@@ -2179,7 +2092,7 @@ pub fn build_system_ui(
                 }
                 "themes" => {
                     std::thread::spawn(move || {
-                        let _ = tx_bg.send(SystemMsg::Themes(fetch_themes_snapshot()));
+                        let _ = tx_bg.send(SystemMsg::Themes(crate::themes::list_all_themes()));
                     });
                 }
                 "wallpapers" => {
@@ -2439,6 +2352,7 @@ pub fn build_system_ui(
                 SystemMsg::ThemeApplied(status) => {
                     theme_status_r.set_label(&status);
                     theme_status_r.set_visible(true);
+                    reload_theme_ui();
                     refresh_for_ui("themes", false);
                 }
                 SystemMsg::Wallpapers(walls) => {
@@ -3248,41 +3162,370 @@ fn render_network_page(
 fn render_themes_page(
     container: &Box,
     status_lbl: &Label,
-    themes: &[ThemeEntry],
+    themes: &[crate::themes::ThemeDefinition],
     tx: &mpsc::Sender<SystemMsg>,
     reload_theme: &Rc<dyn Fn()>,
 ) {
     clear_box(container);
     let cur_cfg = crate::config::get();
 
-    // 1. External theme-switch palettes (if present)
-    if !themes.is_empty() {
-        let hdr = Label::builder()
-            .label("EXTERNAL PALETTES")
-            .halign(Align::Start)
-            .css_classes(vec!["fav-group-header".to_string()])
-            .build();
-        container.append(&hdr);
-    }
+    // Detect currently active global theme name from current.conf
+    let cur_global_name = {
+        let conf_path = crate::config::expand_path(&cur_cfg.paths.theme_conf_file);
+        fs::read_to_string(&conf_path)
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|l| {
+                    let clean = l.split('#').next().unwrap_or("").trim();
+                    let (k, v) = clean.split_once('=')?;
+                    if k.trim() == "name" {
+                        Some(v.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or_default()
+    };
 
-    for theme in themes {
-        let mut classes = vec!["fav-item-btn".to_string()];
-        if theme.is_active {
-            classes.push("pinned".to_string());
+    // ==========================================
+    // 1. COLLAPSIBLE 6-COLOR THEME EDITOR
+    // ==========================================
+    let editor_top_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+
+    let editor_toggle_btn = Button::builder()
+        .label("+ 6-Color Theme Editor")
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .hexpand(true)
+        .build();
+    let open_dir_btn = Button::builder()
+        .label("Themes Dir")
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .tooltip_text("Open ~/.config/lily-dashboard/themes/ to fine-tune .json files")
+        .build();
+    open_dir_btn.connect_clicked(|_| {
+        let dir = crate::themes::user_themes_dir();
+        let _ = Command::new("xdg-open").arg(&dir).spawn();
+    });
+    editor_top_row.append(&editor_toggle_btn);
+    editor_top_row.append(&open_dir_btn);
+    container.append(&editor_top_row);
+
+    let editor_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .visible(false)
+        .css_classes(vec!["sys-card".to_string()])
+        .build();
+
+    let ed_hint = Label::builder()
+        .label("Edit 6 core colors — surfaces, muted text, 16-color terminal, Dolphin & Papirus folders are derived automatically. Save to .json to fine-tune everything.")
+        .halign(Align::Start)
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .build();
+    editor_card.append(&ed_hint);
+
+    // Name + Mode row
+    let meta_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let name_entry = Entry::builder()
+        .placeholder_text("Theme name (e.g. Sunset Amber)")
+        .text("Custom Theme")
+        .hexpand(true)
+        .build();
+    let mode_state = Rc::new(RefCell::new("dark".to_string()));
+    let mode_btn = Button::builder()
+        .label("Mode: Dark")
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .build();
+    {
+        let ms = mode_state.clone();
+        mode_btn.connect_clicked(move |b| {
+            let mut m = ms.borrow_mut();
+            if *m == "dark" {
+                *m = "light".to_string();
+                b.set_label("Mode: Light");
+            } else {
+                *m = "dark".to_string();
+                b.set_label("Mode: Dark");
+            }
+        });
+    }
+    meta_row.append(&name_entry);
+    meta_row.append(&mode_btn);
+    editor_card.append(&meta_row);
+
+    // Folder color selector
+    let folder_hdr = Label::builder()
+        .label("Papirus Folder Color")
+        .halign(Align::Start)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .build();
+    editor_card.append(&folder_hdr);
+
+    let folder_choices = [
+        "auto",
+        "pink",
+        "orange",
+        "paleorange",
+        "yellow",
+        "green",
+        "cyan",
+        "blue",
+        "violet",
+        "red",
+        "grey",
+    ];
+    let folder_state = Rc::new(RefCell::new("auto".to_string()));
+    let folder_flow = gtk4::FlowBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .column_spacing(4)
+        .row_spacing(4)
+        .max_children_per_line(6)
+        .homogeneous(false)
+        .build();
+    let folder_btns: Rc<RefCell<Vec<(String, Button)>>> = Rc::new(RefCell::new(Vec::new()));
+    for fc in folder_choices {
+        let mut cls = vec!["fav-item-btn".to_string()];
+        if fc == "auto" {
+            cls.push("pinned".to_string());
         }
-        let btn = Button::builder()
-            .css_classes(classes)
+        let b = Button::builder().label(fc).css_classes(cls).build();
+        folder_btns.borrow_mut().push((fc.to_string(), b.clone()));
+        folder_flow.insert(&b, -1);
+    }
+    for (fc_name, b) in folder_btns.borrow().iter() {
+        let fstate = folder_state.clone();
+        let all_btns = folder_btns.clone();
+        let fc_c = fc_name.clone();
+        b.connect_clicked(move |_| {
+            *fstate.borrow_mut() = fc_c.clone();
+            for (name, btn) in all_btns.borrow().iter() {
+                if name == &fc_c {
+                    btn.add_css_class("pinned");
+                } else {
+                    btn.remove_css_class("pinned");
+                }
+            }
+        });
+    }
+    editor_card.append(&folder_flow);
+
+    // 6 core color inputs with live-painted preview swatches
+    let default_def = crate::themes::ThemeDefinition::default();
+    let make_color_row = |label: &str, init_hex: &str| -> (Box, Entry, DrawingArea) {
+        let row = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(8)
+            .build();
+        let lbl = Label::builder()
+            .label(label)
+            .halign(Align::Start)
+            .width_chars(11)
+            .css_classes(vec!["plan-body".to_string()])
+            .build();
+        let swatch = DrawingArea::builder()
+            .content_width(24)
+            .content_height(24)
+            .valign(Align::Center)
+            .build();
+        let entry = Entry::builder()
+            .text(&format!("#{}", init_hex))
             .hexpand(true)
             .build();
 
-        let row = Box::builder()
-            .orientation(Orientation::Horizontal)
-            .spacing(10)
-            .margin_top(4)
-            .margin_bottom(4)
+        let e_for_draw = entry.clone();
+        swatch.set_draw_func(move |_, cr, w, h| {
+            let (r, g, b) = parse_hex_rgb(e_for_draw.text().as_str());
+            cr.set_source_rgb(r, g, b);
+            cr.arc(w as f64 / 2.0, h as f64 / 2.0, 9.5, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill_preserve();
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
+            cr.set_line_width(1.2);
+            let _ = cr.stroke();
+        });
+        let sw_c = swatch.clone();
+        entry.connect_changed(move |_| {
+            sw_c.queue_draw();
+        });
+
+        row.append(&lbl);
+        row.append(&swatch);
+        row.append(&entry);
+        (row, entry, swatch)
+    };
+
+    let (r_bg, e_bg, _) = make_color_row("Background", &default_def.bg_main);
+    let (r_pill, e_pill, _) = make_color_row("Surface", &default_def.bg_pill);
+    let (r_fg, e_fg, _) = make_color_row("Text", &default_def.fg_main);
+    let (r_acc, e_acc, _) = make_color_row("Accent", &default_def.accent);
+    let (r_sel, e_sel, _) = make_color_row("Selection", &default_def.selection);
+    let (r_mag, e_mag, _) = make_color_row("Secondary", &default_def.magenta);
+
+    editor_card.append(&r_bg);
+    editor_card.append(&r_pill);
+    editor_card.append(&r_fg);
+    editor_card.append(&r_acc);
+    editor_card.append(&r_sel);
+    editor_card.append(&r_mag);
+
+    let build_editor_def: Rc<dyn Fn() -> crate::themes::ThemeDefinition> = {
+        let name_e = name_entry.clone();
+        let ms = mode_state.clone();
+        let fs = folder_state.clone();
+        let bg = e_bg.clone();
+        let pill = e_pill.clone();
+        let fg = e_fg.clone();
+        let acc = e_acc.clone();
+        let sel = e_sel.clone();
+        let mag = e_mag.clone();
+        Rc::new(move || {
+            let raw_name = name_e.text().trim().to_string();
+            let display_name = if raw_name.is_empty() {
+                "Custom Theme".to_string()
+            } else {
+                raw_name
+            };
+            let key = crate::themes::sanitize_key(&display_name);
+            crate::themes::ThemeDefinition::from_six_colors(
+                &key,
+                &display_name,
+                &ms.borrow(),
+                &fs.borrow(),
+                bg.text().as_str(),
+                pill.text().as_str(),
+                fg.text().as_str(),
+                acc.text().as_str(),
+                sel.text().as_str(),
+                mag.text().as_str(),
+            )
+        })
+    };
+
+    let ed_actions = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .margin_top(4)
+        .build();
+    let save_btn = Button::builder()
+        .label("Save .json")
+        .css_classes(vec!["fav-item-btn".to_string(), "pinned".to_string()])
+        .hexpand(true)
+        .build();
+    let save_open_btn = Button::builder()
+        .label("Save & Fine-Tune .json")
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .hexpand(true)
+        .build();
+
+    {
+        let build_fn = build_editor_def.clone();
+        let tx_c = tx.clone();
+        save_btn.connect_clicked(move |_| {
+            let def = build_fn();
+            match crate::themes::save_user_theme(&def) {
+                Ok(_) => {
+                    let _ = tx_c.send(SystemMsg::ThemeApplied(format!(
+                        "Saved {} (.json)",
+                        def.name
+                    )));
+                }
+                Err(e) => {
+                    let _ = tx_c.send(SystemMsg::ThemeApplied(e));
+                }
+            }
+        });
+    }
+    {
+        let build_fn = build_editor_def.clone();
+        let tx_c = tx.clone();
+        save_open_btn.connect_clicked(move |_| {
+            let def = build_fn();
+            match crate::themes::save_user_theme(&def) {
+                Ok(path) => {
+                    let _ = Command::new("xdg-open").arg(&path).spawn();
+                    let _ = tx_c.send(SystemMsg::ThemeApplied(format!(
+                        "Saved & opened {}.json",
+                        def.key
+                    )));
+                }
+                Err(e) => {
+                    let _ = tx_c.send(SystemMsg::ThemeApplied(e));
+                }
+            }
+        });
+    }
+
+    ed_actions.append(&save_btn);
+    ed_actions.append(&save_open_btn);
+    editor_card.append(&ed_actions);
+    container.append(&editor_card);
+
+    {
+        let ec = editor_card.clone();
+        editor_toggle_btn.connect_clicked(move |b| {
+            let next = !ec.is_visible();
+            ec.set_visible(next);
+            b.set_label(if next {
+                "− Hide Theme Editor"
+            } else {
+                "+ 6-Color Theme Editor"
+            });
+        });
+    }
+
+    // ==========================================
+    // 2. UNIFIED THEME LIST (Global + Dash per theme)
+    // ==========================================
+    let hdr = Label::builder()
+        .label("THEMES (GLOBAL OR DASHBOARD ONLY)")
+        .halign(Align::Start)
+        .css_classes(vec!["fav-group-header".to_string()])
+        .margin_top(6)
+        .build();
+    container.append(&hdr);
+
+    for theme in themes {
+        let is_global_active = cur_cfg.theme_preset == "auto"
+            && !cur_global_name.is_empty()
+            && theme.name.eq_ignore_ascii_case(&cur_global_name);
+        let is_dash_active = if cur_cfg.theme_preset == "custom" {
+            cur_cfg.custom_palette.as_ref().map_or(false, |p| {
+                p.get("bg_main").map(|s| s.as_str()) == Some(theme.bg_main.as_str())
+                    && p.get("accent").map(|s| s.as_str()) == Some(theme.accent.as_str())
+            })
+        } else {
+            cur_cfg.theme_preset == theme.key
+        };
+
+        let mut card_cls = vec!["sys-card".to_string()];
+        if is_global_active || is_dash_active {
+            card_cls.push("pinned".to_string());
+        }
+        let card = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(6)
+            .css_classes(card_cls)
             .build();
 
-        let swatches = theme.swatches;
+        let top_row = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(10)
+            .build();
+
+        let swatches = [
+            parse_hex_rgb(&theme.bg_main),
+            parse_hex_rgb(&theme.accent),
+            parse_hex_rgb(&theme.selection),
+            parse_hex_rgb(&theme.magenta),
+        ];
         let swatch_area = DrawingArea::builder()
             .content_width(64)
             .content_height(18)
@@ -3313,155 +3556,152 @@ fn render_themes_page(
             .ellipsize(gtk4::pango::EllipsizeMode::End)
             .css_classes(vec!["plan-body".to_string()])
             .build();
-        let mode_lbl = Label::builder()
-            .label(&theme.mode.to_uppercase())
+        let resolved_folder = theme.resolved_folder_color();
+        let source_tag = if theme.json_path.is_some() { " • JSON" } else { "" };
+        let sub_lbl = Label::builder()
+            .label(&format!(
+                "{} • folders: {}{}",
+                theme.mode.to_uppercase(),
+                resolved_folder,
+                source_tag
+            ))
             .halign(Align::Start)
             .css_classes(vec!["plan-subnote".to_string()])
             .build();
         col.append(&name_lbl);
-        col.append(&mode_lbl);
+        col.append(&sub_lbl);
 
-        let badge = Label::builder()
-            .label(if theme.is_active { "ACTIVE" } else { "Apply" })
-            .css_classes(vec!["fav-score-badge".to_string()])
-            .valign(Align::Center)
-            .build();
+        top_row.append(&swatch_area);
+        top_row.append(&col);
 
-        row.append(&swatch_area);
-        row.append(&col);
-        row.append(&badge);
-        btn.set_child(Some(&row));
-
-        let key = theme.key.clone();
-        let display_name = theme.name.clone();
-        let tx_c = tx.clone();
-        let st_c = status_lbl.clone();
-        let rel_c = reload_theme.clone();
-        btn.connect_clicked(move |_| {
-            crate::config::update(|c| c.theme_preset = "auto".to_string());
-            st_c.set_label(&format!("Applying {}...", display_name));
-            st_c.set_visible(true);
-            let k = key.clone();
-            let dn = display_name.clone();
-            let tx_bg = tx_c.clone();
-            let rel_after = rel_c.clone();
-            std::thread::spawn(move || {
-                let bin = if std::path::Path::new("/usr/local/bin/theme-switch").exists() {
-                    "/usr/local/bin/theme-switch"
-                } else {
-                    "theme-switch"
-                };
-                let ok = Command::new(bin)
-                    .arg(&k)
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                let msg = if ok {
-                    format!("Applied {}", dn)
-                } else {
-                    format!("Failed to apply {}", dn)
-                };
-                let _ = tx_bg.send(SystemMsg::ThemeApplied(msg));
-            });
-            glib::timeout_add_local_once(Duration::from_millis(200), move || rel_after());
-        });
-
-        container.append(&btn);
-    }
-
-    // 2. Built-in fallback presets (works on any machine without external theme scripts)
-    let bi_hdr = Label::builder()
-        .label("BUILT-IN PRESETS")
-        .halign(Align::Start)
-        .css_classes(vec!["fav-group-header".to_string()])
-        .margin_top(if themes.is_empty() { 0 } else { 8 })
-        .build();
-    container.append(&bi_hdr);
-
-    for preset in crate::config::BUILTIN_THEMES {
-        let is_active = cur_cfg.theme_preset == preset.key;
-        let mut classes = vec!["fav-item-btn".to_string()];
-        if is_active {
-            classes.push("pinned".to_string());
+        if is_global_active || is_dash_active {
+            let badge = Label::builder()
+                .label(if is_global_active { "GLOBAL" } else { "DASH" })
+                .css_classes(vec!["fav-score-badge".to_string()])
+                .valign(Align::Center)
+                .build();
+            top_row.append(&badge);
         }
-        let btn = Button::builder()
-            .css_classes(classes)
-            .hexpand(true)
-            .build();
 
-        let row = Box::builder()
+        let btn_row = Box::builder()
             .orientation(Orientation::Horizontal)
-            .spacing(10)
-            .margin_top(4)
-            .margin_bottom(4)
+            .spacing(6)
             .build();
 
-        let swatches = [
-            parse_hex_rgb(preset.bg_main),
-            parse_hex_rgb(preset.accent),
-            parse_hex_rgb(preset.selection),
-            parse_hex_rgb(preset.magenta),
-        ];
-        let swatch_area = DrawingArea::builder()
-            .content_width(64)
-            .content_height(18)
-            .valign(Align::Center)
-            .build();
-        swatch_area.set_draw_func(move |_, cr, _, h| {
-            let cy = h as f64 / 2.0;
-            let r = 6.5;
-            for (i, &(red, green, blue)) in swatches.iter().enumerate() {
-                let cx = 8.0 + (i as f64 * 16.0);
-                cr.set_source_rgb(red, green, blue);
-                cr.arc(cx, cy, r, 0.0, std::f64::consts::TAU);
-                let _ = cr.fill_preserve();
-                cr.set_source_rgba(1.0, 1.0, 1.0, 0.25);
-                cr.set_line_width(1.0);
-                let _ = cr.stroke();
-            }
-        });
-
-        let col = Box::builder()
-            .orientation(Orientation::Vertical)
-            .spacing(1)
+        let global_btn = Button::builder()
+            .label("Global")
+            .css_classes(vec!["fav-item-btn".to_string()])
             .hexpand(true)
+            .tooltip_text("Apply system-wide: Hyprland, Dolphin, Papirus folders, GTK, Kitty, Wofi, SwayNC, btop & Dashboard")
             .build();
-        let name_lbl = Label::builder()
-            .label(preset.name)
-            .halign(Align::Start)
-            .ellipsize(gtk4::pango::EllipsizeMode::End)
-            .css_classes(vec!["plan-body".to_string()])
+        {
+            let t_clone = theme.clone();
+            let tx_c = tx.clone();
+            let st_c = status_lbl.clone();
+            global_btn.connect_clicked(move |_| {
+                st_c.set_label(&format!("Applying {} globally (including Dolphin & folders)...", t_clone.name));
+                st_c.set_visible(true);
+                let td = t_clone.clone();
+                let tx_bg = tx_c.clone();
+                std::thread::spawn(move || {
+                    let msg = crate::themes::apply_global(&td);
+                    let _ = tx_bg.send(SystemMsg::ThemeApplied(msg));
+                });
+            });
+        }
+
+        let dash_btn = Button::builder()
+            .label("Dash")
+            .css_classes(vec!["fav-item-btn".to_string()])
+            .hexpand(true)
+            .tooltip_text("Apply to Lily Dashboard only")
             .build();
-        let mode_lbl = Label::builder()
-            .label(&format!("{} • BUILT-IN", preset.mode.to_uppercase()))
-            .halign(Align::Start)
-            .css_classes(vec!["plan-subnote".to_string()])
+        {
+            let t_clone = theme.clone();
+            let tx_c = tx.clone();
+            let rel_c = reload_theme.clone();
+            dash_btn.connect_clicked(move |_| {
+                crate::themes::apply_dash_only(&t_clone);
+                rel_c();
+                let _ = tx_c.send(SystemMsg::ThemeApplied(format!(
+                    "Dashboard theme set to {}",
+                    t_clone.name
+                )));
+            });
+        }
+
+        let edit_btn = Button::builder()
+            .label("Edit")
+            .css_classes(vec!["fav-item-btn".to_string()])
+            .tooltip_text("Load this theme into the 6-Color Theme Editor")
             .build();
-        col.append(&name_lbl);
-        col.append(&mode_lbl);
+        {
+            let t_clone = theme.clone();
+            let ec = editor_card.clone();
+            let etb = editor_toggle_btn.clone();
+            let ne = name_entry.clone();
+            let ms = mode_state.clone();
+            let mb = mode_btn.clone();
+            let fstate = folder_state.clone();
+            let fbtns = folder_btns.clone();
+            let bg = e_bg.clone();
+            let pill = e_pill.clone();
+            let fg = e_fg.clone();
+            let acc = e_acc.clone();
+            let sel = e_sel.clone();
+            let mag = e_mag.clone();
+            edit_btn.connect_clicked(move |_| {
+                ne.set_text(&t_clone.name);
+                let m = if t_clone.mode.eq_ignore_ascii_case("light") {
+                    "light"
+                } else {
+                    "dark"
+                };
+                *ms.borrow_mut() = m.to_string();
+                mb.set_label(if m == "light" { "Mode: Light" } else { "Mode: Dark" });
+                let fc = if t_clone.folder_color.is_empty() {
+                    "auto".to_string()
+                } else {
+                    t_clone.folder_color.clone()
+                };
+                *fstate.borrow_mut() = fc.clone();
+                for (name, btn) in fbtns.borrow().iter() {
+                    if name == &fc {
+                        btn.add_css_class("pinned");
+                    } else {
+                        btn.remove_css_class("pinned");
+                    }
+                }
+                bg.set_text(&format!("#{}", t_clone.bg_main));
+                pill.set_text(&format!("#{}", t_clone.bg_pill));
+                fg.set_text(&format!("#{}", t_clone.fg_main));
+                acc.set_text(&format!("#{}", t_clone.accent));
+                sel.set_text(&format!("#{}", t_clone.selection));
+                mag.set_text(&format!("#{}", t_clone.magenta));
+                ec.set_visible(true);
+                etb.set_label("− Hide Theme Editor");
+            });
+        }
 
-        let badge = Label::builder()
-            .label(if is_active { "ACTIVE" } else { "Use" })
-            .css_classes(vec!["fav-score-badge".to_string()])
-            .valign(Align::Center)
-            .build();
+        btn_row.append(&global_btn);
+        btn_row.append(&dash_btn);
+        btn_row.append(&edit_btn);
 
-        row.append(&swatch_area);
-        row.append(&col);
-        row.append(&badge);
-        btn.set_child(Some(&row));
+        if let Some(jpath) = theme.json_path.clone() {
+            let json_btn = Button::builder()
+                .label(".json")
+                .css_classes(vec!["fav-item-btn".to_string()])
+                .tooltip_text("Open .json file to fine-tune derived colors")
+                .build();
+            json_btn.connect_clicked(move |_| {
+                let _ = Command::new("xdg-open").arg(&jpath).spawn();
+            });
+            btn_row.append(&json_btn);
+        }
 
-        let key = preset.key.to_string();
-        let name = preset.name.to_string();
-        let tx_c = tx.clone();
-        let rel_c = reload_theme.clone();
-        btn.connect_clicked(move |_| {
-            crate::config::update(|c| c.theme_preset = key.clone());
-            rel_c();
-            let _ = tx_c.send(SystemMsg::ThemeApplied(format!("Using built-in {}", name)));
-        });
-
-        container.append(&btn);
+        card.append(&top_row);
+        card.append(&btn_row);
+        container.append(&card);
     }
 }
 
