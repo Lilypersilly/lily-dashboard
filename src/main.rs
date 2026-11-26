@@ -300,7 +300,7 @@ fn init_theme() -> Rc<dyn Fn()> {
                 .session-restore-btn:hover {{ background-color: {fg_main_15}; }}
                 .session-restore-lbl {{ color: #{accent2}; font-size: {fs_12}px; font-weight: bold; }}
 
-                .power-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 5px 2px; min-height: 28px; box-shadow: none; transition: background-color 0.16s ease; }}
+                .power-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 5px 1px; min-width: 0; min-height: 28px; box-shadow: none; transition: background-color 0.16s ease; }}
                 .power-btn:hover {{ background-color: {fg_main_15}; }}
                 .power-btn-lbl {{ color: #{accent2}; font-family: '{mono_font}', '{ui_font}', sans-serif; font-size: {fs_14}px; font-weight: bold; }}
                 .power-btn.active {{ background-color: {accent1_24}; }}
@@ -718,9 +718,9 @@ fn build_ui(
         .hscrollbar_policy(gtk4::PolicyType::External) // <-- NEVER stretches parent!
         .vscrollbar_policy(gtk4::PolicyType::Never)
         .propagate_natural_width(false)                // <-- Locks width strictly!
-        .min_content_width(110)
-        .max_content_width(110)
-        .width_request(110)
+        .min_content_width(126)
+        .max_content_width(126)
+        .width_request(126)
         .has_frame(false)
         .hexpand(false)
         .vexpand(true)
@@ -1015,10 +1015,10 @@ fn build_ui(
     // Modular 1–3 button Power row (Shutdown, Reboot, Log Out, Suspend, Lock, or Dropdown Menu)
     let power_row = Box::builder()
         .orientation(Orientation::Horizontal)
-        .spacing(6)
+        .spacing(4)
         .homogeneous(true)
-        .margin_start(8)
-        .margin_end(8)
+        .margin_start(6)
+        .margin_end(6)
         .margin_top(2)
         .margin_bottom(14)
         .build();

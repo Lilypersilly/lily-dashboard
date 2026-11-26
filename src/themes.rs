@@ -653,6 +653,10 @@ widgetStyle=Breeze
 /// Builds a lightweight, symlink-only user icon theme overlay in
 /// `~/.local/share/icons/Lily-Papirus-{Dark,Light}` pointing folder icons to the chosen
 /// Papirus color variant in `/usr/share/icons/Papirus`. Requires zero root/sudo and <1 MB.
+///
+/// Uses a hidden staging directory + atomic rename so running GTK4 apps (whose
+/// `GtkIconTheme` mmaps `icon-theme.cache`) never observe a half-written directory or
+/// truncated cache file.
 fn apply_papirus_folder_color(is_light: bool, folder_color: &str) -> String {
     let base_theme = if is_light { "Papirus-Light" } else { "Papirus-Dark" };
     let sys_papirus = PathBuf::from("/usr/share/icons/Papirus");
@@ -665,8 +669,25 @@ fn apply_papirus_folder_color(is_light: bool, folder_color: &str) -> String {
     } else {
         "Lily-Papirus-Dark"
     };
-    let overlay_dir = glib::user_data_dir().join("icons").join(overlay_name);
-    let _ = fs::create_dir_all(&overlay_dir);
+    let icons_root = glib::user_data_dir().join("icons");
+    let _ = fs::create_dir_all(&icons_root);
+    let overlay_dir = icons_root.join(overlay_name);
+    let marker_path = overlay_dir.join(".lily-color");
+
+    // Fast path: already built for this exact folder color — avoid touching icons_root at all
+    if overlay_dir.is_dir()
+        && fs::read_to_string(&marker_path)
+            .map(|s| s.trim() == folder_color)
+            .unwrap_or(false)
+    {
+        return overlay_name.to_string();
+    }
+
+    let staging_dir = icons_root.join(format!(".{}.staging", overlay_name));
+    let old_dir = icons_root.join(format!(".{}.old", overlay_name));
+    let _ = fs::remove_dir_all(&staging_dir);
+    let _ = fs::remove_dir_all(&old_dir);
+    let _ = fs::create_dir_all(&staging_dir);
 
     let inherits = if is_light {
         "Papirus-Light,Papirus,breeze,hicolor"
@@ -695,7 +716,7 @@ fn apply_papirus_folder_color(is_light: bool, folder_color: &str) -> String {
         "[Icon Theme]\nName={overlay_name}\nComment=Dynamic Papirus folder color overlay (Lily Dashboard)\nInherits={inherits}\nDirectories={}\n{sections}",
         dir_list.join(",")
     );
-    let _ = fs::write(overlay_dir.join("index.theme"), index_theme);
+    let _ = fs::write(staging_dir.join("index.theme"), index_theme);
 
     let folder_exact = format!("folder-{}.svg", folder_color);
     let folder_prefix = format!("folder-{}-", folder_color);
@@ -707,10 +728,7 @@ fn apply_papirus_folder_color(is_light: bool, folder_color: &str) -> String {
         if !src_places.is_dir() {
             continue;
         }
-        let dst_places = overlay_dir.join(sz).join("places");
-        if dst_places.exists() {
-            let _ = fs::remove_dir_all(&dst_places);
-        }
+        let dst_places = staging_dir.join(sz).join("places");
         let _ = fs::create_dir_all(&dst_places);
 
         if let Ok(rd) = fs::read_dir(&src_places) {
@@ -744,23 +762,35 @@ fn apply_papirus_folder_color(is_light: bool, folder_color: &str) -> String {
         }
 
         // HiDPI @2x symlink
-        let hi_path = overlay_dir.join(format!("{}@2x", sz));
-        if !hi_path.exists() {
-            let _ = std::os::unix::fs::symlink(sz, &hi_path);
-        }
+        let hi_path = staging_dir.join(format!("{}@2x", sz));
+        let _ = std::os::unix::fs::symlink(sz, &hi_path);
     }
 
     if !linked_any {
+        let _ = fs::remove_dir_all(&staging_dir);
         return base_theme.to_string();
     }
+
+    let _ = fs::write(staging_dir.join(".lily-color"), folder_color);
 
     if crate::config::bin_exists("gtk-update-icon-cache") {
         let _ = Command::new("gtk-update-icon-cache")
             .args(["-f", "-t"])
-            .arg(&overlay_dir)
+            .arg(&staging_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+
+    // Atomic directory swap (new inode for icon-theme.cache so live mmaps never break)
+    if overlay_dir.exists() {
+        let _ = fs::rename(&overlay_dir, &old_dir);
+    }
+    if fs::rename(&staging_dir, &overlay_dir).is_err() {
+        let _ = fs::rename(&old_dir, &overlay_dir);
+        let _ = fs::remove_dir_all(&staging_dir);
+    } else {
+        let _ = fs::remove_dir_all(&old_dir);
     }
 
     overlay_name.to_string()
@@ -1051,6 +1081,247 @@ textview {{ padding: 16px; }}
             d.magenta, p_red
         );
         let _ = fs::write(btop_dir.join("marshmellow.theme"), btop_theme);
+    }
+
+    // 8b. Vesktop (Vencord) live theme CSS (supports Discord Visual Refresh + Dark/Darker/Midnight/Light)
+    let vesktop_themes_dir = cfg_dir.join("vesktop").join("themes");
+    if vesktop_themes_dir.is_dir() {
+        let fg_sub = blend_hex(&d.fg_main, &d.fg_muted, 0.35);
+        let vesktop_css = format!(
+            r#"/**
+ * @name Marshmellow
+ * @author lilypersilly
+ * @description Dynamic Lily Dashboard Theme ({name})
+ * @version 1.3.0
+ */
+
+:root,
+.theme-light,
+.theme-dark,
+.theme-darker,
+.theme-midnight,
+.visual-refresh {{
+    /* Fonts */
+    --font-primary: "Josefin Sans", "Noto Sans CJK JP", sans-serif !important;
+    --font-display: "Josefin Sans", "Noto Sans CJK JP", sans-serif !important;
+    --font-code: "MesloLGL Nerd Font", monospace !important;
+
+    /* Main Backgrounds (Legacy + Visual Refresh) */
+    --background-primary: #{bg_main} !important;
+    --bg-base-primary: #{bg_main} !important;
+    --background-base-low: #{bg_main} !important;
+    --background-base-lower: #{bg_recessed} !important;
+    --background-base-lowest: #{bg_pill} !important;
+    --background-surface-high: #{bg_pill} !important;
+    --background-surface-higher: #{bg_pill} !important;
+    --background-surface-highest: #{bg_recessed} !important;
+    --bg-overlay-chat: #{bg_main} !important;
+    --bg-overlay-1: #{bg_main} !important;
+    --bg-overlay-2: #{bg_recessed} !important;
+    --bg-overlay-3: #{bg_pill} !important;
+    --chat-background: #{bg_main} !important;
+    --chat-background-default: #{bg_main} !important;
+    --home-background: #{bg_main} !important;
+    --card-primary-bg: #{bg_pill} !important;
+    --card-secondary-bg: #{bg_recessed} !important;
+
+    /* Channel List & Member Sidebar */
+    --background-secondary: #{bg_recessed} !important;
+    --bg-base-secondary: #{bg_recessed} !important;
+    --bg-surface-raised: #{bg_recessed} !important;
+
+    /* Server Bar & Bottom-Left User Panel */
+    --background-secondary-alt: #{bg_pill} !important;
+    --background-tertiary: #{bg_pill} !important;
+    --bg-base-tertiary: #{bg_pill} !important;
+
+    /* Popups, Modals & Context Menus */
+    --background-floating: #{bg_main} !important;
+    --bg-surface-overlay: #{bg_main} !important;
+    --modal-background: #{bg_main} !important;
+    --modal-footer-background: #{bg_recessed} !important;
+    --background-accent: #{selection} !important;
+
+    /* Hover, Modifiers & Borders */
+    --background-modifier-hover: {acc_22} !important;
+    --background-modifier-active: {acc_35} !important;
+    --background-modifier-selected: #{selection} !important;
+    --background-modifier-accent: {acc_35} !important;
+    --bg-mod-faint: {acc_08} !important;
+    --bg-mod-subtle: {acc_12} !important;
+    --bg-mod-normal: {acc_22} !important;
+    --bg-mod-strong: {acc_35} !important;
+    --background-mod-subtle: {acc_12} !important;
+    --background-mod-normal: {acc_22} !important;
+    --background-mod-strong: {acc_35} !important;
+    --border-subtle: {acc_22} !important;
+    --border-normal: {acc_35} !important;
+    --border-strong: #{accent} !important;
+
+    /* Message Input Box */
+    --channeltextarea-background: #{bg_pill} !important;
+    --input-background: #{bg_pill} !important;
+    --input-border: {acc_35} !important;
+    --input-placeholder-text: #{fg_muted} !important;
+
+    /* Text & Icons (Legacy + Visual Refresh) */
+    --text-normal: #{fg_main} !important;
+    --text-default: #{fg_main} !important;
+    --text-strong: #{fg_main} !important;
+    --text-subtle: #{fg_sub} !important;
+    --text-primary: #{fg_main} !important;
+    --text-secondary: #{fg_sub} !important;
+    --text-tertiary: #{fg_muted} !important;
+    --text-muted: #{fg_muted} !important;
+    --text-link: #{magenta} !important;
+    --text-feedback-info: #{fg_main} !important;
+    --header-primary: #{fg_main} !important;
+    --header-secondary: #{fg_sub} !important;
+    --header-muted: #{fg_muted} !important;
+    --channels-default: #{fg_sub} !important;
+    --channel-icon: #{fg_muted} !important;
+    --icon-primary: #{fg_main} !important;
+    --icon-secondary: #{fg_sub} !important;
+    --icon-muted: #{fg_muted} !important;
+    --icon-strong: #{fg_main} !important;
+    --interactive-normal: #{fg_sub} !important;
+    --interactive-hover: #{accent} !important;
+    --interactive-active: #{fg_main} !important;
+    --interactive-muted: #{fg_muted} !important;
+    --interactive-text-default: #{fg_sub} !important;
+    --interactive-text-hover: #{accent} !important;
+    --interactive-text-active: #{fg_main} !important;
+    --button-secondary-text: #{fg_main} !important;
+    --button-outline-primary-text: #{fg_main} !important;
+
+    /* Accents & Mentions */
+    --brand-experiment: #{accent} !important;
+    --brand-experiment-560: #{selection} !important;
+    --brand-500: #{accent} !important;
+    --brand-560: #{selection} !important;
+    --control-primary-background-default: #{accent} !important;
+    --control-primary-text-default: #{sel_fg} !important;
+    --mention-foreground: #{accent} !important;
+    --mention-background: {acc_25} !important;
+    --background-mentioned: {acc_18} !important;
+    --background-mentioned-hover: {acc_28} !important;
+    --info-warning-foreground: #{accent} !important;
+
+    /* Scrollbars */
+    --scrollbar-thin-thumb: #{accent} !important;
+    --scrollbar-auto-thumb: #{accent} !important;
+    --scrollbar-auto-track: #{bg_recessed} !important;
+}}
+
+/* Force Main Chat, Friends, Active Now, Top Bar, Form Footer, Sidebar, and Member List */
+[class*="chat_"],
+[class*="chatContent_"],
+[class*="messagesWrapper_"],
+[class*="scroller_"],
+[class*="form_"],
+[class*="tabBody_"],
+[class*="peopleColumn_"],
+[class*="nowPlayingColumn_"],
+[class*="applicationStore_"],
+[class*="shop_"] {{
+    background: #{bg_main} !important;
+    background-color: #{bg_main} !important;
+}}
+
+[class*="bar_"][class*="base_"],
+[class*="title_"][class*="bar_"],
+[class*="themed_"][class*="container_"],
+section[class*="title_"] {{
+    background: #{bg_recessed} !important;
+    background-color: #{bg_recessed} !important;
+}}
+
+[class*="form_"]::before,
+[class*="form_"]::after {{
+    display: none !important;
+}}
+
+[class*="sidebar_"],
+[class*="privateChannels_"],
+[class*="members_"],
+[class*="membersWrap_"],
+nav[class*="guilds_"] {{
+    background-color: #{bg_recessed} !important;
+}}
+
+/* Eliminate Outer Corners on the Message Input Box */
+[class*="channelTextArea_"] {{
+    background: transparent !important;
+    background-color: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+}}
+
+[class*="channelTextArea_"] [class*="scrollableContainer_"] {{
+    background: #{bg_pill} !important;
+    background-color: #{bg_pill} !important;
+    border: 2px solid #{accent} !important;
+    border-radius: 16px !important;
+    box-shadow: none !important;
+}}
+
+/* Full 4-Sided Rounded Border on the Bottom-Left User Panel */
+[class*="panels_"] {{
+    background-color: #{bg_pill} !important;
+    border: 2px solid #{accent} !important;
+    border-radius: 16px !important;
+    box-shadow: none !important;
+}}
+
+[class*="panels_"] > div,
+[class*="panels_"] [class*="container_"] {{
+    background: transparent !important;
+    background-color: transparent !important;
+}}
+
+/* Ensure crisp foreground text in Light & Dark modes regardless of Discord's internal class */
+[class*="peopleListItem_"] [class*="username_"],
+[class*="userInfo_"] [class*="username_"],
+[class*="panels_"] [class*="title_"],
+[class*="panels_"] [class*="panelTitleContainer_"] *,
+[class*="topPill_"] [class*="item_"] {{
+    color: #{fg_main} !important;
+}}
+
+[class*="peopleListItem_"] [class*="subtext_"],
+[class*="panels_"] [class*="subtext_"],
+[class*="searchBar_"] button,
+[class*="searchBarComponent_"] {{
+    color: #{fg_sub} !important;
+}}
+"#,
+            name = d.name,
+            bg_main = d.bg_main,
+            bg_recessed = d.bg_recessed,
+            bg_pill = d.bg_pill,
+            fg_main = d.fg_main,
+            fg_sub = fg_sub,
+            fg_muted = d.fg_muted,
+            accent = d.accent,
+            selection = d.selection,
+            sel_fg = sel_fg,
+            magenta = d.magenta,
+            acc_08 = rgba_css(&d.accent, 0.08),
+            acc_12 = rgba_css(&d.accent, 0.12),
+            acc_18 = rgba_css(&d.accent, 0.18),
+            acc_22 = rgba_css(&d.accent, 0.22),
+            acc_25 = rgba_css(&d.accent, 0.25),
+            acc_28 = rgba_css(&d.accent, 0.28),
+            acc_35 = rgba_css(&d.accent, 0.35),
+        );
+        let lower_path = vesktop_themes_dir.join("marshmellow.theme.css");
+        let upper_path = vesktop_themes_dir.join("Marshmellow.theme.css");
+        if lower_path.exists() {
+            let _ = fs::write(&lower_path, &vesktop_css);
+        }
+        if upper_path.exists() || !lower_path.exists() {
+            let _ = fs::write(&upper_path, &vesktop_css);
+        }
     }
 
     // 9. Live desktop reloads
