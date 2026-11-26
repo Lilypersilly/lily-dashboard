@@ -1713,6 +1713,40 @@ pub fn build_music_ui() -> Box {
         .vexpand(true)
         .build();
 
+    let mut missing_music_tools = Vec::new();
+    if !crate::config::bin_exists("mpv") {
+        missing_music_tools.push("mpv");
+    }
+    if !crate::config::bin_exists("yt-dlp") {
+        missing_music_tools.push("yt-dlp");
+    }
+    if !missing_music_tools.is_empty() {
+        let warn_card = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(3)
+            .css_classes(vec!["plan-check-row".to_string()])
+            .build();
+        warn_card.append(
+            &Label::builder()
+                .label(&format!("⚠ Missing: {}", missing_music_tools.join(", ")))
+                .halign(Align::Start)
+                .css_classes(vec!["plan-step".to_string()])
+                .build(),
+        );
+        warn_card.append(
+            &Label::builder()
+                .label(&format!(
+                    "Install via your package manager (e.g. sudo pacman -S {})",
+                    missing_music_tools.join(" ")
+                ))
+                .halign(Align::Start)
+                .wrap(true)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build(),
+        );
+        music_page.append(&warn_card);
+    }
+
     let top_nav_row = Box::builder().orientation(Orientation::Horizontal).spacing(6).build();
     let home_nav_btn = Button::builder()
         .label("Home")

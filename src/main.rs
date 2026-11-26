@@ -64,6 +64,7 @@ fn main() {
     let reload_theme_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
     let reload_theme_startup = reload_theme_slot.clone();
     app.connect_startup(move |_| {
+        config::ensure_bundled_fonts();
         let reload_cb = init_theme();
         *reload_theme_startup.borrow_mut() = Some(reload_cb);
     });
@@ -174,6 +175,7 @@ fn init_theme() -> Rc<dyn Fn()> {
             let accent1_55 = hex_to_rgba(accent1, 0.55);
             let accent2_28 = hex_to_rgba(accent2, 0.28);
             let accent2_70 = hex_to_rgba(accent2, 0.70);
+            let fg_main_04 = hex_to_rgba(fg_main, 0.04);
             let fg_main_06 = hex_to_rgba(fg_main, 0.06);
             let fg_main_08 = hex_to_rgba(fg_main, 0.08);
             let fg_main_15 = hex_to_rgba(fg_main, 0.15);
@@ -195,19 +197,71 @@ fn init_theme() -> Rc<dyn Fn()> {
             let r_chk = sr(5.0);
             let r_sliv = sr(4.0);
 
+            let ui_font = if cfg.ui_font.trim().is_empty() {
+                "Josefin Sans".to_string()
+            } else {
+                cfg.ui_font.trim().replace('\'', "")
+            };
+            let mono_font = if cfg.mono_font.trim().is_empty() {
+                "MesloLGL Nerd Font".to_string()
+            } else {
+                cfg.mono_font.trim().replace('\'', "")
+            };
+
+            let fs_scale = cfg.font_scale.clamp(0.75, 1.35);
+            let sf = |base: f64| -> i32 { (base * fs_scale).round().max(8.0) as i32 };
+            let fs_11 = sf(11.0);
+            let fs_12 = sf(12.0);
+            let fs_13 = sf(13.0);
+            let fs_14 = sf(14.0);
+            let fs_15 = sf(15.0);
+            let fs_16 = sf(16.0);
+            let fs_19 = sf(19.0);
+
+            let is_right = cfg.layout.side == "right";
+            let anim_ms = cfg.layout.anim_duration_ms;
+            let trig_h = match cfg.layout.trigger_size.as_str() {
+                "small" => 72,
+                "large" => 140,
+                _ => 100,
+            };
+            let dash_edge_css = if is_right {
+                format!("border-right: none; border-top-left-radius: {r_outer}px; border-bottom-left-radius: {r_outer}px;")
+            } else {
+                format!("border-left: none; border-top-right-radius: {r_outer}px; border-bottom-right-radius: {r_outer}px;")
+            };
+            let trig_edge_css = if is_right {
+                format!("border-right: none; border-top-left-radius: 100px; border-bottom-left-radius: 100px; min-height: {trig_h}px; transform: translateX(36px);")
+            } else {
+                format!("border-left: none; border-top-right-radius: 100px; border-bottom-right-radius: 100px; min-height: {trig_h}px; transform: translateX(-36px);")
+            };
+            let closed_tx = if is_right { "415px" } else { "-415px" };
+            let panel_min_w = (cfg.layout.panel_width.clamp(340, 560) - 2).max(338);
+
+            let sidebar_border_css = if is_right {
+                format!("border-left: 1px solid #{accent1}; border-right: none;")
+            } else {
+                format!("border-right: 1px solid #{accent1}; border-left: none;")
+            };
+            let detail_border_css = if is_right {
+                format!("border-right: 2px solid #{selection}; border-left: none;")
+            } else {
+                format!("border-left: 2px solid #{selection}; border-right: none;")
+            };
+
             let css = format!(
                 r#"
                 window {{ background-color: transparent; }}
-                .drawer-container {{ transform: translateX(-415px); transition: transform 0.35s cubic-bezier(0.25, 0.8, 0.25, 1); }}
+                .drawer-container {{ transform: translateX({closed_tx}); transition: transform {anim_ms}ms cubic-bezier(0.25, 0.8, 0.25, 1); }}
                 .drawer-container.open {{ transform: translateX(0px); }}
                 
-                .dash-box {{ background-color: {bg_main_glass}; border: 2px solid #{accent1}; border-left: none; border-top-right-radius: {r_outer}px; border-bottom-right-radius: {r_outer}px; min-width: 398px; }}
-                .sidebar-column {{ background-color: {bg_recessed_glass}; border-right: 1px solid #{accent1}; }}
+                .dash-box {{ background-color: {bg_main_glass}; border: 2px solid #{accent1}; {dash_edge_css} min-width: {panel_min_w}px; }}
+                .sidebar-column {{ background-color: {bg_recessed_glass}; {sidebar_border_css} }}
                 
                 .sidebar-nav-btn {{ background-color: transparent; border: none; border-radius: {r_md}px; padding: 6px 10px; margin: 1px 4px; box-shadow: none; transition: background-color 0.18s ease, color 0.18s ease; }}
                 .sidebar-nav-btn:hover {{ background-color: {accent1_15}; }}
                 .sidebar-nav-btn.selected {{ background-color: {fg_main_06}; }}
-                .sidebar-nav-btn label {{ color: #{fg_muted}; font-family: 'Josefin Sans', sans-serif; font-size: 15px; font-weight: bold; }}
+                .sidebar-nav-btn label {{ color: #{fg_muted}; font-family: '{ui_font}', sans-serif; font-size: {fs_15}px; font-weight: bold; }}
                 .sidebar-nav-btn.selected label {{ color: #{fg_main}; }}
                 .sidebar-sep {{ background-color: {accent1_35}; min-height: 1px; margin: 4px 10px; }}
                 
@@ -220,21 +274,21 @@ fn init_theme() -> Rc<dyn Fn()> {
                 .music-kind-tab-playlist {{ background-color: #fab387; border-radius: 99px; min-width: 3px; min-height: 28px; }}
                 .music-kind-tab-album {{ background-color: #a6e3a1; border-radius: 99px; min-width: 3px; min-height: 28px; }}
                 
-                .fav-search {{ background-color: {bg_contrast_65}; border: 1px solid transparent; border-radius: {r_md}px; color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; padding: 7px 12px; transition: background-color 0.16s ease, border-color 0.16s ease; }}
+                .fav-search {{ background-color: {bg_contrast_65}; border: 1px solid transparent; border-radius: {r_md}px; color: #{fg_main}; font-family: '{ui_font}', sans-serif; font-size: {fs_14}px; padding: 7px 12px; transition: background-color 0.16s ease, border-color 0.16s ease; }}
                 .fav-search:focus {{ background-color: {bg_contrast_88}; border-color: {accent1_55}; }}
                 
-                .fav-group-header {{ color: #{accent2}; font-weight: bold; font-size: 13px; font-family: 'MesloLGL Nerd Font', monospace; margin-left: 4px; letter-spacing: 1px; }}
-                .fav-score-badge {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 12px; font-weight: bold; }}
+                .fav-group-header {{ color: #{accent2}; font-weight: bold; font-size: {fs_13}px; font-family: '{mono_font}', monospace; margin-left: 4px; letter-spacing: 1px; }}
+                .fav-score-badge {{ color: #{accent2}; font-family: '{mono_font}', monospace; font-size: {fs_12}px; font-weight: bold; }}
                 
-                .plan-fmt-btn, .plan-close-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 6px 11px; color: #{fg_main}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-weight: bold; box-shadow: none; transition: background-color 0.16s ease, color 0.16s ease; }}
-                .plan-fmt-btn label, .plan-close-btn label {{ color: #{fg_main}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-size: 14px; font-weight: bold; }}
+                .plan-fmt-btn, .plan-close-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 6px 11px; color: #{fg_main}; font-family: '{ui_font}', '{mono_font}', sans-serif; font-weight: bold; box-shadow: none; transition: background-color 0.16s ease, color 0.16s ease; }}
+                .plan-fmt-btn label, .plan-close-btn label {{ color: #{fg_main}; font-family: '{ui_font}', '{mono_font}', sans-serif; font-size: {fs_14}px; font-weight: bold; }}
                 .plan-fmt-btn:hover, .plan-close-btn:hover {{ background-color: {fg_main_15}; }}
                 .plan-fmt-btn.active, .plan-close-btn.active {{ background-color: {accent1_24}; border-color: transparent; color: #{accent2}; }}
                 .plan-fmt-btn.active label, .plan-close-btn.active label {{ color: #{accent2}; }}
                 .plan-fmt-btn.active:hover, .plan-close-btn.active:hover {{ background-color: {accent1_38}; }}
 
-                .primary-btn {{ background-color: {accent1_24}; border: 1px solid transparent; border-radius: {r_md}px; padding: 7px 14px; color: #{accent2}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-weight: bold; box-shadow: none; transition: background-color 0.16s ease, color 0.16s ease; }}
-                .primary-btn label {{ color: #{accent2}; font-family: 'Josefin Sans', 'MesloLGL Nerd Font', sans-serif; font-size: 14px; font-weight: bold; }}
+                .primary-btn {{ background-color: {accent1_24}; border: 1px solid transparent; border-radius: {r_md}px; padding: 7px 14px; color: #{accent2}; font-family: '{ui_font}', '{mono_font}', sans-serif; font-weight: bold; box-shadow: none; transition: background-color 0.16s ease, color 0.16s ease; }}
+                .primary-btn label {{ color: #{accent2}; font-family: '{ui_font}', '{mono_font}', sans-serif; font-size: {fs_14}px; font-weight: bold; }}
                 .primary-btn:hover {{ background-color: {accent1_38}; color: #{fg_main}; }}
                 .primary-btn:hover label {{ color: #{fg_main}; }}
                 .primary-btn.active {{ background-color: rgba(243, 139, 168, 0.22); color: #f38ba8; }}
@@ -243,37 +297,37 @@ fn init_theme() -> Rc<dyn Fn()> {
                 
                 .session-restore-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 7px 6px; margin: 4px 8px; box-shadow: none; transition: background-color 0.16s ease; }}
                 .session-restore-btn:hover {{ background-color: {fg_main_15}; }}
-                .session-restore-lbl {{ color: #{accent2}; font-size: 12px; font-weight: bold; }}
+                .session-restore-lbl {{ color: #{accent2}; font-size: {fs_12}px; font-weight: bold; }}
 
                 .power-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 5px 2px; min-height: 28px; box-shadow: none; transition: background-color 0.16s ease; }}
                 .power-btn:hover {{ background-color: {fg_main_15}; }}
-                .power-btn-lbl {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', 'Josefin Sans', sans-serif; font-size: 14px; font-weight: bold; }}
+                .power-btn-lbl {{ color: #{accent2}; font-family: '{mono_font}', '{ui_font}', sans-serif; font-size: {fs_14}px; font-weight: bold; }}
                 .power-btn.active {{ background-color: {accent1_24}; }}
                 .power-btn.active:hover {{ background-color: {accent1_38}; }}
                 .power-btn.armed {{ background-color: rgba(243, 139, 168, 0.24); border-color: transparent; }}
-                .power-btn.armed .power-btn-lbl {{ color: #f38ba8; font-family: 'Josefin Sans', sans-serif; font-size: 11px; }}
+                .power-btn.armed .power-btn-lbl {{ color: #f38ba8; font-family: '{ui_font}', sans-serif; font-size: {fs_11}px; }}
 
                 .sidebar-footer-btn {{ background-color: transparent; border: none; border-radius: {r_bar}px; padding: 2px 3px; margin: 0px; min-height: 0px; min-width: 0px; box-shadow: none; transition: background-color 0.15s ease; }}
                 .sidebar-footer-btn:hover {{ background-color: {accent1_15}; }}
-                .sidebar-weather-lbl {{ color: #{accent2}; font-family: 'Josefin Sans', sans-serif; font-size: 13px; font-weight: bold; }}
-                .sidebar-clock-lbl {{ color: #{fg_main}; font-family: 'MesloLGL Nerd Font', 'Josefin Sans', sans-serif; font-size: 12px; font-weight: bold; }}
-                .sidebar-reload-lbl {{ color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 11px; font-weight: bold; }}
+                .sidebar-weather-lbl {{ color: #{accent2}; font-family: '{ui_font}', sans-serif; font-size: {fs_13}px; font-weight: bold; }}
+                .sidebar-clock-lbl {{ color: #{fg_main}; font-family: '{mono_font}', '{ui_font}', sans-serif; font-size: {fs_12}px; font-weight: bold; }}
+                .sidebar-reload-lbl {{ color: #{fg_main}; font-family: '{ui_font}', sans-serif; font-size: {fs_11}px; font-weight: bold; }}
 
-                .sidebar-status-lbl {{ color: #{fg_muted}; font-family: 'MesloLGL Nerd Font', 'Josefin Sans', sans-serif; font-size: 11px; font-weight: bold; }}
+                .sidebar-status-lbl {{ color: #{fg_muted}; font-family: '{mono_font}', '{ui_font}', sans-serif; font-size: {fs_11}px; font-weight: bold; }}
                 .sidebar-status-lbl.bat-low {{ color: #f38ba8; }}
                 .notif-unread .sidebar-status-lbl {{ color: #{accent2}; }}
 
                 .ws-top-bar {{ background-color: {bg_recessed_glass}; border-bottom: 1px solid {accent1_35}; padding: 6px 10px; }}
                 .ws-pill-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 2px 9px; min-width: 24px; min-height: 22px; box-shadow: none; transition: all 0.15s ease; }}
-                .ws-pill-btn label {{ color: #{fg_muted}; font-family: 'MesloLGL Nerd Font', sans-serif; font-size: 12px; font-weight: bold; }}
+                .ws-pill-btn label {{ color: #{fg_muted}; font-family: '{mono_font}', sans-serif; font-size: {fs_12}px; font-weight: bold; }}
                 .ws-pill-btn:hover {{ background-color: {fg_main_15}; }}
                 .ws-pill-btn.active {{ background-color: {accent1_24}; border-color: transparent; }}
                 .ws-pill-btn.active label {{ color: #{accent2}; }}
                 .ws-preview-map {{ border-radius: {r_xs}px; }}
                 .top-tool-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_sm}px; padding: 2px 7px; min-width: 24px; min-height: 22px; box-shadow: none; transition: background-color 0.15s ease; }}
-                .top-tool-btn label {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', sans-serif; font-size: 13px; }}
+                .top-tool-btn label {{ color: #{accent2}; font-family: '{mono_font}', sans-serif; font-size: {fs_13}px; }}
                 .top-tool-btn:hover {{ background-color: {fg_main_15}; }}
-                .kbd-pill {{ background-color: {fg_main_08}; border-radius: {r_xxs}px; padding: 3px 8px; color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 11px; font-weight: bold; }}
+                .kbd-pill {{ background-color: {fg_main_08}; border-radius: {r_xxs}px; padding: 3px 8px; color: #{accent2}; font-family: '{mono_font}', monospace; font-size: {fs_11}px; font-weight: bold; }}
 
                 .wall-tile-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 4px; box-shadow: none; transition: all 0.15s ease; }}
                 .wall-tile-btn:hover {{ background-color: {fg_main_15}; }}
@@ -287,12 +341,12 @@ fn init_theme() -> Rc<dyn Fn()> {
                 .media-edge-sliver.active {{ opacity: 0.35; }}
                 .media-popout-pill {{ background-color: {bg_main_glass}; border: 2px solid #{accent1}; border-radius: {r_outer}px; padding: 6px 12px; transition: background-color 0.15s ease; }}
                 .media-popout-pill:hover {{ background-color: {bg_pill_glass}; }}
-                .media-pill-lbl {{ color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 13px; font-weight: bold; }}
+                .media-pill-lbl {{ color: #{fg_main}; font-family: '{ui_font}', sans-serif; font-size: {fs_13}px; font-weight: bold; }}
                 .media-popout-card {{ background-color: {bg_main_glass}; border: 2px solid #{accent1}; border-radius: {r_outer}px; padding: 12px 14px; }}
-                .media-popout-title {{ color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 15px; font-weight: bold; }}
+                .media-popout-title {{ color: #{fg_main}; font-family: '{ui_font}', sans-serif; font-size: {fs_15}px; font-weight: bold; }}
                 .media-art-box {{ background-color: #{bg_recessed}; border: 1px solid #{selection}; border-radius: {r_md}px; }}
 
-                calendar.lily-calendar {{ background-color: #{bg_recessed}; border: 1px solid #{accent1}; border-radius: {r_lg}px; color: #{fg_main}; padding: 4px; font-family: 'Josefin Sans', sans-serif; font-size: 13px; }}
+                calendar.lily-calendar {{ background-color: #{bg_recessed}; border: 1px solid #{accent1}; border-radius: {r_lg}px; color: #{fg_main}; padding: 4px; font-family: '{ui_font}', sans-serif; font-size: {fs_13}px; }}
                 calendar.lily-calendar > header {{ color: #{accent2}; font-weight: bold; border-bottom: 1px solid #{selection}; padding-bottom: 4px; }}
                 calendar.lily-calendar > grid > label.day-name {{ color: #{fg_muted}; font-weight: bold; }}
                 calendar.lily-calendar > grid > label.day-number {{ border-radius: {r_xs}px; padding: 3px; }}
@@ -300,23 +354,23 @@ fn init_theme() -> Rc<dyn Fn()> {
                 calendar.lily-calendar > grid > label.day-number.today {{ border: 1px solid #{accent1}; font-weight: bold; }}
                 calendar.lily-calendar > grid > label.day-number.other-month {{ opacity: 0.35; }}
                 
-                label {{ color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 16px; }}
+                label {{ color: #{fg_main}; font-family: '{ui_font}', sans-serif; font-size: {fs_16}px; }}
                 
-                .trigger-wrapper {{ min-width: 56px; min-height: 130px; }}
-                .trigger-btn {{ background-color: #{bg_pill}; border: 2px solid #{accent1}; border-left: none; border-top-right-radius: 100px; border-bottom-right-radius: 100px; min-width: 50px; min-height: 100px; padding: 0; transform: translateX(-36px); transition-property: transform, background-color; transition-duration: 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1); }}
+                .trigger-wrapper {{ min-width: 50px; min-height: {trig_h}px; }}
+                .trigger-btn {{ background-color: #{bg_pill}; border: 2px solid #{accent1}; {trig_edge_css} min-width: 50px; padding: 0; transition-property: transform, background-color; transition-duration: 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1); }}
                 .trigger-btn.peeking, .trigger-btn.riding {{ background-color: #{selection}; transform: translateX(0px); }}
                 
                 popover.fav-popover > contents {{ background-color: {bg_main_glass}; border: 1px solid {accent1_35}; border-radius: {r_lg}px; padding: 6px; }}
                 .fav-hide-btn {{ background-color: {fg_main_08}; border: none; border-radius: {r_sm}px; padding: 6px 12px; color: #{fg_main}; box-shadow: none; transition: background-color 0.15s ease; }}
                 .fav-hide-btn:hover {{ background-color: {fg_main_15}; }}
                 
-                .plan-detail-pane {{ background-color: {bg_main_glass}; border-left: 2px solid #{selection}; min-width: 400px; }}
+                .plan-detail-pane {{ background-color: {bg_main_glass}; {detail_border_css} min-width: 400px; }}
                 .plan-divider {{ background-color: #{selection}; border-radius: 1px; }}
-                .plan-h1 {{ color: #{accent2}; font-weight: bold; font-size: 19px; }}
-                .plan-h2 {{ color: #{accent2}; font-weight: bold; font-size: 16px; }}
-                .plan-step {{ color: #{accent2}; font-weight: bold; font-size: 15px; }}
-                .plan-body {{ color: #{fg_main}; font-size: 14px; }}
-                .plan-subnote {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 12px; }}
+                .plan-h1 {{ color: #{accent2}; font-weight: bold; font-size: {fs_19}px; }}
+                .plan-h2 {{ color: #{accent2}; font-weight: bold; font-size: {fs_16}px; }}
+                .plan-step {{ color: #{accent2}; font-weight: bold; font-size: {fs_15}px; }}
+                .plan-body {{ color: #{fg_main}; font-size: {fs_14}px; }}
+                .plan-subnote {{ color: #{accent2}; font-family: '{mono_font}', monospace; font-size: {fs_12}px; }}
                 .plan-checked-text {{ opacity: 0.55; text-decoration: line-through; }}
                 .plan-check-row {{ background-color: #{bg_recessed}; border: 1px solid #{selection}; border-radius: {r_md}px; padding: 6px 10px; }}
                 checkbutton.plan-checkbox > check {{ background-color: #{bg_pill}; border: 2px solid #{accent1}; border-radius: {r_chk}px; min-width: 18px; min-height: 18px; }}
@@ -325,12 +379,12 @@ fn init_theme() -> Rc<dyn Fn()> {
                 .plan-composer-dock {{ background-color: {bg_recessed_glass}; border-top: 1px solid {accent1_35}; padding: 10px 14px; }}
                 .plan-delete-menu-btn {{ background-color: rgba(243, 139, 168, 0.14); border: none; border-radius: {r_sm}px; padding: 6px 12px; color: #f38ba8; font-weight: bold; box-shadow: none; transition: background-color 0.15s ease; }}
                 .plan-delete-menu-btn:hover {{ background-color: rgba(243, 139, 168, 0.26); }}
-                .plan-line-del-btn {{ background-color: transparent; border: 1px solid transparent; border-radius: {r_xxs}px; padding: 0px 5px; color: #{fg_muted}; font-family: 'Josefin Sans', sans-serif; font-size: 14px; font-weight: bold; min-width: 24px; min-height: 24px; box-shadow: none; transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease; }}
-                .plan-line-del-btn label {{ color: #{fg_muted}; font-size: 14px; font-weight: bold; }}
+                .plan-line-del-btn {{ background-color: transparent; border: 1px solid transparent; border-radius: {r_xxs}px; padding: 0px 5px; color: #{fg_muted}; font-family: '{ui_font}', sans-serif; font-size: {fs_14}px; font-weight: bold; min-width: 24px; min-height: 24px; box-shadow: none; transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease; }}
+                .plan-line-del-btn label {{ color: #{fg_muted}; font-size: {fs_14}px; font-weight: bold; }}
                 .plan-line-del-btn:hover {{ background-color: rgba(243, 139, 168, 0.16); border-color: rgba(243, 139, 168, 0.42); color: #f38ba8; }}
                 .plan-line-del-btn:hover label {{ color: #f38ba8; }}
                 
-                .plan-drag-handle {{ color: #{accent2}; font-family: 'MesloLGL Nerd Font', monospace; font-size: 13px; font-weight: bold; padding: 2px 4px; opacity: 0.7; }}
+                .plan-drag-handle {{ color: #{accent2}; font-family: '{mono_font}', monospace; font-size: {fs_13}px; font-weight: bold; padding: 2px 4px; opacity: 0.7; }}
                 .plan-edit-row {{ border: 1px solid transparent; border-radius: {r_xs}px; padding: 2px 4px; transition: background-color 0.1s ease, border-color 0.1s ease; }}
                 .plan-edit-row:hover {{ background-color: #{bg_recessed}; }}
                 .plan-edit-row.dragging {{ opacity: 0.4; }}
@@ -352,7 +406,7 @@ fn init_theme() -> Rc<dyn Fn()> {
                 .sticky-tint-4 {{ background-color: rgba(34, 24, 44, 0.72); border-color: rgba(203, 166, 247, 0.55); }}
                 .sticky-header {{ background-color: {bg_recessed_glass}; border-bottom: 1px solid {accent1_35}; border-top-left-radius: {r_lg}px; border-top-right-radius: {r_lg}px; padding: 4px 6px; }}
                 .sticky-mini-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_xxs}px; padding: 2px 7px; min-width: 22px; min-height: 22px; color: #{fg_main}; box-shadow: none; transition: background-color 0.15s ease; }}
-                .sticky-mini-btn label {{ font-family: 'MesloLGL Nerd Font', 'Josefin Sans', sans-serif; font-size: 11px; font-weight: bold; color: #{fg_main}; }}
+                .sticky-mini-btn label {{ font-family: '{mono_font}', '{ui_font}', sans-serif; font-size: {fs_11}px; font-weight: bold; color: #{fg_main}; }}
                 .sticky-mini-btn:hover {{ background-color: {fg_main_15}; }}
                 .sticky-mini-btn.active {{ background-color: {accent1_24}; }}
                 .sticky-mini-btn.active label {{ color: #{accent2}; }}
@@ -366,11 +420,92 @@ fn init_theme() -> Rc<dyn Fn()> {
                 .sticky-ink-2 label {{ color: #89b4fa; }}
                 .sticky-ink-3 label {{ color: #a6e3a1; }}
                 .sticky-ink-4 label {{ color: #fab387; }}
-                textview.sticky-text, textview.sticky-text text {{ background-color: transparent; color: #{fg_main}; font-family: 'Josefin Sans', sans-serif; font-size: 14px; }}
+                textview.sticky-text, textview.sticky-text text {{ background-color: transparent; color: #{fg_main}; font-family: '{ui_font}', sans-serif; font-size: {fs_14}px; }}
                 "#
             );
-            
-            provider.load_from_data(&css);
+
+            // Button style overrides ("tonal" uses the base CSS above)
+            let pill_rad = if r_scale > 0.01 { 999 } else { 0 };
+            let btn_style_css = match cfg.button_style.as_str() {
+                "outlined" => format!(
+                    r#"
+                    .plan-fmt-btn, .plan-close-btn, .power-btn, .session-restore-btn, .ws-pill-btn, .top-tool-btn, .sticky-mini-btn, .fav-hide-btn {{ background-color: {fg_main_04}; border: 1px solid {accent1_38}; }}
+                    .plan-fmt-btn:hover, .plan-close-btn:hover, .power-btn:hover, .session-restore-btn:hover, .ws-pill-btn:hover, .top-tool-btn:hover, .sticky-mini-btn:hover, .fav-hide-btn:hover {{ background-color: {accent1_15}; border-color: #{accent2}; }}
+                    .plan-fmt-btn.active, .plan-close-btn.active, .power-btn.active, .ws-pill-btn.active, .sticky-mini-btn.active, .primary-btn {{ background-color: {accent1_24}; border: 1px solid #{accent2}; }}
+                    .sidebar-nav-btn {{ border: 1px solid transparent; }}
+                    .sidebar-nav-btn:hover {{ background-color: {accent1_15}; border-color: {accent1_38}; }}
+                    .sidebar-nav-btn.selected {{ background-color: {accent1_15}; border: 1px solid #{accent2}; }}
+                    .sidebar-nav-btn.selected label {{ color: #{accent2}; }}
+                    .plan-delete-menu-btn, .power-btn.armed {{ background-color: transparent; border: 1px solid rgba(243, 139, 168, 0.65); }}
+                    .plan-delete-menu-btn:hover {{ background-color: rgba(243, 139, 168, 0.18); }}
+                    "#
+                ),
+                "pill" => format!(
+                    r#"
+                    .plan-fmt-btn, .plan-close-btn, .primary-btn, .power-btn, .session-restore-btn, .ws-pill-btn, .top-tool-btn, .sticky-mini-btn, .fav-hide-btn, .plan-delete-menu-btn, .sidebar-nav-btn {{ border-radius: {pill_rad}px; }}
+                    .plan-fmt-btn.active, .plan-close-btn.active, .power-btn.active, .ws-pill-btn.active, .sticky-mini-btn.active, .primary-btn, .sidebar-nav-btn.selected {{ border: 1px solid {accent1_55}; background-color: {accent1_24}; }}
+                    .sidebar-nav-btn.selected label {{ color: #{accent2}; }}
+                    "#
+                ),
+                "solid" => format!(
+                    r#"
+                    .plan-fmt-btn, .plan-close-btn, .power-btn, .session-restore-btn, .ws-pill-btn, .top-tool-btn, .sticky-mini-btn, .fav-hide-btn {{ background-color: #{bg_pill}; border: 1px solid {fg_main_08}; }}
+                    .plan-fmt-btn:hover, .plan-close-btn:hover, .power-btn:hover, .session-restore-btn:hover, .ws-pill-btn:hover, .top-tool-btn:hover, .sticky-mini-btn:hover, .fav-hide-btn:hover {{ background-color: {accent1_24}; }}
+                    .plan-fmt-btn.active, .plan-close-btn.active, .power-btn.active, .ws-pill-btn.active, .sticky-mini-btn.active, .primary-btn, .sidebar-nav-btn.selected {{ background-color: #{accent2}; border: 1px solid #{accent2}; color: #{bg_contrast}; }}
+                    .plan-fmt-btn.active label, .plan-close-btn.active label, .power-btn.active label, .power-btn.active .power-btn-lbl, .ws-pill-btn.active label, .sticky-mini-btn.active label, .primary-btn label, .sidebar-nav-btn.selected label {{ color: #{bg_contrast}; }}
+                    .primary-btn:hover {{ background-color: #{accent1}; }}
+                    .primary-btn:hover label {{ color: #{bg_contrast}; }}
+                    .plan-delete-menu-btn, .power-btn.armed {{ background-color: #f38ba8; border: 1px solid #f38ba8; color: #{bg_contrast}; }}
+                    .plan-delete-menu-btn label, .power-btn.armed .power-btn-lbl {{ color: #{bg_contrast}; }}
+                    "#
+                ),
+                "neon" => format!(
+                    r#"
+                    .plan-fmt-btn, .plan-close-btn, .power-btn, .session-restore-btn, .ws-pill-btn, .top-tool-btn, .sticky-mini-btn, .fav-hide-btn {{ background-color: #{bg_recessed}; border: 1px solid {accent1_38}; }}
+                    .plan-fmt-btn:hover, .plan-close-btn:hover, .power-btn:hover, .session-restore-btn:hover, .ws-pill-btn:hover, .top-tool-btn:hover, .sticky-mini-btn:hover, .fav-hide-btn:hover {{ border-color: #{accent2}; box-shadow: 0px 0px 8px {accent1_55}; }}
+                    .plan-fmt-btn.active, .plan-close-btn.active, .power-btn.active, .ws-pill-btn.active, .sticky-mini-btn.active, .primary-btn, .sidebar-nav-btn.selected {{ background-color: {accent1_24}; border: 1px solid #{accent2}; box-shadow: 0px 0px 9px {accent1_55}; }}
+                    .sidebar-nav-btn:hover {{ border: 1px solid {accent1_38}; box-shadow: 0px 0px 6px {accent1_38}; }}
+                    .sidebar-nav-btn.selected label {{ color: #{accent2}; }}
+                    .plan-delete-menu-btn, .power-btn.armed {{ background-color: rgba(243, 139, 168, 0.14); border: 1px solid #f38ba8; box-shadow: 0px 0px 8px rgba(243, 139, 168, 0.45); }}
+                    "#
+                ),
+                "ghost" => format!(
+                    r#"
+                    .plan-fmt-btn, .plan-close-btn, .power-btn, .session-restore-btn, .ws-pill-btn, .top-tool-btn, .sticky-mini-btn, .fav-hide-btn {{ background-color: transparent; border: 1px solid transparent; }}
+                    .plan-fmt-btn:hover, .plan-close-btn:hover, .power-btn:hover, .session-restore-btn:hover, .ws-pill-btn:hover, .top-tool-btn:hover, .sticky-mini-btn:hover, .fav-hide-btn:hover {{ background-color: {fg_main_08}; }}
+                    .plan-fmt-btn.active, .plan-close-btn.active, .power-btn.active, .ws-pill-btn.active, .sticky-mini-btn.active, .primary-btn, .sidebar-nav-btn.selected {{ background-color: {fg_main_06}; border: none; border-bottom: 2px solid #{accent2}; border-radius: {r_chk}px {r_chk}px 2px 2px; }}
+                    .sidebar-nav-btn.selected label {{ color: #{accent2}; }}
+                    .plan-delete-menu-btn {{ background-color: transparent; }}
+                    .plan-delete-menu-btn:hover {{ background-color: rgba(243, 139, 168, 0.16); }}
+                    "#
+                ),
+                _ => String::new(),
+            };
+
+            let preview_css = format!(
+                r#"
+                .btn-preview-tonal {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 6px 11px; color: #{fg_main}; box-shadow: none; }}
+                .btn-preview-tonal.active {{ background-color: {accent1_24}; }}
+                .btn-preview-tonal.active label {{ color: #{accent2}; }}
+                .btn-preview-outlined {{ background-color: {fg_main_04}; border: 1px solid {accent1_38}; border-radius: {r_md}px; padding: 6px 11px; color: #{fg_main}; box-shadow: none; }}
+                .btn-preview-outlined:hover, .btn-preview-outlined.active {{ background-color: {accent1_24}; border-color: #{accent2}; }}
+                .btn-preview-outlined.active label {{ color: #{accent2}; }}
+                .btn-preview-pill {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {pill_rad}px; padding: 6px 13px; color: #{fg_main}; box-shadow: none; }}
+                .btn-preview-pill.active {{ background-color: {accent1_24}; border: 1px solid {accent1_55}; }}
+                .btn-preview-pill.active label {{ color: #{accent2}; }}
+                .btn-preview-solid {{ background-color: #{accent2}; border: 1px solid #{accent2}; border-radius: {r_md}px; padding: 6px 11px; color: #{bg_contrast}; box-shadow: none; }}
+                .btn-preview-solid label {{ color: #{bg_contrast}; }}
+                .btn-preview-solid:hover {{ background-color: #{accent1}; }}
+                .btn-preview-neon {{ background-color: #{bg_recessed}; border: 1px solid #{accent2}; border-radius: {r_md}px; padding: 6px 11px; color: #{accent2}; box-shadow: 0px 0px 9px {accent1_55}; }}
+                .btn-preview-neon label {{ color: #{accent2}; }}
+                .btn-preview-ghost {{ background-color: transparent; border: none; border-bottom: 2px solid {accent1_55}; border-radius: {r_chk}px {r_chk}px 2px 2px; padding: 6px 11px; color: #{fg_main}; box-shadow: none; }}
+                .btn-preview-ghost.active {{ background-color: {fg_main_06}; border-bottom-color: #{accent2}; }}
+                .btn-preview-ghost.active label {{ color: #{accent2}; }}
+                "#
+            );
+
+            let full_css = format!("{}\n{}\n{}", css, btn_style_css, preview_css);
+            provider.load_from_data(&full_css);
 
             let scrollbar_css = format!(
                 r#"
@@ -425,33 +560,41 @@ fn init_theme() -> Rc<dyn Fn()> {
 
 fn update_input_region(window: &ApplicationWindow, is_open: bool, dash_width: i32) {
     if let Some(surface) = window.surface() {
+        let cfg = config::get();
+        let is_right = cfg.layout.side == "right";
+        let trig_h = match cfg.layout.trigger_size.as_str() {
+            "small" => 72,
+            "large" => 140,
+            _ => 100,
+        };
         let height = window.height().max(1080);
+        let win_w = window.width().max(TOTAL_DASH_WIDTH + TRIGGER_WIDTH);
         let region = if !is_open {
-            let center_y = height / 2;
-            Region::create_rectangle(&RectangleInt::new(
-                0,
-                (center_y - 75).max(0),
-                10,
-                104,
-            ))
+            let y = match cfg.layout.trigger_align.as_str() {
+                "top" => 16,
+                "bottom" => (height - trig_h - 16).max(0),
+                _ => ((height - trig_h) / 2).max(0),
+            };
+            let x = if is_right { (win_w - 10).max(0) } else { 0 };
+            Region::create_rectangle(&RectangleInt::new(x, y, 10, trig_h + 12))
         } else {
-            // Dynamically hug the EXACT rendered width of the dashboard
-            let w = if dash_width > 0 { dash_width } else { BASE_DASH_WIDTH };
-            Region::create_rectangle(&RectangleInt::new(
-                0,
-                0,
-                w + TRIGGER_WIDTH,
-                height,
-            ))
+            let base_w = cfg.layout.panel_width.clamp(340, 560);
+            let w = if dash_width > 0 { dash_width } else { base_w };
+            let total_w = w + TRIGGER_WIDTH;
+            let x = if is_right { (win_w - total_w).max(0) } else { 0 };
+            Region::create_rectangle(&RectangleInt::new(x, 0, total_w, height))
         };
         surface.set_input_region(&region);
-        
-        // Force a Wayland surface commit so the new invisible hitbox actually applies!
         window.queue_draw();
     }
 }
 fn move_to_monitor(window: &ApplicationWindow, target: Option<&str>) {
-    let mut active_name = target.map(|s| s.to_string());
+    let pinned = config::get().layout.pinned_monitor;
+    let mut active_name = if !pinned.trim().is_empty() {
+        Some(pinned)
+    } else {
+        target.map(|s| s.to_string())
+    };
 
     // Fallback to hyprctl if no explicit target provided (e.g., on first launch)
     if active_name.is_none() {
@@ -530,23 +673,31 @@ fn build_ui(
         gtk4::STYLE_PROVIDER_PRIORITY_USER,
     );
 
-    let last_dash_width = Rc::new(Cell::new(400));
-    let dash_watch = dash_box.clone();
+    let last_dash_width = Rc::new(Cell::new(0));
+    let last_side_right = Rc::new(Cell::new(config::get().layout.side == "right"));
+    let dyn_off_prov_tick = dynamic_offset_provider.clone();
     let last_w_watch = last_dash_width.clone();
+    let last_side_watch = last_side_right.clone();
     dash_box.add_tick_callback(move |box_widget, _| {
         let w = box_widget.width();
-        if w > 0 && w != last_w_watch.get() {
+        let is_right = config::get().layout.side == "right";
+        if w > 0 && (w != last_w_watch.get() || is_right != last_side_watch.get()) {
             last_w_watch.set(w);
-            let push_back = w + 10; // Always push 15px past the exact rendered width!
-            dynamic_offset_provider.load_from_data(&format!(
-                ".drawer-container {{ transform: translateX(-{}px); }}
+            last_side_watch.set(is_right);
+            let push_back = w + 10;
+            let closed_val = if is_right {
+                format!("{}px", push_back)
+            } else {
+                format!("-{}px", push_back)
+            };
+            dyn_off_prov_tick.load_from_data(&format!(
+                ".drawer-container {{ transform: translateX({}); }}
                  .drawer-container.open {{ transform: translateX(0px); }}",
-                push_back
+                closed_val
             ));
         }
         glib::ControlFlow::Continue
     });
-    let _ = dash_watch;
 
     let stack = Stack::new();
     stack.set_hhomogeneous(false);
@@ -573,7 +724,7 @@ fn build_ui(
         .child(&sidebar_column)
         .build();
 
-    // Grouped sidebar navigation with 1px horizontal dividers between groups
+    // Dynamic sidebar navigation rebuilt from `config.layout.sidebar_items` (tabs + "---" separators)
     let sidebar_nav = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(1)
@@ -581,71 +732,72 @@ fn build_ui(
         .vexpand(true)
         .build();
 
-    let nav_groups: &[&[(&str, &str)]] = &[
-        &[("run", "Run"), ("favs", "Favorites"), ("clipboard", "Clipboard")],
-        &[("plans", "Plans"), ("calendar", "Calendar"), ("timers", "Timers")],
-        &[("music", "Music")],
-        &[("drive", "Drive"), ("passwords", "Passwords"), ("locker", "Locker")],
-        &[("system", "System")],
-    ];
+    let nav_buttons_rc: Rc<RefCell<Vec<(String, Button)>>> = Rc::new(RefCell::new(Vec::new()));
 
-    let mut nav_buttons: Vec<(&'static str, Button)> = Vec::new();
-    let mut nav_seps: Vec<(usize, Box)> = Vec::new();
-    for (gi, group) in nav_groups.iter().enumerate() {
-        if gi > 0 {
-            let sep = Box::builder()
-                .orientation(Orientation::Horizontal)
-                .height_request(1)
-                .css_classes(vec!["sidebar-sep".to_string()])
-                .build();
-            sidebar_nav.append(&sep);
-            nav_seps.push((gi, sep));
-        }
-        for &(id, title) in *group {
-            let lbl = Label::builder()
-                .label(title)
-                .halign(gtk4::Align::Start)
-                .hexpand(true)
-                .build();
-            let btn = Button::builder()
-                .child(&lbl)
-                .css_classes(vec!["sidebar-nav-btn".to_string()])
-                .build();
-            let stack_click = stack.clone();
-            btn.connect_clicked(move |_| {
-                stack_click.set_visible_child_name(id);
-            });
-            sidebar_nav.append(&btn);
-            nav_buttons.push((id, btn));
-        }
-    }
+    let rebuild_sidebar_nav: Rc<dyn Fn()> = {
+        let snav = sidebar_nav.clone();
+        let stk = stack.clone();
+        let nbtns = nav_buttons_rc.clone();
+        Rc::new(move || {
+            while let Some(c) = snav.first_child() {
+                snav.remove(&c);
+            }
+            nbtns.borrow_mut().clear();
 
+            let cfg = config::get();
+            let active_name = stk.visible_child_name().map(|s| s.to_string());
+
+            for item in &cfg.layout.sidebar_items {
+                if item == "---" {
+                    let sep = Box::builder()
+                        .orientation(Orientation::Horizontal)
+                        .height_request(1)
+                        .css_classes(vec!["sidebar-sep".to_string()])
+                        .build();
+                    snav.append(&sep);
+                } else if let Some(&(_, title)) = config::ALL_TAB_IDS.iter().find(|(id, _)| *id == item.as_str()) {
+                    let lbl = Label::builder()
+                        .label(title)
+                        .halign(gtk4::Align::Start)
+                        .hexpand(true)
+                        .build();
+                    let mut classes = vec!["sidebar-nav-btn".to_string()];
+                    if active_name.as_deref() == Some(item.as_str()) {
+                        classes.push("selected".to_string());
+                    }
+                    let btn = Button::builder()
+                        .child(&lbl)
+                        .css_classes(classes)
+                        .build();
+                    let stack_click = stk.clone();
+                    let id_s = item.clone();
+                    btn.connect_clicked(move |_| {
+                        stack_click.set_visible_child_name(&id_s);
+                    });
+                    snav.append(&btn);
+                    nbtns.borrow_mut().push((item.clone(), btn));
+                }
+            }
+        })
+    };
+
+    let layout_rebuild_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let power_rebuild_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
     let apply_tab_visibility: Rc<dyn Fn()> = {
-        let btns = nav_buttons.clone();
-        let seps = nav_seps.clone();
+        let rebuild_nav = rebuild_sidebar_nav.clone();
+        let pwr_slot = power_rebuild_slot.clone();
+        let lay_slot = layout_rebuild_slot.clone();
         Rc::new(move || {
             let vis = config::get().visible_tabs;
-            let is_vis = |id: &str| match id {
-                "favs" => vis.favorites,
-                "clipboard" => vis.clipboard,
-                "plans" => vis.plans,
-                "calendar" => vis.calendar,
-                "timers" => vis.timers,
-                "music" => vis.music,
-                "drive" => vis.drive,
-                "passwords" => vis.passwords,
-                "locker" => vis.locker,
-                _ => true,
-            };
-            for (id, btn) in &btns {
-                btn.set_visible(is_vis(id));
-            }
-            for (gi, sep) in &seps {
-                let any_in_group = nav_groups[*gi].iter().any(|(id, _)| is_vis(id));
-                sep.set_visible(any_in_group);
-            }
+            rebuild_nav();
             favorites::set_scoring_enabled(vis.favorites);
             clipboard::set_watcher_enabled(vis.clipboard);
+            if let Some(rebuild_pwr) = pwr_slot.borrow().as_ref() {
+                rebuild_pwr();
+            }
+            if let Some(rebuild_lay) = lay_slot.borrow().as_ref() {
+                rebuild_lay();
+            }
         })
     };
     apply_tab_visibility();
@@ -855,7 +1007,9 @@ fn build_ui(
     session_row.append(&sess_save_btn);
     session_row.append(&sess_auto_btn);
 
-    // Two-button Power / Restart row with two-step "Sure?" confirmation
+    let popover_guard = Rc::new(Cell::new(0usize));
+
+    // Modular 1–3 button Power row (Shutdown, Reboot, Log Out, Suspend, Lock, or Dropdown Menu)
     let power_row = Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(6)
@@ -866,107 +1020,198 @@ fn build_ui(
         .margin_bottom(14)
         .build();
 
-    let poweroff_lbl = Label::builder()
-        .label("")
-        .css_classes(vec!["power-btn-lbl".to_string()])
-        .build();
-    let poweroff_btn = Button::builder()
-        .child(&poweroff_lbl)
-        .css_classes(vec!["power-btn".to_string()])
-        .tooltip_text("Power off (click again to confirm)")
-        .build();
-
-    let reboot_lbl = Label::builder()
-        .label("󰜉")
-        .css_classes(vec!["power-btn-lbl".to_string()])
-        .build();
-    let reboot_btn = Button::builder()
-        .child(&reboot_lbl)
-        .css_classes(vec!["power-btn".to_string()])
-        .tooltip_text("Restart (click again to confirm)")
-        .build();
-
-    let armed_power: Rc<Cell<Option<u8>>> = Rc::new(Cell::new(None));
-    let armed_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-
-    {
-        let armed_c = armed_power.clone();
-        let gen_c = armed_gen.clone();
-        let po_btn = poweroff_btn.clone();
-        let po_lbl = poweroff_lbl.clone();
-        let rb_btn = reboot_btn.clone();
-        let rb_lbl = reboot_lbl.clone();
-        poweroff_btn.connect_clicked(move |_| {
-            if armed_c.get() == Some(0) {
-                armed_c.set(None);
-                let _ = std::process::Command::new("systemctl")
-                    .arg("poweroff")
-                    .spawn();
-                return;
+    let rebuild_power_row: Rc<dyn Fn()> = {
+        let p_row = power_row.clone();
+        let p_guard = popover_guard.clone();
+        Rc::new(move || {
+            while let Some(child) = p_row.first_child() {
+                p_row.remove(&child);
             }
-            armed_c.set(Some(0));
-            let my_gen = gen_c.get().wrapping_add(1);
-            gen_c.set(my_gen);
 
-            po_lbl.set_label("Sure?");
-            po_btn.add_css_class("armed");
-            rb_lbl.set_label("󰜉");
-            rb_btn.remove_css_class("armed");
+            let pcfg = config::get().power;
+            let count = pcfg.count.clamp(1, 3);
+            let armed_slot: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+            let armed_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+            let slot_widgets: Rc<RefCell<Vec<(Button, Label, &'static str)>>> =
+                Rc::new(RefCell::new(Vec::new()));
 
-            let armed_r = armed_c.clone();
-            let gen_r = gen_c.clone();
-            let po_btn_r = po_btn.clone();
-            let po_lbl_r = po_lbl.clone();
-            glib::timeout_add_local_once(Duration::from_secs(3), move || {
-                if gen_r.get() == my_gen && armed_r.get() == Some(0) {
-                    armed_r.set(None);
-                    po_lbl_r.set_label("");
-                    po_btn_r.remove_css_class("armed");
+            let action_meta = |act: &str| -> (&'static str, &'static str, bool) {
+                match act {
+                    "shutdown" => ("", "Power Off (click again to confirm)", true),
+                    "reboot" => ("󰜉", "Reboot (click again to confirm)", true),
+                    "logout" => ("󰍃", "Log Out (click again to confirm)", true),
+                    "suspend" => ("󰤄", "Suspend", false),
+                    "lock" => ("󰌾", "Lock Screen", false),
+                    "menu" => (" ▾", "Power Menu", false),
+                    _ => ("", "Power Off (click again to confirm)", true),
                 }
-            });
-        });
-    }
+            };
 
-    {
-        let armed_c = armed_power.clone();
-        let gen_c = armed_gen.clone();
-        let po_btn = poweroff_btn.clone();
-        let po_lbl = poweroff_lbl.clone();
-        let rb_btn = reboot_btn.clone();
-        let rb_lbl = reboot_lbl.clone();
-        reboot_btn.connect_clicked(move |_| {
-            if armed_c.get() == Some(1) {
-                armed_c.set(None);
-                let _ = std::process::Command::new("systemctl")
-                    .arg("reboot")
-                    .spawn();
-                return;
+            for idx in 0..count {
+                let act = pcfg.slots[idx].clone();
+                let (icon, tip, needs_confirm) = action_meta(&act);
+                let lbl = Label::builder()
+                    .label(icon)
+                    .css_classes(vec!["power-btn-lbl".to_string()])
+                    .build();
+                let btn = Button::builder()
+                    .child(&lbl)
+                    .css_classes(vec!["power-btn".to_string()])
+                    .tooltip_text(tip)
+                    .build();
+
+                slot_widgets.borrow_mut().push((btn.clone(), lbl.clone(), icon));
+
+                if act == "menu" {
+                    let guard_m = p_guard.clone();
+                    let pcfg_m = pcfg.clone();
+                    let btn_weak = btn.downgrade();
+                    btn.connect_clicked(move |_| {
+                        let Some(parent_btn) = btn_weak.upgrade() else {
+                            return;
+                        };
+                        let pop = gtk4::Popover::builder()
+                            .css_classes(vec!["fav-popover".to_string()])
+                            .autohide(true)
+                            .build();
+                        pop.set_parent(&parent_btn);
+                        pop.connect_closed(|p| {
+                            let pw = p.downgrade();
+                            glib::idle_add_local_once(move || {
+                                if let Some(p) = pw.upgrade() {
+                                    p.unparent();
+                                }
+                            });
+                        });
+                        let gm = guard_m.clone();
+                        pop.connect_map(move |_| gm.set(gm.get() + 1));
+                        let gu = guard_m.clone();
+                        pop.connect_unmap(move |_| {
+                            let g = gu.clone();
+                            glib::timeout_add_local_once(Duration::from_millis(150), move || {
+                                g.set(g.get().saturating_sub(1));
+                            });
+                        });
+
+                        let menu_box = Box::builder()
+                            .orientation(Orientation::Vertical)
+                            .spacing(4)
+                            .build();
+
+                        let items: &[(&str, &str, bool, bool)] = &[
+                            ("lock", "󰌾  Lock", pcfg_m.menu_lock, false),
+                            ("suspend", "󰤄  Suspend", pcfg_m.menu_suspend, false),
+                            ("logout", "󰍃  Log Out", pcfg_m.menu_logout, true),
+                            ("reboot", "󰜉  Reboot", pcfg_m.menu_reboot, true),
+                            ("shutdown", "  Shutdown", pcfg_m.menu_shutdown, true),
+                        ];
+
+                        let mut added = 0;
+                        for &(act_key, title, enabled, destructive) in items {
+                            if !enabled {
+                                continue;
+                            }
+                            added += 1;
+                            let item_btn = Button::builder()
+                                .label(title)
+                                .css_classes(vec![if destructive {
+                                    "plan-delete-menu-btn".to_string()
+                                } else {
+                                    "fav-hide-btn".to_string()
+                                }])
+                                .build();
+                            let armed_item = Rc::new(Cell::new(false));
+                            let pop_w = pop.downgrade();
+                            item_btn.connect_clicked(move |b| {
+                                if destructive && !armed_item.get() {
+                                    armed_item.set(true);
+                                    b.set_label(&format!("Sure? {}", title));
+                                    let ai = armed_item.clone();
+                                    let br = b.clone();
+                                    glib::timeout_add_local_once(Duration::from_secs(3), move || {
+                                        if ai.get() {
+                                            ai.set(false);
+                                            br.set_label(title);
+                                        }
+                                    });
+                                    return;
+                                }
+                                if let Some(p) = pop_w.upgrade() {
+                                    p.popdown();
+                                }
+                                config::run_power_action(act_key);
+                            });
+                            menu_box.append(&item_btn);
+                        }
+
+                        if added == 0 {
+                            menu_box.append(
+                                &Label::builder()
+                                    .label("No menu actions enabled")
+                                    .css_classes(vec!["plan-subnote".to_string()])
+                                    .margin_top(4)
+                                    .margin_bottom(4)
+                                    .build(),
+                            );
+                        }
+
+                        pop.set_child(Some(&menu_box));
+                        pop.popup();
+                    });
+                } else if needs_confirm {
+                    let armed_c = armed_slot.clone();
+                    let gen_c = armed_gen.clone();
+                    let all_w = slot_widgets.clone();
+                    let act_s = act.clone();
+                    let my_btn = btn.clone();
+                    let my_lbl = lbl.clone();
+                    btn.connect_clicked(move |_| {
+                        if armed_c.get() == Some(idx) {
+                            armed_c.set(None);
+                            my_lbl.set_label(icon);
+                            my_btn.remove_css_class("armed");
+                            config::run_power_action(&act_s);
+                            return;
+                        }
+                        armed_c.set(Some(idx));
+                        let my_gen = gen_c.get().wrapping_add(1);
+                        gen_c.set(my_gen);
+
+                        for (i, (ob, ol, oicon)) in all_w.borrow().iter().enumerate() {
+                            if i == idx {
+                                ol.set_label("Sure?");
+                                ob.add_css_class("armed");
+                            } else {
+                                ol.set_label(oicon);
+                                ob.remove_css_class("armed");
+                            }
+                        }
+
+                        let ar = armed_c.clone();
+                        let gr = gen_c.clone();
+                        let br = my_btn.clone();
+                        let lr = my_lbl.clone();
+                        glib::timeout_add_local_once(Duration::from_secs(3), move || {
+                            if gr.get() == my_gen && ar.get() == Some(idx) {
+                                ar.set(None);
+                                lr.set_label(icon);
+                                br.remove_css_class("armed");
+                            }
+                        });
+                    });
+                } else {
+                    let act_s = act.clone();
+                    btn.connect_clicked(move |_| {
+                        config::run_power_action(&act_s);
+                    });
+                }
+
+                p_row.append(&btn);
             }
-            armed_c.set(Some(1));
-            let my_gen = gen_c.get().wrapping_add(1);
-            gen_c.set(my_gen);
-
-            rb_lbl.set_label("Sure?");
-            rb_btn.add_css_class("armed");
-            po_lbl.set_label("");
-            po_btn.remove_css_class("armed");
-
-            let armed_r = armed_c.clone();
-            let gen_r = gen_c.clone();
-            let rb_btn_r = rb_btn.clone();
-            let rb_lbl_r = rb_lbl.clone();
-            glib::timeout_add_local_once(Duration::from_secs(3), move || {
-                if gen_r.get() == my_gen && armed_r.get() == Some(1) {
-                    armed_r.set(None);
-                    rb_lbl_r.set_label("󰜉");
-                    rb_btn_r.remove_css_class("armed");
-                }
-            });
-        });
-    }
-
-    power_row.append(&poweroff_btn);
-    power_row.append(&reboot_btn);
+        })
+    };
+    *power_rebuild_slot.borrow_mut() = Some(rebuild_power_row.clone());
+    rebuild_power_row();
 
     // Create the weather tab AND the compact sidebar weather button
     let (weather_page, weather_sidebar_btn) = weather::build_weather_ui(&stack);
@@ -1079,7 +1324,6 @@ fn build_ui(
     let is_hovered = Rc::new(Cell::new(false));
     let is_open = Rc::new(Cell::new(false));
     let is_closing = Rc::new(Cell::new(false));
-    let popover_guard = Rc::new(Cell::new(0usize));
 
     let plans_ui = plans::build_plans_ui(popover_guard.clone(), move |_expand| {
         // We don't need to manually update the hitbox here anymore!
@@ -1217,14 +1461,14 @@ fn build_ui(
     let run_search_c = run_search_slot.clone();
     let system_ui_c = system_ui_slot.clone();
 
-    let nav_buttons_sync = nav_buttons.clone();
+    let nav_buttons_sync = nav_buttons_rc.clone();
 
     stack.connect_visible_child_name_notify(move |stk| {
         let current = stk.visible_child_name();
         let name = current.as_deref();
 
-        for (id, btn) in &nav_buttons_sync {
-            if name == Some(*id) {
+        for (id, btn) in nav_buttons_sync.borrow().iter() {
+            if name == Some(id.as_str()) {
                 btn.add_css_class("selected");
             } else {
                 btn.remove_css_class("selected");
@@ -1335,7 +1579,11 @@ fn build_ui(
                         apply_tabs_for_sys.clone(),
                     );
                     system_slot_c.append(&sys_ui.list_view);
-                    dash_for_sys.append(&sys_ui.detail_view);
+                    if config::get().layout.side == "right" {
+                        dash_for_sys.prepend(&sys_ui.detail_view);
+                    } else {
+                        dash_for_sys.append(&sys_ui.detail_view);
+                    }
                     *system_ui_c.borrow_mut() = Some(sys_ui);
                 }
                 if let Some(sys) = system_ui_c.borrow().as_ref() {
@@ -1385,8 +1633,110 @@ fn build_ui(
     stack.add_titled(&clipboard_slot, Some("clipboard"), "Clipboard");
     stack.add_titled(&system_slot, Some("system"), "System");
 
-    // Default to the Run tab on startup
-    stack.set_visible_child_name("run");
+    // Default to the user's configured default tab on startup
+    let startup_tab = config::get().layout.default_tab;
+    stack.set_visible_child_name(if startup_tab.is_empty() { "run" } else { &startup_tab });
+
+    // Live Layout & Chrome applier (full left/right mirror, flush trigger, monitor pin,
+    // panel width, and individual chrome toggles)
+    let apply_layout_and_chrome: Rc<dyn Fn()> = {
+        let win_l = window.clone();
+        let dc_l = drawer_container.clone();
+        let db_l = dash_box.clone();
+        let mc_l = main_col.clone();
+        let br_l = body_row.clone();
+        let sbc_l = sidebar_clamp.clone();
+        let sc_l = stack_clamp.clone();
+        let stk_l = stack.clone();
+        let tw_l = trigger_wrapper.clone();
+        let tb_l = trigger_btn.clone();
+        let open_l = is_open.clone();
+        let plan_det_l = plans_ui.detail_view.clone();
+        let sys_slot_l = system_ui_slot.clone();
+        let ws_w = workspaces_widget.clone();
+        let tr_w = tray_widget.clone();
+        let st_w = status_strip.clone();
+        let sr_w = session_row.clone();
+        let pr_w = power_row.clone();
+        let we_w = weather_sidebar_btn.clone();
+        let cl_w = clock_btn.clone();
+        let rl_w = reload_btn.clone();
+
+        Rc::new(move || {
+            let cfg = config::get();
+            let lay = &cfg.layout;
+            let is_right = lay.side == "right";
+
+            // 1. Anchor & mirror entire layout (trigger + detail panes + sidebar column!)
+            win_l.set_anchor(Edge::Left, !is_right);
+            win_l.set_anchor(Edge::Right, is_right);
+            dc_l.set_halign(if is_right {
+                gtk4::Align::End
+            } else {
+                gtk4::Align::Start
+            });
+            tb_l.set_halign(if is_right {
+                gtk4::Align::End
+            } else {
+                gtk4::Align::Start
+            });
+            if is_right {
+                dc_l.reorder_child_after(&db_l, Some(&tw_l));
+                // Mirror sidebar nav to hug the right screen edge
+                br_l.reorder_child_after(&sbc_l, Some(&sc_l));
+                // Mirror detail panes inward (to the left of main_col)
+                db_l.reorder_child_after(&mc_l, Some(&plan_det_l));
+                if let Some(sys) = sys_slot_l.borrow().as_ref() {
+                    db_l.reorder_child_after(&sys.detail_view, Some(&plan_det_l));
+                    db_l.reorder_child_after(&mc_l, Some(&sys.detail_view));
+                }
+            } else {
+                dc_l.reorder_child_after(&tw_l, Some(&db_l));
+                // Standard left-edge layout: sidebar on left, detail panes on right
+                br_l.reorder_child_after(&sc_l, Some(&sbc_l));
+                db_l.reorder_child_after(&plan_det_l, Some(&mc_l));
+                if let Some(sys) = sys_slot_l.borrow().as_ref() {
+                    db_l.reorder_child_after(&sys.detail_view, Some(&plan_det_l));
+                }
+            }
+
+            // 2. Trigger vertical alignment
+            let valign = match lay.trigger_align.as_str() {
+                "top" => gtk4::Align::Start,
+                "bottom" => gtk4::Align::End,
+                _ => gtk4::Align::Center,
+            };
+            tw_l.set_valign(valign);
+            tw_l.set_margin_top(if lay.trigger_align == "top" { 16 } else { 0 });
+            tw_l.set_margin_bottom(if lay.trigger_align == "bottom" { 16 } else { 0 });
+
+            // 3. Panel width
+            let pw = lay.panel_width.clamp(340, 560);
+            let stack_w = (pw - 112).max(220);
+            db_l.set_width_request(pw);
+            mc_l.set_width_request(pw - 2);
+            sc_l.set_min_content_width(stack_w);
+            sc_l.set_max_content_width(stack_w);
+            sc_l.set_width_request(stack_w);
+            stk_l.set_size_request(stack_w, -1);
+            win_l.set_size_request((pw + 456).max(TOTAL_DASH_WIDTH) + TRIGGER_WIDTH, -1);
+
+            // 4. Chrome toggles
+            ws_w.set_visible(lay.chrome.show_top_bar);
+            tr_w.set_visible(lay.chrome.show_tray);
+            st_w.set_visible(lay.chrome.show_status_strip);
+            sr_w.set_visible(lay.chrome.show_session_row);
+            pr_w.set_visible(lay.chrome.show_power_row);
+            we_w.set_visible(lay.chrome.show_weather);
+            cl_w.set_visible(lay.chrome.show_clock);
+            rl_w.set_visible(lay.chrome.show_reload_btn);
+
+            // 5. Monitor pinning & hitbox refresh
+            move_to_monitor(&win_l, None);
+            update_input_region(&win_l, open_l.get(), db_l.width());
+        })
+    };
+    *layout_rebuild_slot.borrow_mut() = Some(apply_layout_and_chrome.clone());
 
     let win_motion = EventControllerMotion::new();
     let btn_motion = trigger_btn.clone();
@@ -1398,6 +1748,9 @@ fn build_ui(
         if !open_motion.get() && !closing_motion.get() {
             hovered_motion.set(true);
             btn_motion.add_css_class("peeking");
+            if config::get().layout.trigger_hover_open {
+                btn_motion.emit_clicked();
+            }
         }
     });
 
@@ -1420,14 +1773,21 @@ fn build_ui(
     let btn_win_click = trigger_btn.clone();
     let open_win_click = is_open.clone();
     let dash_box_click = dash_box.clone();
+    let win_for_click = window.clone();
     win_click.connect_pressed(move |_, _, x, _| {
         if !open_win_click.get() {
             btn_win_click.emit_clicked();
         } else {
-            // Dynamically calculate the right edge of the dashboard based on actual physical width!
             let current_w = dash_box_click.width() as f64;
             let dash_edge = if current_w > 0.0 { current_w } else { BASE_DASH_WIDTH as f64 };
-            if x >= dash_edge {
+            let is_right = config::get().layout.side == "right";
+            let clicked_trigger = if is_right {
+                let win_w = win_for_click.width() as f64;
+                x <= (win_w - dash_edge)
+            } else {
+                x >= dash_edge
+            };
+            if clicked_trigger {
                 btn_win_click.emit_clicked();
             }
         }
@@ -1490,7 +1850,8 @@ fn build_ui(
             let open_after = open_click.clone();
             let closing_after = closing_click.clone();
 
-            glib::timeout_add_local_once(Duration::from_millis(SLIDE_DURATION_MS), move || {
+            let close_ms = config::get().layout.anim_duration_ms.max(16);
+            glib::timeout_add_local_once(Duration::from_millis(close_ms), move || {
                 closing_after.set(false);
                 if !open_after.get() {
                     btn_after.remove_css_class("riding");
@@ -1517,6 +1878,7 @@ fn build_ui(
     drawer_container.append(&trigger_wrapper);
 
     window.set_child(Some(&drawer_container));
+    apply_layout_and_chrome();
 
     // --- THE BULLETPROOF HITBOX FIX (UPDATED FOR DYNAMIC WIDTH) ---
     let last_known_height = Rc::new(Cell::new(0));

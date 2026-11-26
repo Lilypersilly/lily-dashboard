@@ -245,9 +245,177 @@ impl Default for HyprlandConfig {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
+pub struct PowerRowConfig {
+    /// Number of buttons in the sidebar footer power row (1, 2, or 3).
+    pub count: usize,
+    /// Action for each slot: "shutdown", "reboot", "logout", "suspend", "lock", or "menu"
+    pub slots: [String; 3],
+    pub menu_shutdown: bool,
+    pub menu_reboot: bool,
+    pub menu_logout: bool,
+    pub menu_suspend: bool,
+    pub menu_lock: bool,
+    /// Optional custom screen-lock command (empty = auto-detect hyprlock / swaylock / loginctl)
+    pub lock_cmd: String,
+}
+
+impl Default for PowerRowConfig {
+    fn default() -> Self {
+        Self {
+            count: 2,
+            slots: [
+                "shutdown".to_string(),
+                "reboot".to_string(),
+                "menu".to_string(),
+            ],
+            menu_shutdown: true,
+            menu_reboot: true,
+            menu_logout: true,
+            menu_suspend: true,
+            menu_lock: true,
+            lock_cmd: String::new(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct ChromeToggles {
+    pub show_top_bar: bool,
+    pub show_tray: bool,
+    pub show_status_strip: bool,
+    pub show_session_row: bool,
+    pub show_power_row: bool,
+    pub show_weather: bool,
+    pub show_clock: bool,
+    pub show_reload_btn: bool,
+}
+
+impl Default for ChromeToggles {
+    fn default() -> Self {
+        Self {
+            show_top_bar: true,
+            show_tray: true,
+            show_status_strip: true,
+            show_session_row: true,
+            show_power_row: true,
+            show_weather: true,
+            show_clock: true,
+            show_reload_btn: true,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct LayoutConfig {
+    /// "left" or "right"
+    pub side: String,
+    /// Edge trigger vertical alignment: "top", "center", or "bottom"
+    pub trigger_align: String,
+    /// Edge trigger size: "small" (72px), "medium" (100px), or "large" (140px)
+    pub trigger_size: String,
+    /// true = open on edge hover; false = click-only
+    pub trigger_hover_open: bool,
+    /// Empty = follow active monitor; non-empty = pin to specific connector (e.g. "DP-3")
+    pub pinned_monitor: String,
+    /// Default tab opened on startup ("run", "favs", "music", etc.)
+    pub default_tab: String,
+    /// Ordered sidebar entries: tab IDs ("run", "favs", ...) and "---" for 1px separators.
+    /// Any tab not in this list is unloaded (hidden & background watchers paused).
+    pub sidebar_items: Vec<String>,
+    /// Main dashboard panel width in px (340..=560, default 400)
+    pub panel_width: i32,
+    /// Slide animation duration in ms (0 = instant snap)
+    pub anim_duration_ms: u64,
+    pub chrome: ChromeToggles,
+}
+
+pub const ALL_TAB_IDS: &[(&str, &str)] = &[
+    ("run", "Run"),
+    ("favs", "Favorites"),
+    ("clipboard", "Clipboard"),
+    ("plans", "Plans"),
+    ("calendar", "Calendar"),
+    ("timers", "Timers"),
+    ("music", "Music"),
+    ("drive", "Drive"),
+    ("passwords", "Passwords"),
+    ("locker", "Locker"),
+    ("system", "System"),
+];
+
+pub const DEFAULT_SIDEBAR_ITEMS: &[&str] = &[
+    "run",
+    "favs",
+    "clipboard",
+    "---",
+    "plans",
+    "calendar",
+    "timers",
+    "---",
+    "music",
+    "---",
+    "drive",
+    "passwords",
+    "locker",
+    "---",
+    "system",
+];
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            side: "left".to_string(),
+            trigger_align: "center".to_string(),
+            trigger_size: "medium".to_string(),
+            trigger_hover_open: false,
+            pinned_monitor: String::new(),
+            default_tab: "run".to_string(),
+            sidebar_items: DEFAULT_SIDEBAR_ITEMS.iter().map(|s| s.to_string()).collect(),
+            panel_width: 400,
+            anim_duration_ms: 350,
+            chrome: ChromeToggles::default(),
+        }
+    }
+}
+
+/// Keeps `visible_tabs` booleans in sync with `layout.sidebar_items` so watchers
+/// (Favorites inotify, Clipboard wl-paste) automatically pause when a tab is unloaded.
+pub fn sync_visible_tabs_from_sidebar(cfg: &mut AppConfig) {
+    // Always ensure "system" stays loaded so user can never lock themselves out of Settings
+    if !cfg.layout.sidebar_items.iter().any(|x| x == "system") {
+        cfg.layout.sidebar_items.push("system".to_string());
+    }
+    let has = |id: &str| cfg.layout.sidebar_items.iter().any(|x| x == id);
+    cfg.visible_tabs.favorites = has("favs");
+    cfg.visible_tabs.clipboard = has("clipboard");
+    cfg.visible_tabs.plans = has("plans");
+    cfg.visible_tabs.calendar = has("calendar");
+    cfg.visible_tabs.timers = has("timers");
+    cfg.visible_tabs.music = has("music");
+    cfg.visible_tabs.drive = has("drive");
+    cfg.visible_tabs.passwords = has("passwords");
+    cfg.visible_tabs.locker = has("locker");
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct AppConfig {
-    /// "auto" (read `paths.theme_conf_file`, fall back to marshmellow-dark) or a built-in preset key
+    /// "auto" (read `paths.theme_conf_file`, fall back to marshmellow-dark), a built-in preset key, or "custom"
     pub theme_preset: String,
+    /// Optional imported custom palette hex colors (used when `theme_preset == "custom"`)
+    pub custom_palette: Option<HashMap<String, String>>,
+    /// Button visual style: "tonal", "outlined", "pill", "solid", "neon", or "ghost"
+    pub button_style: String,
+    /// Primary UI font family (default: bundled "Josefin Sans")
+    pub ui_font: String,
+    /// Global UI font size multiplier in [0.75, 1.35] (1.0 = 100%)
+    pub font_scale: f64,
+    /// Monospace / Nerd Font icon family (default: "MesloLGL Nerd Font")
+    pub mono_font: String,
+    pub power: PowerRowConfig,
+    pub layout: LayoutConfig,
     pub visible_tabs: VisibleTabs,
     pub tools: ToolsConfig,
     pub paths: PathsConfig,
@@ -258,6 +426,13 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme_preset: "auto".to_string(),
+            custom_palette: None,
+            button_style: "tonal".to_string(),
+            ui_font: "Josefin Sans".to_string(),
+            font_scale: 1.0,
+            mono_font: "MesloLGL Nerd Font".to_string(),
+            power: PowerRowConfig::default(),
+            layout: LayoutConfig::default(),
             visible_tabs: VisibleTabs::default(),
             tools: ToolsConfig::default(),
             paths: PathsConfig::default(),
@@ -308,6 +483,34 @@ fn load_from_disk() -> AppConfig {
             if parsed.hyprland.hypr_max_rounding <= 0 {
                 parsed.hyprland.hypr_max_rounding = 20;
             }
+            parsed.power.count = parsed.power.count.clamp(1, 3);
+            parsed.layout.panel_width = parsed.layout.panel_width.clamp(340, 560);
+            if parsed.layout.sidebar_items.is_empty() {
+                // Migrate legacy visible_tabs into sidebar_items cleanly
+                let v = &parsed.visible_tabs;
+                let keep = |id: &str| match id {
+                    "favs" => v.favorites,
+                    "clipboard" => v.clipboard,
+                    "plans" => v.plans,
+                    "calendar" => v.calendar,
+                    "timers" => v.timers,
+                    "music" => v.music,
+                    "drive" => v.drive,
+                    "passwords" => v.passwords,
+                    "locker" => v.locker,
+                    _ => true,
+                };
+                parsed.layout.sidebar_items = DEFAULT_SIDEBAR_ITEMS
+                    .iter()
+                    .filter(|&&item| item == "---" || keep(item))
+                    .map(|s| s.to_string())
+                    .collect();
+            }
+            sync_visible_tabs_from_sidebar(&mut parsed);
+            if !parsed.font_scale.is_finite() || parsed.font_scale <= 0.0 {
+                parsed.font_scale = 1.0;
+            }
+            parsed.font_scale = parsed.font_scale.clamp(0.75, 1.35);
             return parsed;
         }
     }
@@ -466,6 +669,15 @@ pub fn resolve_theme_colors(cfg: &AppConfig) -> HashMap<String, String> {
 
     // Start with Marshmellow Dark as fallback defaults
     apply_builtin(&mut map, &BUILTIN_THEMES[0]);
+
+    if cfg.theme_preset == "custom" {
+        if let Some(ref custom) = cfg.custom_palette {
+            for (k, v) in custom {
+                map.insert(k.clone(), v.trim_start_matches('#').to_string());
+            }
+            return map;
+        }
+    }
 
     if cfg.theme_preset != "auto" {
         if let Some(preset) = BUILTIN_THEMES.iter().find(|t| t.key == cfg.theme_preset) {
@@ -677,4 +889,188 @@ pub fn apply_hyprland_settings(h: &HyprlandConfig) {
             .args(["--batch", &batch.join(" ; ")])
             .spawn();
     }
+}
+
+/// Executes a modular power action ("shutdown", "reboot", "logout", "suspend", "lock").
+pub fn run_power_action(action: &str) {
+    match action {
+        "shutdown" => {
+            let _ = Command::new("systemctl").arg("poweroff").spawn();
+        }
+        "reboot" => {
+            let _ = Command::new("systemctl").arg("reboot").spawn();
+        }
+        "suspend" => {
+            let _ = Command::new("systemctl").arg("suspend").spawn();
+        }
+        "logout" => {
+            if is_hyprlua() {
+                let _ = Command::new("hyprctl")
+                    .args(["dispatch", "hl.dsp.exit()"])
+                    .spawn();
+            } else {
+                let _ = Command::new("hyprctl").args(["dispatch", "exit"]).spawn();
+            }
+        }
+        "lock" => {
+            let custom = get().power.lock_cmd;
+            if !custom.trim().is_empty() {
+                let _ = Command::new("sh").args(["-c", custom.trim()]).spawn();
+            } else if bin_exists("hyprlock") {
+                let _ = Command::new("hyprlock").spawn();
+            } else if bin_exists("swaylock") {
+                let _ = Command::new("swaylock").spawn();
+            } else {
+                let _ = Command::new("loginctl").arg("lock-session").spawn();
+            }
+        }
+        _ => {}
+    }
+}
+
+// ==========================================
+// BUNDLED JOSEFIN SANS (SIL OFL-1.1) & FONT DISCOVERY
+// ==========================================
+
+const JOSEFIN_REGULAR: &[u8] = include_bytes!("../assets/fonts/JosefinSans-Regular.ttf");
+const JOSEFIN_BOLD: &[u8] = include_bytes!("../assets/fonts/JosefinSans-Bold.ttf");
+const JOSEFIN_ITALIC: &[u8] = include_bytes!("../assets/fonts/JosefinSans-Italic.ttf");
+const JOSEFIN_BOLD_ITALIC: &[u8] = include_bytes!("../assets/fonts/JosefinSans-BoldItalic.ttf");
+const JOSEFIN_OFL: &[u8] = include_bytes!("../assets/fonts/OFL.txt");
+
+/// Ensures the bundled Josefin Sans font family is installed in
+/// `~/.local/share/fonts/lily-dashboard/` if not already available on the system.
+/// No-ops immediately on subsequent boots (zero extra SSD writes).
+pub fn ensure_bundled_fonts() {
+    let dest_dir = glib::user_data_dir().join("fonts").join("lily-dashboard");
+    let marker = dest_dir.join("JosefinSans-Regular.ttf");
+    if marker.is_file() {
+        return;
+    }
+
+    // If Josefin Sans is already installed elsewhere on the system, skip writing
+    if let Ok(out) = Command::new("fc-list").args([":", "family"]).output() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout
+            .lines()
+            .any(|l| l.split(',').any(|p| p.trim().eq_ignore_ascii_case("Josefin Sans")))
+        {
+            return;
+        }
+    }
+
+    if fs::create_dir_all(&dest_dir).is_ok() {
+        let _ = fs::write(dest_dir.join("JosefinSans-Regular.ttf"), JOSEFIN_REGULAR);
+        let _ = fs::write(dest_dir.join("JosefinSans-Bold.ttf"), JOSEFIN_BOLD);
+        let _ = fs::write(dest_dir.join("JosefinSans-Italic.ttf"), JOSEFIN_ITALIC);
+        let _ = fs::write(dest_dir.join("JosefinSans-BoldItalic.ttf"), JOSEFIN_BOLD_ITALIC);
+        let _ = fs::write(dest_dir.join("OFL.txt"), JOSEFIN_OFL);
+        let _ = Command::new("fc-cache").args(["-f"]).arg(&dest_dir).status();
+    }
+}
+
+/// Returns a sorted, deduplicated list of installed font families via `fc-list`.
+pub fn list_installed_fonts() -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut fonts = Vec::new();
+    let mut add = |name: &str| {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let key = trimmed.to_lowercase();
+        if seen.insert(key) {
+            fonts.push(trimmed.to_string());
+        }
+    };
+
+    add("Josefin Sans");
+    if let Ok(out) = Command::new("fc-list").args([":", "family"]).output() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            if let Some(primary) = line.split(',').next() {
+                add(primary);
+            }
+        }
+    }
+
+    fonts.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    fonts
+}
+
+/// Lists connected Hyprland monitor connector names (e.g. `["DP-3", "DVI-D-1"]`).
+pub fn list_connected_monitors() -> Vec<String> {
+    let mut out_names = Vec::new();
+    if let Ok(output) = Command::new("hyprctl").args(["monitors", "-j"]).output() {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+            if let Some(arr) = json.as_array() {
+                for m in arr {
+                    if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
+                        out_names.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out_names
+}
+
+// ==========================================
+// ONE-CLICK THEME SHARING (EXPORT / IMPORT JSON)
+// ==========================================
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SharedTheme {
+    pub palette: HashMap<String, String>,
+    pub button_style: String,
+    pub ui_font: String,
+    pub font_scale: f64,
+    pub rounding_scale: f64,
+    pub glass_opacity: f64,
+}
+
+pub fn export_theme_json() -> String {
+    let cfg = get();
+    let palette = resolve_theme_colors(&cfg);
+    let shared = SharedTheme {
+        palette,
+        button_style: cfg.button_style,
+        ui_font: cfg.ui_font,
+        font_scale: (cfg.font_scale * 100.0).round() / 100.0,
+        rounding_scale: (cfg.hyprland.rounding_scale * 100.0).round() / 100.0,
+        glass_opacity: (cfg.hyprland.glass_opacity * 100.0).round() / 100.0,
+    };
+    serde_json::to_string(&shared).unwrap_or_else(|_| "{}".to_string())
+}
+
+pub fn import_theme_json(raw: &str) -> Result<(), String> {
+    let parsed: SharedTheme =
+        serde_json::from_str(raw.trim()).map_err(|e| format!("Invalid theme JSON: {}", e))?;
+    let updated = update(|c| {
+        if !parsed.palette.is_empty() {
+            c.theme_preset = "custom".to_string();
+            c.custom_palette = Some(parsed.palette.clone());
+        }
+        if matches!(
+            parsed.button_style.as_str(),
+            "tonal" | "outlined" | "pill" | "solid" | "neon" | "ghost"
+        ) {
+            c.button_style = parsed.button_style.clone();
+        }
+        if !parsed.ui_font.trim().is_empty() {
+            c.ui_font = parsed.ui_font.trim().to_string();
+        }
+        if parsed.font_scale.is_finite() && parsed.font_scale > 0.0 {
+            c.font_scale = parsed.font_scale.clamp(0.75, 1.35);
+        }
+        if parsed.rounding_scale.is_finite() {
+            c.hyprland.rounding_scale = parsed.rounding_scale.clamp(0.0, 1.0);
+        }
+        if parsed.glass_opacity.is_finite() {
+            c.hyprland.glass_opacity = parsed.glass_opacity.clamp(0.35, 1.0);
+        }
+    });
+    let r_px = hypr_rounding_px(&updated.hyprland);
+    hypr_set_keyword("decoration:rounding", &r_px.to_string());
+    Ok(())
 }

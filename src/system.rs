@@ -14,6 +14,7 @@ use gtk4::{
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::{Mutex, mpsc};
@@ -294,6 +295,8 @@ struct KeybindEntry {
     keys: String,
     desc: String,
     raw: String,
+    line_idx: usize,
+    editable: bool,
 }
 
 enum SystemMsg {
@@ -1378,7 +1381,7 @@ fn fetch_keybinds_snapshot() -> Vec<KeybindEntry> {
     let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut entries = Vec::new();
 
-    for raw_line in content.lines() {
+    for (line_idx, raw_line) in content.lines().enumerate() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with("--") || line.starts_with('#') {
             continue;
@@ -1409,6 +1412,7 @@ fn fetch_keybinds_snapshot() -> Vec<KeybindEntry> {
                 if args.len() >= 2 {
                     let keys = eval_lua_key_expr(&args[0], &vars);
                     let (group, mut desc) = describe_bind_action(&args[1]);
+                    let is_loop = keys.contains("1..0") || line.contains("tostring(");
                     if keys.contains("1..0") {
                         if desc == "Switch workspace" {
                             desc = "Switch to workspace 1–10".to_string();
@@ -1421,6 +1425,8 @@ fn fetch_keybinds_snapshot() -> Vec<KeybindEntry> {
                         keys,
                         desc,
                         raw: args[1].clone(),
+                        line_idx,
+                        editable: !is_loop && bind_start == 0,
                     });
                 }
             }
@@ -1469,6 +1475,8 @@ fn fetch_keybinds_snapshot() -> Vec<KeybindEntry> {
                             keys: combo,
                             desc,
                             raw,
+                            line_idx,
+                            editable: true,
                         });
                     }
                 }
@@ -1477,6 +1485,167 @@ fn fetch_keybinds_snapshot() -> Vec<KeybindEntry> {
     }
 
     entries
+}
+
+fn is_lua_keybinds_file(path: &Path) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("lua") => true,
+        Some(ext) if ext.eq_ignore_ascii_case("conf") => false,
+        _ => crate::config::is_hyprlua(),
+    }
+}
+
+fn format_hypr_keybind_line(
+    is_lua: bool,
+    mods: &str,
+    key: &str,
+    action_kind: &str,
+    param: &str,
+) -> Result<String, String> {
+    let clean_key = key.trim();
+    if clean_key.is_empty() {
+        return Err("Enter or record a key first.".to_string());
+    }
+    let mod_parts: Vec<&str> = mods
+        .split(|c: char| c.is_whitespace() || c == '+' || c == ',')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let clean_param = param.trim();
+
+    if is_lua {
+        let combo = if mod_parts.is_empty() {
+            clean_key.to_string()
+        } else {
+            format!("{} + {}", mod_parts.join(" + "), clean_key)
+        };
+        let esc_param = clean_param.replace('\\', "\\\\").replace('"', "\\\"");
+        let action_expr = match action_kind {
+            "exec" => {
+                if clean_param.is_empty() {
+                    return Err("Enter a command to run.".to_string());
+                }
+                format!("hl.dsp.exec_cmd(\"{}\")", esc_param)
+            }
+            "killactive" => "hl.dsp.window.close()".to_string(),
+            "togglefloating" => "hl.dsp.window.toggle_floating()".to_string(),
+            "fullscreen" => "hl.dsp.window.fullscreen()".to_string(),
+            "workspace" => {
+                if clean_param.is_empty() {
+                    return Err("Enter a workspace number or name.".to_string());
+                }
+                if clean_param.parse::<i32>().is_ok() {
+                    format!("hl.dsp.focus({{ workspace = {} }})", clean_param)
+                } else {
+                    format!("hl.dsp.focus({{ workspace = \"{}\" }})", esc_param)
+                }
+            }
+            _ => {
+                if clean_param.is_empty() {
+                    return Err("Enter a custom Hyprlua action expression.".to_string());
+                }
+                clean_param.to_string()
+            }
+        };
+        Ok(format!("hl.bind(\"{}\", {})", combo, action_expr))
+    } else {
+        let mod_str = mod_parts.join(" ");
+        let (disp, arg) = match action_kind {
+            "exec" => {
+                if clean_param.is_empty() {
+                    return Err("Enter a command to run.".to_string());
+                }
+                ("exec", clean_param)
+            }
+            "killactive" => ("killactive", ""),
+            "togglefloating" => ("togglefloating", ""),
+            "fullscreen" => ("fullscreen", ""),
+            "workspace" => {
+                if clean_param.is_empty() {
+                    return Err("Enter a workspace number or name.".to_string());
+                }
+                ("workspace", clean_param)
+            }
+            _ => {
+                if clean_param.is_empty() {
+                    return Err("Enter a custom dispatcher (e.g. movetoworkspace, 2).".to_string());
+                }
+                return Ok(format!("bind = {}, {}, {}", mod_str, clean_key, clean_param));
+            }
+        };
+        if arg.is_empty() {
+            Ok(format!("bind = {}, {}, {},", mod_str, clean_key, disp))
+        } else {
+            Ok(format!("bind = {}, {}, {}, {}", mod_str, clean_key, disp, arg))
+        }
+    }
+}
+
+fn append_keybind_to_file(
+    mods: &str,
+    key: &str,
+    action_kind: &str,
+    param: &str,
+) -> Result<String, String> {
+    let path = crate::config::expand_path(&crate::config::get().paths.keybinds_file);
+    let is_lua = is_lua_keybinds_file(&path);
+    let new_line = format_hypr_keybind_line(is_lua, mods, key, action_kind, param)?;
+
+    let mut content = fs::read_to_string(&path).unwrap_or_default();
+    if path.exists() {
+        let mut bak = path.as_os_str().to_os_string();
+        bak.push(".bak");
+        let _ = fs::copy(&path, PathBuf::from(bak));
+    } else if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let marker = if is_lua {
+        "-- [Lily Dashboard Keybinds]"
+    } else {
+        "# [Lily Dashboard Keybinds]"
+    };
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !content.contains(marker) {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(marker);
+        content.push('\n');
+    }
+    content.push_str(&new_line);
+    content.push('\n');
+
+    fs::write(&path, &content).map_err(|e| format!("Write failed: {}", e))?;
+    let _ = Command::new("hyprctl").arg("reload").spawn();
+
+    let fname = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "keybinds".to_string());
+    Ok(format!("Saved to {} & reloaded Hyprland!", fname))
+}
+
+fn delete_keybind_line(line_idx: usize) -> Result<(), String> {
+    let path = crate::config::expand_path(&crate::config::get().paths.keybinds_file);
+    let content = fs::read_to_string(&path).map_err(|e| format!("Read failed: {}", e))?;
+    let mut lines: Vec<&str> = content.lines().collect();
+    if line_idx >= lines.len() {
+        return Err("Line out of range".to_string());
+    }
+    let mut bak = path.as_os_str().to_os_string();
+    bak.push(".bak");
+    let _ = fs::copy(&path, PathBuf::from(bak));
+
+    lines.remove(line_idx);
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    fs::write(&path, out).map_err(|e| format!("Write failed: {}", e))?;
+    let _ = Command::new("hyprctl").arg("reload").spawn();
+    Ok(())
 }
 
 pub fn build_system_ui(
@@ -1735,7 +1904,7 @@ pub fn build_system_ui(
     let (disp_scroll, disp_box) = make_scroll_page();
     detail_stack.add_named(&disp_scroll, Some("displays"));
 
-    // PAGE 6: KEYBINDS (live binds.lua parser + instant filter)
+    // PAGE 6: KEYBINDS (live .lua / .conf viewer + editor with Key Recorder)
     let kbd_page = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(8)
@@ -1746,10 +1915,199 @@ pub fn build_system_ui(
         .hexpand(true)
         .vexpand(true)
         .build();
+    let kbd_top_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
     let kbd_search = Entry::builder()
         .placeholder_text("Search keybinds, keys, or apps...")
         .css_classes(vec!["fav-search".to_string()])
+        .hexpand(true)
         .build();
+    let kbd_add_toggle_btn = Button::builder()
+        .label("+ Add")
+        .css_classes(vec!["primary-btn".to_string()])
+        .tooltip_text("Add a new Hyprland keybind (.lua or .conf)")
+        .build();
+    kbd_top_row.append(&kbd_search);
+    kbd_top_row.append(&kbd_add_toggle_btn);
+
+    // Collapsible Add Keybind card
+    let kbd_add_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(6)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .visible(false)
+        .build();
+
+    let kbd_key_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let kbd_mods_entry = Entry::builder()
+        .text("SUPER")
+        .placeholder_text("Mods (SUPER SHIFT)")
+        .css_classes(vec!["fav-search".to_string()])
+        .hexpand(true)
+        .build();
+    let kbd_key_entry = Entry::builder()
+        .placeholder_text("Key (K, Return)")
+        .width_chars(10)
+        .css_classes(vec!["fav-search".to_string()])
+        .build();
+    let kbd_rec_btn = Button::builder()
+        .label("󰌌 Rec")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .tooltip_text("Click then press a key combo to record it")
+        .build();
+    kbd_key_row.append(&kbd_mods_entry);
+    kbd_key_row.append(&kbd_key_entry);
+    kbd_key_row.append(&kbd_rec_btn);
+
+    let kbd_recording = Rc::new(Cell::new(false));
+    {
+        let rec_flag = kbd_recording.clone();
+        kbd_rec_btn.connect_clicked(move |b| {
+            let next = !rec_flag.get();
+            rec_flag.set(next);
+            if next {
+                b.set_label("Press...");
+                b.add_css_class("active");
+            } else {
+                b.set_label("󰌌 Rec");
+                b.remove_css_class("active");
+            }
+        });
+    }
+    {
+        let rec_flag = kbd_recording.clone();
+        let rec_b = kbd_rec_btn.clone();
+        let mods_e = kbd_mods_entry.clone();
+        let key_e = kbd_key_entry.clone();
+        let key_ctrl = gtk4::EventControllerKey::new();
+        key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        key_ctrl.connect_key_pressed(move |_, keyval, _, state| {
+            if !rec_flag.get() {
+                return glib::Propagation::Proceed;
+            }
+            let Some(kname) = keyval.name() else {
+                return glib::Propagation::Stop;
+            };
+            let ks = kname.as_str();
+            // Ignore bare modifier presses until the actual key is struck
+            if matches!(
+                ks,
+                "Super_L" | "Super_R" | "Shift_L" | "Shift_R" | "Control_L" | "Control_R" | "Alt_L" | "Alt_R" | "Meta_L" | "Meta_R"
+            ) {
+                return glib::Propagation::Stop;
+            }
+            let mut m = Vec::new();
+            if state.contains(gtk4::gdk::ModifierType::SUPER_MASK) {
+                m.push("SUPER");
+            }
+            if state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+                m.push("CTRL");
+            }
+            if state.contains(gtk4::gdk::ModifierType::ALT_MASK) {
+                m.push("ALT");
+            }
+            if state.contains(gtk4::gdk::ModifierType::SHIFT_MASK) {
+                m.push("SHIFT");
+            }
+            let norm_key = if ks.len() == 1 {
+                ks.to_uppercase()
+            } else {
+                ks.to_string()
+            };
+            mods_e.set_text(&m.join(" "));
+            key_e.set_text(&norm_key);
+            rec_flag.set(false);
+            rec_b.set_label("󰌌 Rec");
+            rec_b.remove_css_class("active");
+            glib::Propagation::Stop
+        });
+        kbd_add_card.add_controller(key_ctrl);
+    }
+
+    let kbd_action_kind = Rc::new(RefCell::new("exec".to_string()));
+    let kbd_act_flow = FlowBox::builder()
+        .selection_mode(SelectionMode::None)
+        .column_spacing(5)
+        .row_spacing(5)
+        .max_children_per_line(3)
+        .build();
+    let kbd_param_entry = Entry::builder()
+        .placeholder_text("Command (e.g. kitty, firefox)...")
+        .css_classes(vec!["fav-search".to_string()])
+        .build();
+    let kbd_act_btns: Rc<RefCell<Vec<(&'static str, Button)>>> = Rc::new(RefCell::new(Vec::new()));
+    let act_presets: &[(&str, &str, &str)] = &[
+        ("exec", "Run Cmd", "Command (e.g. kitty, firefox)..."),
+        ("killactive", "Close Win", ""),
+        ("togglefloating", "Float", ""),
+        ("fullscreen", "Fullscreen", ""),
+        ("workspace", "Workspace", "Workspace number or name (e.g. 1)..."),
+        ("custom", "Custom", "Raw Hyprlua expr or classic dispatcher, param..."),
+    ];
+    for &(ak, albl, ph) in act_presets {
+        let b = Button::builder()
+            .label(albl)
+            .css_classes(if ak == "exec" {
+                vec!["plan-fmt-btn".to_string(), "active".to_string()]
+            } else {
+                vec!["plan-fmt-btn".to_string()]
+            })
+            .build();
+        let kind_c = kbd_action_kind.clone();
+        let all_b = kbd_act_btns.clone();
+        let pe = kbd_param_entry.clone();
+        b.connect_clicked(move |_| {
+            *kind_c.borrow_mut() = ak.to_string();
+            for (k, ob) in all_b.borrow().iter() {
+                if *k == ak {
+                    ob.add_css_class("active");
+                } else {
+                    ob.remove_css_class("active");
+                }
+            }
+            if ph.is_empty() {
+                pe.set_visible(false);
+            } else {
+                pe.set_placeholder_text(Some(ph));
+                pe.set_visible(true);
+            }
+        });
+        kbd_act_btns.borrow_mut().push((ak, b.clone()));
+        kbd_act_flow.insert(&b, -1);
+    }
+
+    let kbd_save_btn = Button::builder()
+        .label("Save & Reload Hyprland")
+        .css_classes(vec!["primary-btn".to_string()])
+        .build();
+    let kbd_status_lbl = Label::builder()
+        .label("")
+        .halign(Align::Start)
+        .wrap(true)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .visible(false)
+        .build();
+
+    kbd_add_card.append(&kbd_key_row);
+    kbd_add_card.append(&kbd_act_flow);
+    kbd_add_card.append(&kbd_param_entry);
+    kbd_add_card.append(&kbd_save_btn);
+    kbd_add_card.append(&kbd_status_lbl);
+
+    {
+        let card = kbd_add_card.clone();
+        kbd_add_toggle_btn.connect_clicked(move |b| {
+            let next = !card.is_visible();
+            card.set_visible(next);
+            b.set_label(if next { "Close" } else { "+ Add" });
+        });
+    }
+
     let kbd_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
@@ -1762,7 +2120,8 @@ pub fn build_system_ui(
         .margin_bottom(8)
         .build();
     kbd_scroll.set_child(Some(&kbd_list_box));
-    kbd_page.append(&kbd_search);
+    kbd_page.append(&kbd_top_row);
+    kbd_page.append(&kbd_add_card);
     kbd_page.append(&kbd_scroll);
     detail_stack.add_named(&kbd_page, Some("keybinds"));
 
@@ -1922,13 +2281,43 @@ pub fn build_system_ui(
         sett_cat_btn.connect_clicked(move |_| open_s("settings"));
     }
 
+    // Save new Keybind handler (.lua or .conf)
+    {
+        let me = kbd_mods_entry.clone();
+        let ke = kbd_key_entry.clone();
+        let ak = kbd_action_kind.clone();
+        let pe = kbd_param_entry.clone();
+        let st = kbd_status_lbl.clone();
+        let ref_k = trigger_refresh.clone();
+        kbd_save_btn.connect_clicked(move |_| {
+            let mods = me.text().to_string();
+            let key = ke.text().to_string();
+            let kind = ak.borrow().clone();
+            let param = pe.text().to_string();
+            match append_keybind_to_file(&mods, &key, &kind, &param) {
+                Ok(msg) => {
+                    ke.set_text("");
+                    pe.set_text("");
+                    st.set_label(&msg);
+                    st.set_visible(true);
+                    ref_k("keybinds", false);
+                }
+                Err(err) => {
+                    st.set_label(&err);
+                    st.set_visible(true);
+                }
+            }
+        });
+    }
+
     // Live search filtering for Keybinds
     {
         let kbd_cache_f = keybinds_cache.clone();
         let kbd_box_f = kbd_list_box.clone();
+        let ref_k = trigger_refresh.clone();
         kbd_search.connect_changed(move |entry| {
             let query = entry.text().to_string();
-            render_keybinds_page(&kbd_box_f, &kbd_cache_f.borrow(), &query);
+            render_keybinds_page(&kbd_box_f, &kbd_cache_f.borrow(), &query, &ref_k);
         });
     }
 
@@ -2094,7 +2483,7 @@ pub fn build_system_ui(
                 SystemMsg::Keybinds(binds) => {
                     *kbd_cache_r.borrow_mut() = binds;
                     let q = kbd_search_r.text().to_string();
-                    render_keybinds_page(&kbd_box_r, &kbd_cache_r.borrow(), &q);
+                    render_keybinds_page(&kbd_box_r, &kbd_cache_r.borrow(), &q, &refresh_for_ui);
                 }
                 SystemMsg::Overview(snap) => {
                     *last_ov_r.borrow_mut() = Some(snap.clone());
@@ -3368,7 +3757,12 @@ fn render_displays_page(
     container.append(&reload_hypr_btn);
 }
 
-fn render_keybinds_page(container: &Box, binds: &[KeybindEntry], query: &str) {
+fn render_keybinds_page(
+    container: &Box,
+    binds: &[KeybindEntry],
+    query: &str,
+    refresh_cb: &Rc<dyn Fn(&str, bool)>,
+) {
     clear_box(container);
     let q = query.trim().to_lowercase();
 
@@ -3388,7 +3782,7 @@ fn render_keybinds_page(container: &Box, binds: &[KeybindEntry], query: &str) {
     if filtered.is_empty() {
         let empty = Label::builder()
             .label(if binds.is_empty() {
-                "Could not read ~/.config/hypr/binds.lua"
+                "No keybinds found — click '+ Add' above to create one."
             } else {
                 "No matching keybinds."
             })
@@ -3457,6 +3851,39 @@ fn render_keybinds_page(container: &Box, binds: &[KeybindEntry], query: &str) {
 
             row.append(&key_pill);
             row.append(&desc_lbl);
+
+            if b.editable {
+                let del_btn = Button::builder()
+                    .label("×")
+                    .valign(Align::Center)
+                    .css_classes(vec!["plan-line-del-btn".to_string()])
+                    .tooltip_text("Delete keybind (click twice to confirm)")
+                    .build();
+                let armed = Rc::new(Cell::new(false));
+                let lidx = b.line_idx;
+                let ref_d = refresh_cb.clone();
+                del_btn.connect_clicked(move |btn| {
+                    if !armed.get() {
+                        armed.set(true);
+                        btn.set_label("Sure?");
+                        let a_r = armed.clone();
+                        let b_r = btn.clone();
+                        glib::timeout_add_local_once(Duration::from_secs(3), move || {
+                            if a_r.get() {
+                                a_r.set(false);
+                                b_r.set_label("×");
+                            }
+                        });
+                        return;
+                    }
+                    armed.set(false);
+                    if delete_keybind_line(lidx).is_ok() {
+                        ref_d("keybinds", false);
+                    }
+                });
+                row.append(&del_btn);
+            }
+
             card.append(&row);
         }
 
@@ -3840,14 +4267,150 @@ fn render_overview_page(
 }
 
 // ==========================================
-// SETTINGS PAGE (HYPRLAND, APPS, PATHS, TABS)
+// SETTINGS PAGE (COLLAPSIBLE CATEGORIES)
 // ==========================================
+
+thread_local! {
+    static SETTINGS_OPEN_SECTIONS: RefCell<std::collections::HashSet<String>> = RefCell::new({
+        let mut s = std::collections::HashSet::new();
+        s.insert("buttons".to_string());
+        s.insert("power".to_string());
+        s
+    });
+}
+
+fn is_settings_section_open(key: &str) -> bool {
+    SETTINGS_OPEN_SECTIONS.with(|s| s.borrow().contains(key))
+}
+
+fn toggle_settings_section(key: &str) -> bool {
+    SETTINGS_OPEN_SECTIONS.with(|s| {
+        let mut set = s.borrow_mut();
+        if set.contains(key) {
+            set.remove(key);
+            false
+        } else {
+            set.insert(key.to_string());
+            true
+        }
+    })
+}
+
+fn append_collapsible_section(
+    container: &Box,
+    key: &'static str,
+    title: &str,
+    summary: &str,
+    body: &Box,
+) {
+    let open = is_settings_section_open(key);
+    body.set_visible(open);
+
+    let hdr_btn = Button::builder()
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .hexpand(true)
+        .margin_top(4)
+        .build();
+    let hdr_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let chev_lbl = Label::builder()
+        .label(if open { "▾" } else { "▸" })
+        .css_classes(vec!["fav-score-badge".to_string()])
+        .width_request(12)
+        .build();
+    let title_lbl = Label::builder()
+        .label(title)
+        .halign(Align::Start)
+        .hexpand(true)
+        .css_classes(vec!["fav-group-header".to_string()])
+        .build();
+    let sum_lbl = Label::builder()
+        .label(summary)
+        .halign(Align::End)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .build();
+    hdr_row.append(&chev_lbl);
+    hdr_row.append(&title_lbl);
+    hdr_row.append(&sum_lbl);
+    hdr_btn.set_child(Some(&hdr_row));
+
+    let body_c = body.clone();
+    let chev_c = chev_lbl.clone();
+    hdr_btn.connect_clicked(move |_| {
+        let next = toggle_settings_section(key);
+        body_c.set_visible(next);
+        chev_c.set_label(if next { "▾" } else { "▸" });
+    });
+
+    container.append(&hdr_btn);
+    container.append(body);
+}
+
+/// Attaches a bulletproof apply-on-release trigger to a `gtk4::Scale`.
+/// Uses `EventControllerLegacy` in Capture phase so it observes raw `ButtonPress` /
+/// `ButtonRelease` without ever fighting `GtkScale`'s internal gesture claiming.
+fn attach_apply_on_release(scale: &Scale, on_commit: Rc<dyn Fn()>) {
+    let is_pressed = Rc::new(Cell::new(false));
+    let debounce_gen = Rc::new(Cell::new(0u64));
+
+    let legacy = gtk4::EventControllerLegacy::new();
+    legacy.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    {
+        let ip = is_pressed.clone();
+        let cb = on_commit.clone();
+        legacy.connect_event(move |_, ev| {
+            match ev.event_type() {
+                gtk4::gdk::EventType::ButtonPress => {
+                    ip.set(true);
+                }
+                gtk4::gdk::EventType::ButtonRelease => {
+                    if ip.get() {
+                        ip.set(false);
+                        cb();
+                    }
+                }
+                _ => {}
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    scale.add_controller(legacy);
+
+    let ip_v = is_pressed.clone();
+    let dg_v = debounce_gen.clone();
+    let cb_v = on_commit;
+    scale.connect_value_changed(move |_| {
+        if !ip_v.get() {
+            let next = dg_v.get().wrapping_add(1);
+            dg_v.set(next);
+            let dg_chk = dg_v.clone();
+            let ip_chk = ip_v.clone();
+            let cb_run = cb_v.clone();
+            glib::timeout_add_local_once(Duration::from_millis(300), move || {
+                if dg_chk.get() == next && !ip_chk.get() {
+                    cb_run();
+                }
+            });
+        }
+    });
+}
 
 fn render_settings_page(
     container: &Box,
     reload_theme: &Rc<dyn Fn()>,
     apply_tabs: &Rc<dyn Fn()>,
 ) {
+    // Preserve scroll position across Settings rebuilds
+    let saved_scroll = container
+        .ancestor(ScrolledWindow::static_type())
+        .and_then(|w| w.downcast::<ScrolledWindow>().ok())
+        .map(|sw| {
+            let v = sw.vadjustment().value();
+            (sw, v)
+        });
+
     clear_box(container);
     let cfg = crate::config::get();
 
@@ -3865,6 +4428,46 @@ fn render_settings_page(
                 }
             });
         })
+    };
+
+    // Helper for segmented choice rows
+    let make_choice_group = |parent: &Box,
+                             label_txt: &str,
+                             options: &[(&str, &str)],
+                             current: &str,
+                             on_pick: Rc<dyn Fn(String)>| {
+        if !label_txt.is_empty() {
+            let lbl = Label::builder()
+                .label(label_txt)
+                .halign(Align::Start)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build();
+            parent.append(&lbl);
+        }
+
+        let flow = FlowBox::builder()
+            .selection_mode(SelectionMode::None)
+            .column_spacing(5)
+            .row_spacing(5)
+            .max_children_per_line(4)
+            .build();
+
+        for &(val, title) in options {
+            let active = current == val;
+            let btn = Button::builder()
+                .label(title)
+                .css_classes(if active {
+                    vec!["plan-fmt-btn".to_string(), "active".to_string()]
+                } else {
+                    vec!["plan-fmt-btn".to_string()]
+                })
+                .build();
+            let v_str = val.to_string();
+            let cb = on_pick.clone();
+            btn.connect_clicked(move |_| cb(v_str.clone()));
+            flow.insert(&btn, -1);
+        }
+        parent.append(&flow);
     };
 
     // Helper: create a titled slider card row
@@ -3962,16 +4565,1115 @@ fn render_settings_page(
     container.append(&cfg_card);
 
     // ------------------------------------------
-    // 2. HYPRLAND & APPEARANCE (LIVE)
+    // 1b. BUTTON STYLE (COLLAPSIBLE, LIVE PREVIEW)
     // ------------------------------------------
-    let hypr_hdr = Label::builder()
-        .label("HYPRLAND & APPEARANCE")
-        .halign(Align::Start)
-        .css_classes(vec!["fav-group-header".to_string()])
-        .margin_top(6)
+    let btn_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .css_classes(vec!["plan-check-row".to_string()])
         .build();
-    container.append(&hypr_hdr);
+    btn_card.append(
+        &Label::builder()
+            .label("Each button previews its own style — click to apply live")
+            .halign(Align::Start)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build(),
+    );
+    {
+        let style_flow = FlowBox::builder()
+            .selection_mode(SelectionMode::None)
+            .homogeneous(true)
+            .min_children_per_line(2)
+            .max_children_per_line(3)
+            .column_spacing(6)
+            .row_spacing(6)
+            .build();
 
+        let styles: &[(&str, &str, &str)] = &[
+            ("tonal", "Tonal", "btn-preview-tonal"),
+            ("outlined", "Outlined", "btn-preview-outlined"),
+            ("pill", "Pill", "btn-preview-pill"),
+            ("solid", "Solid", "btn-preview-solid"),
+            ("neon", "Neon Glow", "btn-preview-neon"),
+            ("ghost", "Ghost", "btn-preview-ghost"),
+        ];
+
+        for &(val, title, preview_cls) in styles {
+            let active = cfg.button_style == val;
+            let text = if active {
+                format!("✓ {}", title)
+            } else {
+                title.to_string()
+            };
+            let mut classes = vec![preview_cls.to_string()];
+            if active {
+                classes.push("active".to_string());
+            }
+            let b = Button::builder()
+                .label(&text)
+                .css_classes(classes)
+                .build();
+            let v_str = val.to_string();
+            let c_box = container.clone();
+            let rel_t = reload_theme.clone();
+            let app_t = apply_tabs.clone();
+            b.connect_clicked(move |_| {
+                crate::config::update(|c| c.button_style = v_str.clone());
+                rel_t();
+                render_settings_page(&c_box, &rel_t, &app_t);
+            });
+            style_flow.insert(&b, -1);
+        }
+        btn_card.append(&style_flow);
+    }
+    let btn_style_label = match cfg.button_style.as_str() {
+        "outlined" => "Outlined",
+        "pill" => "Pill",
+        "solid" => "Solid",
+        "neon" => "Neon",
+        "ghost" => "Ghost",
+        _ => "Tonal",
+    };
+    append_collapsible_section(container, "buttons", "BUTTON STYLE", btn_style_label, &btn_card);
+
+    // ------------------------------------------
+    // 1b2. FONT SELECTOR (COLLAPSIBLE, LIVE)
+    // ------------------------------------------
+    let font_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .build();
+
+    let init_fscale_pct = (cfg.font_scale.clamp(0.75, 1.35) * 100.0).round();
+    let (fscale_row, fscale_slider, fscale_lbl) = make_slider_row(
+        "Font Scale (applies on release)",
+        75.0,
+        135.0,
+        1.0,
+        init_fscale_pct,
+        format!("{}%", init_fscale_pct as i32),
+    );
+    let pending_fscale = Rc::new(Cell::new(init_fscale_pct));
+    {
+        let lbl = fscale_lbl.clone();
+        let pf = pending_fscale.clone();
+        fscale_slider.connect_value_changed(move |sc| {
+            let pct = sc.value().round().clamp(75.0, 135.0);
+            pf.set(pct);
+            lbl.set_label(&format!("{}%", pct as i32));
+        });
+    }
+    let commit_fscale: Rc<dyn Fn()> = {
+        let pf = pending_fscale.clone();
+        let rel_t = reload_theme.clone();
+        let flush = schedule_flush.clone();
+        Rc::new(move || {
+            let pct = pf.get();
+            crate::config::update_in_memory(|c| {
+                c.font_scale = pct / 100.0;
+            });
+            rel_t();
+            flush();
+        })
+    };
+    attach_apply_on_release(&fscale_slider, commit_fscale);
+    font_card.append(&fscale_row);
+
+    let font_top_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let font_search = Entry::builder()
+        .placeholder_text("Filter installed fonts...")
+        .css_classes(vec!["fav-search".to_string()])
+        .hexpand(true)
+        .build();
+    let font_reset_btn = Button::builder()
+        .label("Default")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .tooltip_text("Reset to bundled Josefin Sans at 100%")
+        .build();
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        font_reset_btn.connect_clicked(move |_| {
+            crate::config::update(|c| {
+                c.ui_font = "Josefin Sans".to_string();
+                c.font_scale = 1.0;
+            });
+            rel_t();
+            render_settings_page(&c_box, &rel_t, &app_t);
+        });
+    }
+    font_top_row.append(&font_search);
+    font_top_row.append(&font_reset_btn);
+    font_card.append(&font_top_row);
+
+    let font_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_height(145)
+        .max_content_height(145)
+        .build();
+    let font_list_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(3)
+        .build();
+    font_scroll.set_child(Some(&font_list_box));
+    font_card.append(&font_scroll);
+
+    let all_fonts = Rc::new(crate::config::list_installed_fonts());
+    let populate_fonts: Rc<dyn Fn(&str)> = {
+        let flb = font_list_box.clone();
+        let af = all_fonts.clone();
+        let cur_font = cfg.ui_font.clone();
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        Rc::new(move |q: &str| {
+            clear_box(&flb);
+            let ql = q.trim().to_lowercase();
+            let mut count = 0usize;
+            for fam in af.iter() {
+                if !ql.is_empty() && !fam.to_lowercase().contains(&ql) {
+                    continue;
+                }
+                let is_cur = fam.eq_ignore_ascii_case(&cur_font);
+                let title = if fam == "Josefin Sans" {
+                    "Josefin Sans (Bundled)".to_string()
+                } else {
+                    fam.clone()
+                };
+                let lbl = Label::builder()
+                    .halign(Align::Start)
+                    .hexpand(true)
+                    .ellipsize(gtk4::pango::EllipsizeMode::End)
+                    .build();
+                lbl.set_markup(&format!(
+                    "<span font_family=\"{}\">{}</span>",
+                    glib::markup_escape_text(fam),
+                    glib::markup_escape_text(&title)
+                ));
+                let b = Button::builder()
+                    .child(&lbl)
+                    .css_classes(if is_cur {
+                        vec!["plan-fmt-btn".to_string(), "active".to_string()]
+                    } else {
+                        vec!["fav-item-btn".to_string()]
+                    })
+                    .hexpand(true)
+                    .build();
+                let fam_s = fam.clone();
+                let cb = c_box.clone();
+                let rt = rel_t.clone();
+                let at = app_t.clone();
+                b.connect_clicked(move |_| {
+                    crate::config::update(|c| c.ui_font = fam_s.clone());
+                    rt();
+                    render_settings_page(&cb, &rt, &at);
+                });
+                flb.append(&b);
+                count += 1;
+                if count >= 40 {
+                    break;
+                }
+            }
+            if count == 0 {
+                flb.append(
+                    &Label::builder()
+                        .label("No matching fonts")
+                        .css_classes(vec!["plan-subnote".to_string()])
+                        .margin_top(12)
+                        .build(),
+                );
+            }
+        })
+    };
+    populate_fonts("");
+    {
+        let pf = populate_fonts.clone();
+        font_search.connect_changed(move |e| pf(&e.text()));
+    }
+
+    append_collapsible_section(
+        container,
+        "font",
+        "UI FONT",
+        &format!("{} · {}%", cfg.ui_font, init_fscale_pct as i32),
+        &font_card,
+    );
+
+    // ------------------------------------------
+    // 1c. MODULAR POWER BUTTONS (COLLAPSIBLE, LIVE)
+    // ------------------------------------------
+    let pwr_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .build();
+
+    let pwr_count = cfg.power.count.clamp(1, 3);
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        make_choice_group(
+            &pwr_card,
+            "Number of Sidebar Power Buttons",
+            &[("1", "1 Button"), ("2", "2 Buttons"), ("3", "3 Buttons")],
+            &pwr_count.to_string(),
+            Rc::new(move |val| {
+                let n = val.parse::<usize>().unwrap_or(2).clamp(1, 3);
+                crate::config::update(|c| c.power.count = n);
+                app_t();
+                render_settings_page(&c_box, &rel_t, &app_t);
+            }),
+        );
+    }
+
+    let slot_opts: &[(&str, &str)] = &[
+        ("shutdown", " Shutdown"),
+        ("reboot", "󰜉 Reboot"),
+        ("logout", "󰍃 Log Out"),
+        ("suspend", "󰤄 Suspend"),
+        ("lock", "󰌾 Lock"),
+        ("menu", " ▾ Dropdown"),
+    ];
+
+    let mut has_menu_slot = false;
+    for slot_idx in 0..pwr_count {
+        if cfg.power.slots[slot_idx] == "menu" {
+            has_menu_slot = true;
+        }
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        make_choice_group(
+            &pwr_card,
+            &format!("Button {} Action", slot_idx + 1),
+            slot_opts,
+            &cfg.power.slots[slot_idx],
+            Rc::new(move |val| {
+                crate::config::update(|c| c.power.slots[slot_idx] = val);
+                app_t();
+                render_settings_page(&c_box, &rel_t, &app_t);
+            }),
+        );
+    }
+
+    if has_menu_slot {
+        let menu_lbl = Label::builder()
+            .label("Dropdown Menu Actions")
+            .halign(Align::Start)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .margin_top(2)
+            .build();
+        pwr_card.append(&menu_lbl);
+
+        let menu_flow = FlowBox::builder()
+            .selection_mode(SelectionMode::None)
+            .column_spacing(5)
+            .row_spacing(5)
+            .max_children_per_line(3)
+            .build();
+
+        let menu_defs: &[(&str, &str, bool)] = &[
+            ("shutdown", " Shutdown", cfg.power.menu_shutdown),
+            ("reboot", "󰜉 Reboot", cfg.power.menu_reboot),
+            ("logout", "󰍃 Log Out", cfg.power.menu_logout),
+            ("suspend", "󰤄 Suspend", cfg.power.menu_suspend),
+            ("lock", "󰌾 Lock", cfg.power.menu_lock),
+        ];
+
+        for &(mkey, mtitle, initial) in menu_defs {
+            let on = Rc::new(Cell::new(initial));
+            let b = Button::builder()
+                .label(mtitle)
+                .css_classes(if initial {
+                    vec!["plan-fmt-btn".to_string(), "active".to_string()]
+                } else {
+                    vec!["plan-fmt-btn".to_string()]
+                })
+                .build();
+            let on_c = on.clone();
+            let app_t = apply_tabs.clone();
+            b.connect_clicked(move |btn| {
+                let next = !on_c.get();
+                on_c.set(next);
+                if next {
+                    btn.add_css_class("active");
+                } else {
+                    btn.remove_css_class("active");
+                }
+                crate::config::update(|c| match mkey {
+                    "shutdown" => c.power.menu_shutdown = next,
+                    "reboot" => c.power.menu_reboot = next,
+                    "logout" => c.power.menu_logout = next,
+                    "suspend" => c.power.menu_suspend = next,
+                    "lock" => c.power.menu_lock = next,
+                    _ => {}
+                });
+                app_t();
+            });
+            menu_flow.insert(&b, -1);
+        }
+        pwr_card.append(&menu_flow);
+    }
+
+    // Optional custom lock command
+    let lock_cmd_lbl = Label::builder()
+        .label("Lock Command (blank = auto hyprlock / swaylock)")
+        .halign(Align::Start)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .margin_top(2)
+        .build();
+    let lock_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let lock_e = Entry::builder()
+        .text(&cfg.power.lock_cmd)
+        .placeholder_text("Auto-detect...")
+        .css_classes(vec!["fav-search".to_string()])
+        .hexpand(true)
+        .build();
+    let lock_save = Button::builder()
+        .label("Save")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .build();
+    {
+        let le = lock_e.clone();
+        lock_save.connect_clicked(move |b| {
+            crate::config::update(|c| c.power.lock_cmd = le.text().trim().to_string());
+            b.set_label("Saved!");
+            let br = b.clone();
+            glib::timeout_add_local_once(Duration::from_millis(1000), move || {
+                br.set_label("Save");
+            });
+        });
+    }
+    lock_row.append(&lock_e);
+    lock_row.append(&lock_save);
+    pwr_card.append(&lock_cmd_lbl);
+    pwr_card.append(&lock_row);
+
+    append_collapsible_section(
+        container,
+        "power",
+        "POWER BUTTONS",
+        &format!("{} btn{}", pwr_count, if pwr_count == 1 { "" } else { "s" }),
+        &pwr_card,
+    );
+
+    // ------------------------------------------
+    // 1d. LAYOUT & BEHAVIOUR (COLLAPSIBLE, LIVE)
+    // ------------------------------------------
+    let lay_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(10)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .build();
+
+    // Side anchor (Left vs Right)
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        make_choice_group(
+            &lay_card,
+            "Sidebar Anchor Edge",
+            &[("left", "Left Edge"), ("right", "Right Edge")],
+            &cfg.layout.side,
+            Rc::new(move |val| {
+                crate::config::update(|c| c.layout.side = val);
+                rel_t();
+                app_t();
+                render_settings_page(&c_box, &rel_t, &app_t);
+            }),
+        );
+    }
+
+    // Edge trigger alignment, size, hover-to-open
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        make_choice_group(
+            &lay_card,
+            "Edge Trigger Position",
+            &[("top", "Top"), ("center", "Center"), ("bottom", "Bottom")],
+            &cfg.layout.trigger_align,
+            Rc::new(move |val| {
+                crate::config::update(|c| c.layout.trigger_align = val);
+                app_t();
+                render_settings_page(&c_box, &rel_t, &app_t);
+            }),
+        );
+    }
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        make_choice_group(
+            &lay_card,
+            "Edge Trigger Size",
+            &[("small", "Small"), ("medium", "Medium"), ("large", "Large")],
+            &cfg.layout.trigger_size,
+            Rc::new(move |val| {
+                crate::config::update(|c| c.layout.trigger_size = val);
+                rel_t();
+                app_t();
+                render_settings_page(&c_box, &rel_t, &app_t);
+            }),
+        );
+    }
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        make_choice_group(
+            &lay_card,
+            "Edge Trigger Activation",
+            &[("click", "Click Only"), ("hover", "Hover to Open")],
+            if cfg.layout.trigger_hover_open { "hover" } else { "click" },
+            Rc::new(move |val| {
+                let hov = val == "hover";
+                crate::config::update(|c| c.layout.trigger_hover_open = hov);
+                render_settings_page(&c_box, &rel_t, &app_t);
+            }),
+        );
+    }
+
+    // Monitor pinning
+    {
+        let monitors = crate::config::list_connected_monitors();
+        let mut mon_opts: Vec<(String, String)> = vec![("".to_string(), "Follow Active".to_string())];
+        for m in monitors {
+            mon_opts.push((m.clone(), m));
+        }
+        let mon_lbl = Label::builder()
+            .label("Monitor Pinning")
+            .halign(Align::Start)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build();
+        lay_card.append(&mon_lbl);
+        let mon_flow = FlowBox::builder()
+            .selection_mode(SelectionMode::None)
+            .column_spacing(5)
+            .row_spacing(5)
+            .max_children_per_line(3)
+            .build();
+        for (val, title) in mon_opts {
+            let active = cfg.layout.pinned_monitor == val;
+            let b = Button::builder()
+                .label(&title)
+                .css_classes(if active {
+                    vec!["plan-fmt-btn".to_string(), "active".to_string()]
+                } else {
+                    vec!["plan-fmt-btn".to_string()]
+                })
+                .build();
+            let c_box = container.clone();
+            let rel_t = reload_theme.clone();
+            let app_t = apply_tabs.clone();
+            b.connect_clicked(move |_| {
+                crate::config::update(|c| c.layout.pinned_monitor = val.clone());
+                app_t();
+                render_settings_page(&c_box, &rel_t, &app_t);
+            });
+            mon_flow.insert(&b, -1);
+        }
+        lay_card.append(&mon_flow);
+    }
+
+    // Panel width slider (apply-on-release!)
+    let init_pw = cfg.layout.panel_width.clamp(340, 560) as f64;
+    let (pw_row, pw_slider, pw_lbl) = make_slider_row(
+        "Panel Width (applies on release)",
+        340.0,
+        560.0,
+        4.0,
+        init_pw,
+        format!("{}px", init_pw as i32),
+    );
+    let pending_pw = Rc::new(Cell::new(init_pw as i32));
+    {
+        let lbl = pw_lbl.clone();
+        let ppw = pending_pw.clone();
+        pw_slider.connect_value_changed(move |sc| {
+            let v = sc.value().round().clamp(340.0, 560.0) as i32;
+            ppw.set(v);
+            lbl.set_label(&format!("{}px", v));
+        });
+    }
+    {
+        let ppw = pending_pw.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        let flush = schedule_flush.clone();
+        let commit_pw: Rc<dyn Fn()> = Rc::new(move || {
+            let v = ppw.get();
+            crate::config::update_in_memory(|c| c.layout.panel_width = v);
+            rel_t();
+            app_t();
+            flush();
+        });
+        attach_apply_on_release(&pw_slider, commit_pw);
+    }
+    lay_card.append(&pw_row);
+
+    // Animation speed
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        make_choice_group(
+            &lay_card,
+            "Slide Animation Speed",
+            &[
+                ("0", "0ms Instant"),
+                ("150", "150ms"),
+                ("250", "250ms"),
+                ("350", "350ms"),
+                ("500", "500ms"),
+            ],
+            &cfg.layout.anim_duration_ms.to_string(),
+            Rc::new(move |val| {
+                let ms = val.parse::<u64>().unwrap_or(350);
+                crate::config::update(|c| c.layout.anim_duration_ms = ms);
+                rel_t();
+                render_settings_page(&c_box, &rel_t, &app_t);
+            }),
+        );
+    }
+
+    // Default startup tab
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        make_choice_group(
+            &lay_card,
+            "Default Startup Tab",
+            &[
+                ("run", "Run"),
+                ("favs", "Favorites"),
+                ("clipboard", "Clipboard"),
+                ("plans", "Plans"),
+                ("calendar", "Calendar"),
+                ("timers", "Timers"),
+                ("music", "Music"),
+                ("drive", "Drive"),
+                ("passwords", "Passwords"),
+                ("locker", "Locker"),
+                ("system", "System"),
+            ],
+            &cfg.layout.default_tab,
+            Rc::new(move |val| {
+                crate::config::update(|c| c.layout.default_tab = val);
+                render_settings_page(&c_box, &rel_t, &app_t);
+            }),
+        );
+    }
+
+    // Chrome visibility toggles
+    {
+        lay_card.append(
+            &Label::builder()
+                .label("Chrome Widgets (Show / Hide)")
+                .halign(Align::Start)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build(),
+        );
+        let ch_flow = FlowBox::builder()
+            .selection_mode(SelectionMode::None)
+            .column_spacing(5)
+            .row_spacing(5)
+            .max_children_per_line(4)
+            .build();
+        let ch = &cfg.layout.chrome;
+        let chrome_defs: &[(&str, &str, bool)] = &[
+            ("top_bar", "Top Bar", ch.show_top_bar),
+            ("tray", "Tray", ch.show_tray),
+            ("status", "Status", ch.show_status_strip),
+            ("session", "Session", ch.show_session_row),
+            ("power", "Power", ch.show_power_row),
+            ("weather", "Weather", ch.show_weather),
+            ("clock", "Clock", ch.show_clock),
+            ("reload", "Reload", ch.show_reload_btn),
+        ];
+        for &(ckey, clbl, initial) in chrome_defs {
+            let on = Rc::new(Cell::new(initial));
+            let b = Button::builder()
+                .label(clbl)
+                .css_classes(if initial {
+                    vec!["plan-fmt-btn".to_string(), "active".to_string()]
+                } else {
+                    vec!["plan-fmt-btn".to_string()]
+                })
+                .build();
+            let on_c = on.clone();
+            let app_t = apply_tabs.clone();
+            b.connect_clicked(move |btn| {
+                let next = !on_c.get();
+                on_c.set(next);
+                if next {
+                    btn.add_css_class("active");
+                } else {
+                    btn.remove_css_class("active");
+                }
+                crate::config::update(|c| match ckey {
+                    "top_bar" => c.layout.chrome.show_top_bar = next,
+                    "tray" => c.layout.chrome.show_tray = next,
+                    "status" => c.layout.chrome.show_status_strip = next,
+                    "session" => c.layout.chrome.show_session_row = next,
+                    "power" => c.layout.chrome.show_power_row = next,
+                    "weather" => c.layout.chrome.show_weather = next,
+                    "clock" => c.layout.chrome.show_clock = next,
+                    "reload" => c.layout.chrome.show_reload_btn = next,
+                    _ => {}
+                });
+                app_t();
+            });
+            ch_flow.insert(&b, -1);
+        }
+        lay_card.append(&ch_flow);
+    }
+
+    append_collapsible_section(
+        container,
+        "layout",
+        "LAYOUT & BEHAVIOUR",
+        &format!("{} · {}px", cfg.layout.side, cfg.layout.panel_width),
+        &lay_card,
+    );
+
+    // ------------------------------------------
+    // 1d2. SIDEBAR TABS & SEPARATORS (2-PANEL DRAG & DROP EDITOR)
+    // ------------------------------------------
+    let tabs_ed_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .build();
+
+    let tabs_ed_top = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .homogeneous(true)
+        .build();
+    let add_sep_btn = Button::builder()
+        .label("+ Add Separator")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .tooltip_text("Insert a 1px divider line into Loaded tabs (drag it anywhere)")
+        .build();
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        add_sep_btn.connect_clicked(move |_| {
+            crate::config::update(|c| {
+                c.layout.sidebar_items.push("---".to_string());
+                crate::config::sync_visible_tabs_from_sidebar(c);
+            });
+            app_t();
+            render_settings_page(&c_box, &rel_t, &app_t);
+        });
+    }
+    let reset_tabs_btn = Button::builder()
+        .label("Reset Default")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .build();
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        reset_tabs_btn.connect_clicked(move |_| {
+            crate::config::update(|c| {
+                c.layout.sidebar_items = crate::config::DEFAULT_SIDEBAR_ITEMS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                crate::config::sync_visible_tabs_from_sidebar(c);
+            });
+            app_t();
+            render_settings_page(&c_box, &rel_t, &app_t);
+        });
+    }
+    tabs_ed_top.append(&add_sep_btn);
+    tabs_ed_top.append(&reset_tabs_btn);
+    tabs_ed_card.append(&tabs_ed_top);
+
+    let two_col = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .homogeneous(true)
+        .build();
+
+    // LEFT COLUMN: UNLOADED TABS
+    let left_col = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(4)
+        .build();
+    left_col.append(
+        &Label::builder()
+            .label("UNLOADED")
+            .halign(Align::Start)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build(),
+    );
+    let unloaded_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_height(190)
+        .max_content_height(190)
+        .build();
+    let unloaded_list = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(3)
+        .build();
+    let mut unloaded_count = 0usize;
+    for &(tab_id, title) in crate::config::ALL_TAB_IDS {
+        if !cfg.layout.sidebar_items.iter().any(|x| x == tab_id) {
+            unloaded_count += 1;
+            let row_btn = Button::builder()
+                .css_classes(vec!["plan-fmt-btn".to_string()])
+                .tooltip_text("Click to load into sidebar")
+                .build();
+            let row_inner = Box::builder().orientation(Orientation::Horizontal).spacing(4).build();
+            row_inner.append(
+                &Label::builder()
+                    .label(title)
+                    .halign(Align::Start)
+                    .hexpand(true)
+                    .ellipsize(gtk4::pango::EllipsizeMode::End)
+                    .build(),
+            );
+            row_inner.append(
+                &Label::builder()
+                    .label("→")
+                    .css_classes(vec!["fav-score-badge".to_string()])
+                    .build(),
+            );
+            row_btn.set_child(Some(&row_inner));
+            let id_s = tab_id.to_string();
+            let c_box = container.clone();
+            let rel_t = reload_theme.clone();
+            let app_t = apply_tabs.clone();
+            row_btn.connect_clicked(move |_| {
+                crate::config::update(|c| {
+                    if !c.layout.sidebar_items.iter().any(|x| x == &id_s) {
+                        c.layout.sidebar_items.push(id_s.clone());
+                    }
+                    crate::config::sync_visible_tabs_from_sidebar(c);
+                });
+                app_t();
+                render_settings_page(&c_box, &rel_t, &app_t);
+            });
+            unloaded_list.append(&row_btn);
+        }
+    }
+    if unloaded_count == 0 {
+        unloaded_list.append(
+            &Label::builder()
+                .label("All tabs loaded")
+                .css_classes(vec!["plan-subnote".to_string()])
+                .margin_top(16)
+                .build(),
+        );
+    }
+    unloaded_scroll.set_child(Some(&unloaded_list));
+    left_col.append(&unloaded_scroll);
+
+    // RIGHT COLUMN: LOADED TABS & SEPARATORS (DRAG & DROP REORDER)
+    let right_col = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(4)
+        .build();
+    right_col.append(
+        &Label::builder()
+            .label("LOADED (drag ⋮⋮)")
+            .halign(Align::Start)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build(),
+    );
+    let loaded_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_height(190)
+        .max_content_height(190)
+        .build();
+    let loaded_list = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(3)
+        .build();
+
+    let mut loaded_tab_count = 0usize;
+    for (idx, item) in cfg.layout.sidebar_items.iter().enumerate() {
+        let is_sep = item == "---";
+        if !is_sep {
+            loaded_tab_count += 1;
+        }
+        let row = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(4)
+            .css_classes(vec!["plan-edit-row".to_string()])
+            .build();
+
+        let grip = Label::builder()
+            .label("⋮⋮")
+            .css_classes(vec!["plan-drag-handle".to_string()])
+            .build();
+        row.append(&grip);
+
+        if is_sep {
+            let line = Box::builder()
+                .orientation(Orientation::Horizontal)
+                .height_request(2)
+                .hexpand(true)
+                .valign(Align::Center)
+                .css_classes(vec!["sidebar-sep".to_string()])
+                .build();
+            row.append(&line);
+
+            let del_b = Button::builder()
+                .label("×")
+                .css_classes(vec!["plan-line-del-btn".to_string()])
+                .tooltip_text("Remove separator")
+                .build();
+            let c_box = container.clone();
+            let rel_t = reload_theme.clone();
+            let app_t = apply_tabs.clone();
+            del_b.connect_clicked(move |_| {
+                crate::config::update(|c| {
+                    if idx < c.layout.sidebar_items.len() {
+                        c.layout.sidebar_items.remove(idx);
+                    }
+                    crate::config::sync_visible_tabs_from_sidebar(c);
+                });
+                app_t();
+                render_settings_page(&c_box, &rel_t, &app_t);
+            });
+            row.append(&del_b);
+        } else {
+            let title = crate::config::ALL_TAB_IDS
+                .iter()
+                .find(|(id, _)| *id == item.as_str())
+                .map(|(_, t)| *t)
+                .unwrap_or(item.as_str());
+            row.append(
+                &Label::builder()
+                    .label(title)
+                    .halign(Align::Start)
+                    .hexpand(true)
+                    .ellipsize(gtk4::pango::EllipsizeMode::End)
+                    .css_classes(vec!["plan-body".to_string()])
+                    .build(),
+            );
+            if item != "system" {
+                let unload_b = Button::builder()
+                    .label("←")
+                    .css_classes(vec!["plan-line-del-btn".to_string()])
+                    .tooltip_text("Unload tab from sidebar")
+                    .build();
+                let c_box = container.clone();
+                let rel_t = reload_theme.clone();
+                let app_t = apply_tabs.clone();
+                unload_b.connect_clicked(move |_| {
+                    crate::config::update(|c| {
+                        if idx < c.layout.sidebar_items.len() {
+                            c.layout.sidebar_items.remove(idx);
+                        }
+                        crate::config::sync_visible_tabs_from_sidebar(c);
+                    });
+                    app_t();
+                    render_settings_page(&c_box, &rel_t, &app_t);
+                });
+                row.append(&unload_b);
+            }
+        }
+
+        // DragSource on row
+        let drag_src = gtk4::DragSource::builder()
+            .actions(gtk4::gdk::DragAction::MOVE)
+            .build();
+        drag_src.connect_prepare(move |_, _, _| {
+            Some(gtk4::gdk::ContentProvider::for_value(&idx.to_string().to_value()))
+        });
+        let row_d1 = row.clone();
+        drag_src.connect_drag_begin(move |_, _| {
+            row_d1.add_css_class("dragging");
+        });
+        let row_d2 = row.clone();
+        drag_src.connect_drag_end(move |_, _, _| {
+            row_d2.remove_css_class("dragging");
+        });
+        row.add_controller(drag_src);
+
+        // DropTarget on row
+        let drop_tgt = gtk4::DropTarget::new(glib::Type::STRING, gtk4::gdk::DragAction::MOVE);
+        let row_t1 = row.clone();
+        drop_tgt.connect_enter(move |_, _, _| {
+            row_t1.add_css_class("drop-target");
+            gtk4::gdk::DragAction::MOVE
+        });
+        let row_t2 = row.clone();
+        drop_tgt.connect_leave(move |_| {
+            row_t2.remove_css_class("drop-target");
+        });
+        let row_t3 = row.clone();
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        drop_tgt.connect_drop(move |_, val, _, _| {
+            row_t3.remove_css_class("drop-target");
+            if let Ok(src_str) = val.get::<String>() {
+                if let Ok(src_idx) = src_str.parse::<usize>() {
+                    if src_idx != idx {
+                        crate::config::update(|c| {
+                            if src_idx < c.layout.sidebar_items.len()
+                                && idx < c.layout.sidebar_items.len()
+                            {
+                                let moved = c.layout.sidebar_items.remove(src_idx);
+                                let dest = idx.min(c.layout.sidebar_items.len());
+                                c.layout.sidebar_items.insert(dest, moved);
+                            }
+                            crate::config::sync_visible_tabs_from_sidebar(c);
+                        });
+                        app_t();
+                        render_settings_page(&c_box, &rel_t, &app_t);
+                        return true;
+                    }
+                }
+            }
+            false
+        });
+        row.add_controller(drop_tgt);
+
+        loaded_list.append(&row);
+    }
+    loaded_scroll.set_child(Some(&loaded_list));
+    right_col.append(&loaded_scroll);
+
+    two_col.append(&left_col);
+    two_col.append(&right_col);
+    tabs_ed_card.append(&two_col);
+
+    append_collapsible_section(
+        container,
+        "sidebar_tabs",
+        "SIDEBAR TABS",
+        &format!("{}/{}", loaded_tab_count, crate::config::ALL_TAB_IDS.len()),
+        &tabs_ed_card,
+    );
+
+    // ------------------------------------------
+    // 1e. ONE-CLICK THEME SHARING (COLLAPSIBLE)
+    // ------------------------------------------
+    let share_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .build();
+    share_card.append(
+        &Label::builder()
+            .label("Share your exact palette, button style, font, rounding & glass opacity as a compact JSON snippet.")
+            .halign(Align::Start)
+            .wrap(true)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build(),
+    );
+
+    let share_row1 = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .homogeneous(true)
+        .build();
+    let copy_theme_btn = Button::builder()
+        .label("󰆏 Copy Theme JSON")
+        .css_classes(vec!["primary-btn".to_string()])
+        .build();
+    copy_theme_btn.connect_clicked(move |b| {
+        let json = crate::config::export_theme_json();
+        if let Some(display) = gtk4::gdk::Display::default() {
+            display.clipboard().set_text(&json);
+        }
+        b.set_label("Copied!");
+        let br = b.clone();
+        glib::timeout_add_local_once(Duration::from_millis(1400), move || {
+            br.set_label("󰆏 Copy Theme JSON");
+        });
+    });
+
+    let reset_auto_btn = Button::builder()
+        .label("Use Auto Theme")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .tooltip_text("Return to your system theme-switch palette")
+        .build();
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        reset_auto_btn.connect_clicked(move |_| {
+            crate::config::update(|c| {
+                c.theme_preset = "auto".to_string();
+                c.custom_palette = None;
+            });
+            rel_t();
+            render_settings_page(&c_box, &rel_t, &app_t);
+        });
+    }
+    share_row1.append(&copy_theme_btn);
+    share_row1.append(&reset_auto_btn);
+    share_card.append(&share_row1);
+
+    let import_entry = Entry::builder()
+        .placeholder_text("Paste shared theme JSON here...")
+        .css_classes(vec!["fav-search".to_string()])
+        .build();
+    let import_btn = Button::builder()
+        .label("Import & Apply Theme")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .build();
+    let import_status = Label::builder()
+        .label("")
+        .halign(Align::Start)
+        .wrap(true)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .visible(false)
+        .build();
+    {
+        let ie = import_entry.clone();
+        let st = import_status.clone();
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        import_btn.connect_clicked(move |_| {
+            let raw = ie.text().to_string();
+            match crate::config::import_theme_json(&raw) {
+                Ok(()) => {
+                    ie.set_text("");
+                    rel_t();
+                    render_settings_page(&c_box, &rel_t, &app_t);
+                }
+                Err(err) => {
+                    st.set_label(&err);
+                    st.set_visible(true);
+                }
+            }
+        });
+    }
+    share_card.append(&import_entry);
+    share_card.append(&import_btn);
+    share_card.append(&import_status);
+
+    append_collapsible_section(container, "share", "THEME SHARING", "JSON", &share_card);
+
+    // ------------------------------------------
+    // 2. HYPRLAND & APPEARANCE (COLLAPSIBLE, LIVE)
+    // ------------------------------------------
     let hypr_card = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(10)
@@ -4367,62 +6069,22 @@ fn render_settings_page(
     hypr_foot.append(&recal_btn);
     hypr_foot.append(&reset_hypr_btn);
     hypr_card.append(&hypr_foot);
-    container.append(&hypr_card);
+    append_collapsible_section(
+        container,
+        "hyprland",
+        "HYPRLAND & APPEARANCE",
+        &format!("{}% · {}%", init_r_pct as i32, init_glass_pct as i32),
+        &hypr_card,
+    );
 
     // ------------------------------------------
-    // 3. APPS & TOOLS
+    // 3. APPS & TOOLS (COLLAPSIBLE)
     // ------------------------------------------
-    let apps_hdr = Label::builder()
-        .label("APPS & BACKENDS")
-        .halign(Align::Start)
-        .css_classes(vec!["fav-group-header".to_string()])
-        .margin_top(6)
-        .build();
-    container.append(&apps_hdr);
-
     let apps_card = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(10)
         .css_classes(vec!["plan-check-row".to_string()])
         .build();
-
-    // Helper for segmented choice rows
-    let make_choice_group = |parent: &Box,
-                             label_txt: &str,
-                             options: &[(&str, &str)],
-                             current: &str,
-                             on_pick: Rc<dyn Fn(String)>| {
-        let lbl = Label::builder()
-            .label(label_txt)
-            .halign(Align::Start)
-            .css_classes(vec!["plan-subnote".to_string()])
-            .build();
-        parent.append(&lbl);
-
-        let flow = FlowBox::builder()
-            .selection_mode(SelectionMode::None)
-            .column_spacing(5)
-            .row_spacing(5)
-            .max_children_per_line(4)
-            .build();
-
-        for &(val, title) in options {
-            let active = current == val;
-            let btn = Button::builder()
-                .label(title)
-                .css_classes(if active {
-                    vec!["plan-fmt-btn".to_string(), "active".to_string()]
-                } else {
-                    vec!["plan-fmt-btn".to_string()]
-                })
-                .build();
-            let v_str = val.to_string();
-            let cb = on_pick.clone();
-            btn.connect_clicked(move |_| cb(v_str.clone()));
-            flow.insert(&btn, -1);
-        }
-        parent.append(&flow);
-    };
 
     // 3a. Screenshot Tool
     {
@@ -4662,96 +6324,17 @@ fn render_settings_page(
         );
     }
 
-    container.append(&apps_card);
+    append_collapsible_section(
+        container,
+        "apps",
+        "APPS & BACKENDS",
+        &cfg.tools.screenshot_tool,
+        &apps_card,
+    );
 
     // ------------------------------------------
-    // 4. VISIBLE SIDEBAR TABS (LIVE)
+    // 5. PATHS & DEFAULTS (COLLAPSIBLE)
     // ------------------------------------------
-    let tabs_hdr = Label::builder()
-        .label("VISIBLE SIDEBAR TABS")
-        .halign(Align::Start)
-        .css_classes(vec!["fav-group-header".to_string()])
-        .margin_top(6)
-        .build();
-    container.append(&tabs_hdr);
-
-    let tabs_card = Box::builder()
-        .orientation(Orientation::Vertical)
-        .spacing(6)
-        .css_classes(vec!["plan-check-row".to_string()])
-        .build();
-
-    let tabs_flow = FlowBox::builder()
-        .selection_mode(SelectionMode::None)
-        .homogeneous(true)
-        .min_children_per_line(3)
-        .max_children_per_line(3)
-        .column_spacing(6)
-        .row_spacing(6)
-        .build();
-
-    let tab_defs: &[(&str, &str, bool)] = &[
-        ("favorites", "Favorites", cfg.visible_tabs.favorites),
-        ("clipboard", "Clipboard", cfg.visible_tabs.clipboard),
-        ("plans", "Plans", cfg.visible_tabs.plans),
-        ("calendar", "Calendar", cfg.visible_tabs.calendar),
-        ("timers", "Timers", cfg.visible_tabs.timers),
-        ("music", "Music", cfg.visible_tabs.music),
-        ("drive", "Drive", cfg.visible_tabs.drive),
-        ("passwords", "Passwords", cfg.visible_tabs.passwords),
-        ("locker", "Locker", cfg.visible_tabs.locker),
-    ];
-
-    for &(key, label, initial) in tab_defs {
-        let on = Rc::new(Cell::new(initial));
-        let btn = Button::builder()
-            .label(label)
-            .css_classes(if initial {
-                vec!["plan-fmt-btn".to_string(), "active".to_string()]
-            } else {
-                vec!["plan-fmt-btn".to_string()]
-            })
-            .build();
-        let on_c = on.clone();
-        let app_t = apply_tabs.clone();
-        btn.connect_clicked(move |b| {
-            let next = !on_c.get();
-            on_c.set(next);
-            if next {
-                b.add_css_class("active");
-            } else {
-                b.remove_css_class("active");
-            }
-            crate::config::update(|c| match key {
-                "favorites" => c.visible_tabs.favorites = next,
-                "clipboard" => c.visible_tabs.clipboard = next,
-                "plans" => c.visible_tabs.plans = next,
-                "calendar" => c.visible_tabs.calendar = next,
-                "timers" => c.visible_tabs.timers = next,
-                "music" => c.visible_tabs.music = next,
-                "drive" => c.visible_tabs.drive = next,
-                "passwords" => c.visible_tabs.passwords = next,
-                "locker" => c.visible_tabs.locker = next,
-                _ => {}
-            });
-            app_t();
-        });
-        tabs_flow.insert(&btn, -1);
-    }
-    tabs_card.append(&tabs_flow);
-    container.append(&tabs_card);
-
-    // ------------------------------------------
-    // 5. PATHS & DEFAULTS
-    // ------------------------------------------
-    let paths_hdr = Label::builder()
-        .label("PATHS & DEFAULTS")
-        .halign(Align::Start)
-        .css_classes(vec!["fav-group-header".to_string()])
-        .margin_top(6)
-        .build();
-    container.append(&paths_hdr);
-
     let paths_card = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(6)
@@ -4844,5 +6427,15 @@ fn render_settings_page(
         });
     }
     paths_card.append(&save_paths_btn);
-    container.append(&paths_card);
+    append_collapsible_section(container, "paths", "PATHS & DEFAULTS", "6 paths", &paths_card);
+
+    // Restore exact scroll offset after GTK lays out the rebuilt children
+    if let Some((sw, v)) = saved_scroll {
+        if v > 0.0 {
+            glib::idle_add_local_once(move || {
+                let adj = sw.vadjustment();
+                adj.set_value(v.min((adj.upper() - adj.page_size()).max(0.0)));
+            });
+        }
+    }
 }

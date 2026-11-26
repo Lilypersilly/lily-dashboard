@@ -57,6 +57,30 @@ pub fn build_drive_ui() -> Box {
     scroll.set_child(Some(&content));
     root.append(&scroll);
 
+    if !crate::config::bin_exists("rclone") {
+        let warn_card = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(4)
+            .css_classes(vec!["plan-check-row".to_string()])
+            .build();
+        warn_card.append(
+            &Label::builder()
+                .label("⚠ Missing dependency: rclone")
+                .halign(Align::Start)
+                .css_classes(vec!["plan-step".to_string()])
+                .build(),
+        );
+        warn_card.append(
+            &Label::builder()
+                .label("Install via your package manager (e.g. sudo pacman -S rclone) and run `rclone config`.")
+                .halign(Align::Start)
+                .wrap(true)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build(),
+        );
+        content.append(&warn_card);
+    }
+
     // 1. Remote Path Config
     let remote_lbl = Label::builder()
         .label("Remote Destination:")

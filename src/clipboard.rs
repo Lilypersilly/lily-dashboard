@@ -438,6 +438,30 @@ pub fn build_clipboard_ui(popover_guard: Rc<Cell<usize>>) -> Box {
     header_row.append(&clear_btn);
     root.append(&header_row);
 
+    if !crate::config::bin_exists("wl-paste") {
+        let warn_card = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(3)
+            .css_classes(vec!["plan-check-row".to_string()])
+            .build();
+        warn_card.append(
+            &Label::builder()
+                .label("⚠ Missing dependency: wl-clipboard (wl-paste)")
+                .halign(Align::Start)
+                .css_classes(vec!["plan-step".to_string()])
+                .build(),
+        );
+        warn_card.append(
+            &Label::builder()
+                .label("Install via your package manager (e.g. sudo pacman -S wl-clipboard).")
+                .halign(Align::Start)
+                .wrap(true)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build(),
+        );
+        root.append(&warn_card);
+    }
+
     let search_entry = SearchEntry::builder()
         .placeholder_text("Search clipboard...")
         .css_classes(vec!["fav-search".to_string()])
