@@ -1,7 +1,9 @@
-//! Simple local password list tab.
+//! Local password list tab with optional encrypted Locker vault integration.
 //!
-//! Stores entries in `~/.config/lily-dashboard/passwords.txt` with `0600` permissions
-//! and provides search, click-to-copy, and inline add/delete.
+//! Everyday logins live in `~/.config/lily-dashboard/passwords.txt` (`0600`) for
+//! instant access. Sensitive logins can be loaded directly from the unlocked Locker's
+//! `passwords.txt` into RAM (zeroized on lock/unload/exit) and auto-save back to the
+//! encrypted vault whenever added or deleted.
 
 use gtk4::gdk;
 use gtk4::glib;
@@ -19,12 +21,116 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
+thread_local! {
+    /// Decrypted contents of the Locker's `passwords.txt` held strictly in RAM.
+    /// Zeroized and cleared whenever the Locker locks, the user clicks Unload, or the app exits.
+    static LOCKER_PASSWORDS_RAM: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Zeroizes and clears any decrypted Locker passwords currently held in RAM.
+pub fn wipe_locker_ram_cache() {
+    LOCKER_PASSWORDS_RAM.with(|slot| {
+        if let Some(mut s) = slot.borrow_mut().take() {
+            unsafe {
+                for b in s.as_bytes_mut() {
+                    std::ptr::write_volatile(b, 0);
+                }
+            }
+        }
+    });
+}
+
+fn is_locker_loaded() -> bool {
+    LOCKER_PASSWORDS_RAM.with(|slot| slot.borrow().is_some())
+}
+
 #[derive(Clone)]
 struct PasswordEntry {
     line_idx: usize,
+    from_locker: bool,
     service: String,
     username: String,
     password: String,
+}
+
+fn parse_entries(content: &str, from_locker: bool) -> Vec<PasswordEntry> {
+    let mut entries = Vec::new();
+    for (line_idx, raw_line) in content.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.splitn(3, '|').map(|s| s.trim()).collect();
+        if parts.len() == 3 {
+            entries.push(PasswordEntry {
+                line_idx,
+                from_locker,
+                service: parts[0].to_string(),
+                username: parts[1].to_string(),
+                password: parts[2].to_string(),
+            });
+        }
+    }
+
+    entries.sort_by(|a, b| a.service.to_lowercase().cmp(&b.service.to_lowercase()));
+    entries
+}
+
+fn load_locker_entries_from_ram() -> Option<Vec<PasswordEntry>> {
+    LOCKER_PASSWORDS_RAM.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|content| parse_entries(content, true))
+    })
+}
+
+fn append_locker_entry(service: &str, username: &str, password: &str) -> Result<(), String> {
+    let clean_s = service.replace('|', "-");
+    let clean_u = username.replace('|', "-");
+    let new_line = format!("{} | {} | {}\n", clean_s, clean_u, password);
+
+    let updated = LOCKER_PASSWORDS_RAM.with(|slot| {
+        let borrow = slot.borrow();
+        let Some(existing) = borrow.as_ref() else {
+            return Err("Locker passwords not loaded".to_string());
+        };
+        let mut next = existing.clone();
+        if !next.is_empty() && !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push_str(&new_line);
+        Ok(next)
+    })?;
+
+    crate::locker::save_passwords_file(&updated)?;
+    LOCKER_PASSWORDS_RAM.with(|slot| {
+        *slot.borrow_mut() = Some(updated);
+    });
+    Ok(())
+}
+
+fn delete_locker_entry(target_line_idx: usize) -> Result<(), String> {
+    let updated = LOCKER_PASSWORDS_RAM.with(|slot| {
+        let borrow = slot.borrow();
+        let Some(existing) = borrow.as_ref() else {
+            return Err("Locker passwords not loaded".to_string());
+        };
+        let mut lines: Vec<&str> = existing.lines().collect();
+        if target_line_idx < lines.len() {
+            lines.remove(target_line_idx);
+        }
+        let mut out = lines.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        Ok(out)
+    })?;
+
+    crate::locker::save_passwords_file(&updated)?;
+    LOCKER_PASSWORDS_RAM.with(|slot| {
+        *slot.borrow_mut() = Some(updated);
+    });
+    Ok(())
 }
 
 fn passwords_file_path() -> PathBuf {
@@ -49,26 +155,7 @@ fn load_entries() -> Vec<PasswordEntry> {
     let Ok(content) = fs::read_to_string(path) else {
         return Vec::new();
     };
-
-    let mut entries = Vec::new();
-    for (line_idx, raw_line) in content.lines().enumerate() {
-        let trimmed = raw_line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = trimmed.splitn(3, '|').map(|s| s.trim()).collect();
-        if parts.len() == 3 {
-            entries.push(PasswordEntry {
-                line_idx,
-                service: parts[0].to_string(),
-                username: parts[1].to_string(),
-                password: parts[2].to_string(),
-            });
-        }
-    }
-
-    entries.sort_by(|a, b| a.service.to_lowercase().cmp(&b.service.to_lowercase()));
-    entries
+    parse_entries(&content, false)
 }
 
 fn append_entry(service: &str, username: &str, password: &str) {
@@ -185,7 +272,10 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
-pub fn build_passwords_ui(popover_guard: Rc<Cell<usize>>) -> Box {
+pub fn build_passwords_ui(
+    popover_guard: Rc<Cell<usize>>,
+    open_locker_cb: Rc<dyn Fn()>,
+) -> Box {
     let root = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(8)
@@ -202,6 +292,29 @@ pub fn build_passwords_ui(popover_guard: Rc<Cell<usize>>) -> Box {
         .css_classes(vec!["fav-search".to_string()])
         .build();
 
+    // --- Locker Passwords Action Bar ---
+    let locker_bar = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+
+    let load_locker_btn = Button::builder()
+        .label("󰌾 Load Locker Passwords")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .hexpand(true)
+        .tooltip_text("Decrypt Locker's passwords.txt into RAM (creates it if missing)")
+        .build();
+
+    let unload_locker_btn = Button::builder()
+        .label("Unload")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .tooltip_text("Wipe Locker passwords from RAM")
+        .visible(false)
+        .build();
+
+    locker_bar.append(&load_locker_btn);
+    locker_bar.append(&unload_locker_btn);
+
     let scrolled = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
@@ -216,11 +329,13 @@ pub fn build_passwords_ui(popover_guard: Rc<Cell<usize>>) -> Box {
 
     scrolled.set_child(Some(&list_container));
     root.append(&search_entry);
+    root.append(&locker_bar);
     root.append(&scrolled);
 
-    // Track which line_idx values currently have their password revealed
-    let revealed_set: Rc<RefCell<HashSet<usize>>> = Rc::new(RefCell::new(HashSet::new()));
+    // Track which (from_locker, line_idx) pairs currently have their password revealed
+    let revealed_set: Rc<RefCell<HashSet<(bool, usize)>>> = Rc::new(RefCell::new(HashSet::new()));
     let current_query = Rc::new(RefCell::new(String::new()));
+    let save_to_locker = Rc::new(Cell::new(is_locker_loaded()));
 
     // --- Collapsible "+ New Login" Creator Dock at the Bottom ---
     let creator_wrapper = Box::builder()
@@ -318,6 +433,28 @@ pub fn build_passwords_ui(popover_guard: Rc<Cell<usize>>) -> Box {
     pass_row.append(&pass_entry);
     pass_row.append(&gen_btn);
 
+    let target_btn = Button::builder()
+        .label("Save to: 󰌾 Locker")
+        .css_classes(vec!["plan-fmt-btn".to_string(), "active".to_string()])
+        .tooltip_text("Toggle whether new logins save to the encrypted Locker or plaintext passwords.txt")
+        .visible(is_locker_loaded())
+        .build();
+
+    {
+        let stl = save_to_locker.clone();
+        target_btn.connect_clicked(move |btn| {
+            let next = !stl.get();
+            stl.set(next);
+            if next {
+                btn.set_label("Save to: 󰌾 Locker");
+                btn.add_css_class("active");
+            } else {
+                btn.set_label("Save to: Plaintext");
+                btn.remove_css_class("active");
+            }
+        });
+    }
+
     let action_row = Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(6)
@@ -340,7 +477,98 @@ pub fn build_passwords_ui(popover_guard: Rc<Cell<usize>>) -> Box {
     form_box.append(&service_entry);
     form_box.append(&user_entry);
     form_box.append(&pass_row);
+    form_box.append(&target_btn);
     form_box.append(&action_row);
+
+    let sync_locker_ui: Rc<dyn Fn()> = {
+        let load_b = load_locker_btn.clone();
+        let unload_b = unload_locker_btn.clone();
+        let tgt_b = target_btn.clone();
+        let stl = save_to_locker.clone();
+        Rc::new(move || {
+            let loaded = is_locker_loaded();
+            if loaded {
+                let count = load_locker_entries_from_ram().map(|v| v.len()).unwrap_or(0);
+                load_b.set_label(&format!("󰌿 Locker Loaded ({})", count));
+                load_b.add_css_class("active");
+                load_b.set_sensitive(false);
+                unload_b.set_visible(true);
+                tgt_b.set_visible(true);
+                if stl.get() {
+                    tgt_b.set_label("Save to: 󰌾 Locker");
+                    tgt_b.add_css_class("active");
+                } else {
+                    tgt_b.set_label("Save to: Plaintext");
+                    tgt_b.remove_css_class("active");
+                }
+            } else {
+                load_b.set_label("󰌾 Load Locker Passwords");
+                load_b.remove_css_class("active");
+                load_b.set_sensitive(true);
+                unload_b.set_visible(false);
+                tgt_b.set_visible(false);
+            }
+        })
+    };
+    sync_locker_ui();
+
+    // Load Locker Passwords button handler
+    {
+        let list_l = list_container.clone();
+        let query_l = current_query.clone();
+        let rev_l = revealed_set.clone();
+        let guard_l = popover_guard.clone();
+        let sync_l = sync_locker_ui.clone();
+        let stl_l = save_to_locker.clone();
+        let open_locker = open_locker_cb.clone();
+        load_locker_btn.connect_clicked(move |btn| {
+            match crate::locker::load_or_create_passwords_file() {
+                Ok(content) => {
+                    LOCKER_PASSWORDS_RAM.with(|slot| {
+                        *slot.borrow_mut() = Some(content);
+                    });
+                    stl_l.set(true);
+                    sync_l();
+                    populate_password_list(&list_l, &query_l.borrow(), &rev_l, &guard_l, &sync_l);
+                }
+                Err(e) if e == "LOCKED" => {
+                    btn.set_label("Unlock Locker first...");
+                    let open_now = open_locker.clone();
+                    let btn_reset = btn.clone();
+                    let sync_reset = sync_l.clone();
+                    glib::timeout_add_local_once(Duration::from_millis(350), move || {
+                        let _ = btn_reset;
+                        sync_reset();
+                        open_now();
+                    });
+                }
+                Err(e) => {
+                    btn.set_label(&format!("Error: {}", e));
+                    let sync_reset = sync_l.clone();
+                    glib::timeout_add_local_once(Duration::from_millis(2000), move || {
+                        sync_reset();
+                    });
+                }
+            }
+        });
+    }
+
+    // Unload Locker Passwords button handler
+    {
+        let list_u = list_container.clone();
+        let query_u = current_query.clone();
+        let rev_u = revealed_set.clone();
+        let guard_u = popover_guard.clone();
+        let sync_u = sync_locker_ui.clone();
+        let stl_u = save_to_locker.clone();
+        unload_locker_btn.connect_clicked(move |_| {
+            wipe_locker_ram_cache();
+            stl_u.set(false);
+            rev_u.borrow_mut().retain(|(from_locker, _)| !*from_locker);
+            sync_u();
+            populate_password_list(&list_u, &query_u.borrow(), &rev_u, &guard_u, &sync_u);
+        });
+    }
 
     let form_toggle = form_box.clone();
     let btn_toggle = toggle_creator_btn.clone();
@@ -366,6 +594,7 @@ pub fn build_passwords_ui(popover_guard: Rc<Cell<usize>>) -> Box {
         &current_query.borrow(),
         &revealed_set,
         &popover_guard,
+        &sync_locker_ui,
     );
 
     // Search filter handler
@@ -373,10 +602,11 @@ pub fn build_passwords_ui(popover_guard: Rc<Cell<usize>>) -> Box {
     let query_search = current_query.clone();
     let rev_search = revealed_set.clone();
     let guard_search = popover_guard.clone();
+    let sync_search = sync_locker_ui.clone();
     search_entry.connect_search_changed(move |entry| {
         let q = entry.text().trim().to_lowercase();
         *query_search.borrow_mut() = q.clone();
-        populate_password_list(&list_search, &q, &rev_search, &guard_search);
+        populate_password_list(&list_search, &q, &rev_search, &guard_search, &sync_search);
     });
 
     // Save New Login handler
@@ -384,11 +614,14 @@ pub fn build_passwords_ui(popover_guard: Rc<Cell<usize>>) -> Box {
     let query_save = current_query.clone();
     let rev_save = revealed_set.clone();
     let guard_save = popover_guard.clone();
+    let sync_save = sync_locker_ui.clone();
+    let stl_save = save_to_locker.clone();
     let srv_save = service_entry.clone();
     let usr_save = user_entry.clone();
     let pwd_save = pass_entry.clone();
     let form_save = form_box.clone();
     let toggle_save = toggle_creator_btn.clone();
+    let save_btn_status = save_btn.clone();
 
     let commit_save = Rc::new(move || {
         let s = srv_save.text().trim().to_string();
@@ -397,13 +630,25 @@ pub fn build_passwords_ui(popover_guard: Rc<Cell<usize>>) -> Box {
         if s.is_empty() || p.is_empty() {
             return;
         }
-        append_entry(&s, &u, &p);
+        if is_locker_loaded() && stl_save.get() {
+            if let Err(e) = append_locker_entry(&s, &u, &p) {
+                save_btn_status.set_label(&format!("Locker error: {}", e));
+                let sb_reset = save_btn_status.clone();
+                glib::timeout_add_local_once(Duration::from_millis(1800), move || {
+                    sb_reset.set_label("Save Login");
+                });
+                return;
+            }
+        } else {
+            append_entry(&s, &u, &p);
+        }
         srv_save.set_text("");
         usr_save.set_text("");
         pwd_save.set_text("");
         form_save.set_visible(false);
         toggle_save.set_visible(true);
-        populate_password_list(&list_save, &query_save.borrow(), &rev_save, &guard_save);
+        sync_save();
+        populate_password_list(&list_save, &query_save.borrow(), &rev_save, &guard_save, &sync_save);
     });
 
     let commit_btn = commit_save.clone();
@@ -418,24 +663,63 @@ pub fn build_passwords_ui(popover_guard: Rc<Cell<usize>>) -> Box {
 fn populate_password_list(
     container: &Box,
     query: &str,
-    revealed_set: &Rc<RefCell<HashSet<usize>>>,
+    revealed_set: &Rc<RefCell<HashSet<(bool, usize)>>>,
     popover_guard: &Rc<Cell<usize>>,
+    sync_locker_ui: &Rc<dyn Fn()>,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
 
+    let mut total_shown = 0;
+
+    // 1. Locker Passwords section (when loaded into RAM)
+    if let Some(locker_entries) = load_locker_entries_from_ram() {
+        let locker_header = Label::builder()
+            .label("󰌾 LOCKER PASSWORDS")
+            .halign(Align::Start)
+            .css_classes(vec!["fav-group-header".to_string()])
+            .margin_top(2)
+            .build();
+        container.append(&locker_header);
+
+        let mut locker_shown = 0;
+        for item in locker_entries {
+            if !query.is_empty() {
+                let s_match = item.service.to_lowercase().contains(query);
+                let u_match = item.username.to_lowercase().contains(query);
+                if !s_match && !u_match {
+                    continue;
+                }
+            }
+            append_entry_row(container, &item, query, revealed_set, popover_guard, sync_locker_ui);
+            locker_shown += 1;
+            total_shown += 1;
+        }
+
+        if locker_shown == 0 && query.is_empty() {
+            let hint = Label::builder()
+                .label("No Locker logins yet — new logins auto-save here.")
+                .halign(Align::Start)
+                .css_classes(vec!["fav-score-badge".to_string()])
+                .margin_start(4)
+                .margin_bottom(4)
+                .build();
+            container.append(&hint);
+        }
+    }
+
+    // 2. Plaintext Saved Logins section
     let header = Label::builder()
         .label("SAVED LOGINS")
         .halign(Align::Start)
         .css_classes(vec!["fav-group-header".to_string()])
-        .margin_top(2)
+        .margin_top(if is_locker_loaded() { 8 } else { 2 })
         .build();
     container.append(&header);
 
     let entries = load_entries();
-    let mut shown = 0;
-
+    let mut plain_shown = 0;
     for item in entries {
         if !query.is_empty() {
             let s_match = item.service.to_lowercase().contains(query);
@@ -444,237 +728,12 @@ fn populate_password_list(
                 continue;
             }
         }
-
-        let is_revealed = revealed_set.borrow().contains(&item.line_idx);
-
-        let row_box = Box::builder()
-            .orientation(Orientation::Horizontal)
-            .build();
-
-        let btn = Button::builder()
-            .css_classes(vec!["fav-item-btn".to_string()])
-            .hexpand(true)
-            .tooltip_text("Left-click to copy password | Right-click for options")
-            .build();
-
-        let inner_col = Box::builder()
-            .orientation(Orientation::Vertical)
-            .spacing(2)
-            .build();
-
-        let top_row = Box::builder()
-            .orientation(Orientation::Horizontal)
-            .spacing(6)
-            .build();
-
-        let service_lbl = Label::builder()
-            .label(&item.service)
-            .halign(Align::Start)
-            .hexpand(true)
-            .ellipsize(gtk4::pango::EllipsizeMode::End)
-            .build();
-
-        let status_lbl = Label::builder()
-            .label("Copy")
-            .css_classes(vec!["fav-score-badge".to_string()])
-            .halign(Align::End)
-            .build();
-
-        top_row.append(&service_lbl);
-        top_row.append(&status_lbl);
-        inner_col.append(&top_row);
-
-        if !item.username.is_empty() {
-            let user_lbl = Label::builder()
-                .label(&item.username)
-                .halign(Align::Start)
-                .ellipsize(gtk4::pango::EllipsizeMode::End)
-                .css_classes(vec!["fav-score-badge".to_string()])
-                .build();
-            inner_col.append(&user_lbl);
-        }
-
-        if is_revealed {
-            let pass_lbl = Label::builder()
-                .label(&format!("Pass: {}", item.password))
-                .halign(Align::Start)
-                .ellipsize(gtk4::pango::EllipsizeMode::End)
-                .css_classes(vec!["plan-subnote".to_string()])
-                .build();
-            inner_col.append(&pass_lbl);
-        }
-
-        btn.set_child(Some(&inner_col));
-
-        // Left-Click: Copy Password immediately & flash "Copied!"
-        let pass_copy = item.password.clone();
-        let status_flash = status_lbl.clone();
-        btn.connect_clicked(move |_| {
-            copy_to_clipboard(&pass_copy);
-            status_flash.set_label("Copied!");
-            let status_reset = status_flash.clone();
-            glib::timeout_add_local_once(Duration::from_millis(1200), move || {
-                status_reset.set_label("Copy");
-            });
-        });
-
-        // Lazily build Right-Click Context Menu on demand & unparent on close
-        let right_click = GestureClick::builder().button(3).build();
-        let row_weak = row_box.downgrade();
-        let guard_ctx = popover_guard.clone();
-        let usr_ctx = item.username.clone();
-        let pwd_ctx = item.password.clone();
-        let status_ctx = status_lbl.clone();
-        let idx = item.line_idx;
-        let rev_ctx = revealed_set.clone();
-        let cont_ctx = container.clone();
-        let query_ctx = query.to_string();
-
-        right_click.connect_pressed(move |_, _, _, _| {
-            let Some(parent_row) = row_weak.upgrade() else {
-                return;
-            };
-
-            let popover = Popover::builder()
-                .css_classes(vec!["fav-popover".to_string()])
-                .autohide(true)
-                .build();
-            popover.set_parent(&parent_row);
-
-            popover.connect_closed(|p| {
-                let p_weak = p.downgrade();
-                glib::idle_add_local_once(move || {
-                    if let Some(pop) = p_weak.upgrade() {
-                        pop.unparent();
-                    }
-                });
-            });
-
-            let guard_map = guard_ctx.clone();
-            popover.connect_map(move |_| {
-                guard_map.set(guard_map.get() + 1);
-            });
-            let guard_unmap = guard_ctx.clone();
-            popover.connect_unmap(move |_| {
-                let g = guard_unmap.clone();
-                glib::timeout_add_local_once(Duration::from_millis(150), move || {
-                    g.set(g.get().saturating_sub(1));
-                });
-            });
-
-            let menu_box = Box::builder()
-                .orientation(Orientation::Vertical)
-                .spacing(4)
-                .build();
-
-            let copy_user_btn = Button::builder()
-                .label("Copy Username")
-                .css_classes(vec!["fav-hide-btn".to_string()])
-                .build();
-
-            let copy_pass_btn = Button::builder()
-                .label("Copy Password")
-                .css_classes(vec!["fav-hide-btn".to_string()])
-                .build();
-
-            let reveal_btn = Button::builder()
-                .label(if is_revealed {
-                    "Hide Password"
-                } else {
-                    "Show Password"
-                })
-                .css_classes(vec!["fav-hide-btn".to_string()])
-                .build();
-
-            let delete_btn = Button::builder()
-                .label("Delete Login")
-                .css_classes(vec!["plan-delete-menu-btn".to_string()])
-                .build();
-
-            menu_box.append(&copy_user_btn);
-            menu_box.append(&copy_pass_btn);
-            menu_box.append(&reveal_btn);
-            menu_box.append(&delete_btn);
-            popover.set_child(Some(&menu_box));
-
-            // 1. Copy Username
-            let usr_str = usr_ctx.clone();
-            let pop_usr = popover.downgrade();
-            let status_usr = status_ctx.clone();
-            copy_user_btn.connect_clicked(move |_| {
-                if let Some(p) = pop_usr.upgrade() {
-                    p.popdown();
-                }
-                copy_to_clipboard(&usr_str);
-                status_usr.set_label("User Copied!");
-                let status_reset = status_usr.clone();
-                glib::timeout_add_local_once(Duration::from_millis(1200), move || {
-                    status_reset.set_label("Copy");
-                });
-            });
-
-            // 2. Copy Password
-            let pwd_str = pwd_ctx.clone();
-            let pop_pwd = popover.downgrade();
-            let status_pwd = status_ctx.clone();
-            copy_pass_btn.connect_clicked(move |_| {
-                if let Some(p) = pop_pwd.upgrade() {
-                    p.popdown();
-                }
-                copy_to_clipboard(&pwd_str);
-                status_pwd.set_label("Copied!");
-                let status_reset = status_pwd.clone();
-                glib::timeout_add_local_once(Duration::from_millis(1200), move || {
-                    status_reset.set_label("Copy");
-                });
-            });
-
-            // 3. Show / Hide Password
-            let rev_toggle = rev_ctx.clone();
-            let cont_rev = cont_ctx.clone();
-            let query_rev = query_ctx.clone();
-            let guard_rev = guard_ctx.clone();
-            let pop_rev = popover.downgrade();
-            reveal_btn.connect_clicked(move |_| {
-                if let Some(p) = pop_rev.upgrade() {
-                    p.popdown();
-                }
-                {
-                    let mut set = rev_toggle.borrow_mut();
-                    if set.contains(&idx) {
-                        set.remove(&idx);
-                    } else {
-                        set.insert(idx);
-                    }
-                }
-                populate_password_list(&cont_rev, &query_rev, &rev_toggle, &guard_rev);
-            });
-
-            // 4. Delete Login
-            let cont_del = cont_ctx.clone();
-            let query_del = query_ctx.clone();
-            let rev_del = rev_ctx.clone();
-            let guard_del = guard_ctx.clone();
-            let pop_del = popover.downgrade();
-            delete_btn.connect_clicked(move |_| {
-                if let Some(p) = pop_del.upgrade() {
-                    p.popdown();
-                }
-                delete_entry(idx);
-                rev_del.borrow_mut().remove(&idx);
-                populate_password_list(&cont_del, &query_del, &rev_del, &guard_del);
-            });
-
-            popover.popup();
-        });
-        btn.add_controller(right_click);
-
-        row_box.append(&btn);
-        container.append(&row_box);
-        shown += 1;
+        append_entry_row(container, &item, query, revealed_set, popover_guard, sync_locker_ui);
+        plain_shown += 1;
+        total_shown += 1;
     }
 
-    if shown == 0 {
+    if total_shown == 0 && plain_shown == 0 {
         let empty_lbl = Label::builder()
             .label(if query.is_empty() {
                 "No logins saved yet.\nClick '+ New Login' below!"
@@ -687,4 +746,263 @@ fn populate_password_list(
             .build();
         container.append(&empty_lbl);
     }
+}
+
+fn append_entry_row(
+    container: &Box,
+    item: &PasswordEntry,
+    query: &str,
+    revealed_set: &Rc<RefCell<HashSet<(bool, usize)>>>,
+    popover_guard: &Rc<Cell<usize>>,
+    sync_locker_ui: &Rc<dyn Fn()>,
+) {
+    let key = (item.from_locker, item.line_idx);
+    let is_revealed = revealed_set.borrow().contains(&key);
+
+    let row_box = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .build();
+
+    let btn = Button::builder()
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .hexpand(true)
+        .tooltip_text(if item.from_locker {
+            "Encrypted in Locker • Left-click to copy password | Right-click for options"
+        } else {
+            "Left-click to copy password | Right-click for options"
+        })
+        .build();
+
+    let inner_col = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(2)
+        .build();
+
+    let top_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+
+    let service_text = if item.from_locker {
+        format!("󰌾 {}", item.service)
+    } else {
+        item.service.clone()
+    };
+    let service_lbl = Label::builder()
+        .label(&service_text)
+        .halign(Align::Start)
+        .hexpand(true)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .build();
+
+    let status_lbl = Label::builder()
+        .label("Copy")
+        .css_classes(vec!["fav-score-badge".to_string()])
+        .halign(Align::End)
+        .build();
+
+    top_row.append(&service_lbl);
+    top_row.append(&status_lbl);
+    inner_col.append(&top_row);
+
+    if !item.username.is_empty() {
+        let user_lbl = Label::builder()
+            .label(&item.username)
+            .halign(Align::Start)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .css_classes(vec!["fav-score-badge".to_string()])
+            .build();
+        inner_col.append(&user_lbl);
+    }
+
+    if is_revealed {
+        let pass_lbl = Label::builder()
+            .label(&format!("Pass: {}", item.password))
+            .halign(Align::Start)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build();
+        inner_col.append(&pass_lbl);
+    }
+
+    btn.set_child(Some(&inner_col));
+
+    // Left-Click: Copy Password immediately & flash "Copied!"
+    let pass_copy = item.password.clone();
+    let status_flash = status_lbl.clone();
+    btn.connect_clicked(move |_| {
+        copy_to_clipboard(&pass_copy);
+        status_flash.set_label("Copied!");
+        let status_reset = status_flash.clone();
+        glib::timeout_add_local_once(Duration::from_millis(1200), move || {
+            status_reset.set_label("Copy");
+        });
+    });
+
+    // Lazily build Right-Click Context Menu on demand & unparent on close
+    let right_click = GestureClick::builder().button(3).build();
+    let row_weak = row_box.downgrade();
+    let guard_ctx = popover_guard.clone();
+    let usr_ctx = item.username.clone();
+    let pwd_ctx = item.password.clone();
+    let status_ctx = status_lbl.clone();
+    let from_locker = item.from_locker;
+    let idx = item.line_idx;
+    let rev_ctx = revealed_set.clone();
+    let cont_ctx = container.clone();
+    let query_ctx = query.to_string();
+    let sync_ctx = sync_locker_ui.clone();
+
+    right_click.connect_pressed(move |_, _, _, _| {
+        let Some(parent_row) = row_weak.upgrade() else {
+            return;
+        };
+
+        let popover = Popover::builder()
+            .css_classes(vec!["fav-popover".to_string()])
+            .autohide(true)
+            .build();
+        popover.set_parent(&parent_row);
+
+        popover.connect_closed(|p| {
+            let p_weak = p.downgrade();
+            glib::idle_add_local_once(move || {
+                if let Some(pop) = p_weak.upgrade() {
+                    pop.unparent();
+                }
+            });
+        });
+
+        let guard_map = guard_ctx.clone();
+        popover.connect_map(move |_| {
+            guard_map.set(guard_map.get() + 1);
+        });
+        let guard_unmap = guard_ctx.clone();
+        popover.connect_unmap(move |_| {
+            let g = guard_unmap.clone();
+            glib::timeout_add_local_once(Duration::from_millis(150), move || {
+                g.set(g.get().saturating_sub(1));
+            });
+        });
+
+        let menu_box = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(4)
+            .build();
+
+        let copy_user_btn = Button::builder()
+            .label("Copy Username")
+            .css_classes(vec!["fav-hide-btn".to_string()])
+            .build();
+
+        let copy_pass_btn = Button::builder()
+            .label("Copy Password")
+            .css_classes(vec!["fav-hide-btn".to_string()])
+            .build();
+
+        let reveal_btn = Button::builder()
+            .label(if is_revealed {
+                "Hide Password"
+            } else {
+                "Show Password"
+            })
+            .css_classes(vec!["fav-hide-btn".to_string()])
+            .build();
+
+        let delete_btn = Button::builder()
+            .label(if from_locker {
+                "Delete from Locker"
+            } else {
+                "Delete Login"
+            })
+            .css_classes(vec!["plan-delete-menu-btn".to_string()])
+            .build();
+
+        menu_box.append(&copy_user_btn);
+        menu_box.append(&copy_pass_btn);
+        menu_box.append(&reveal_btn);
+        menu_box.append(&delete_btn);
+        popover.set_child(Some(&menu_box));
+
+        // 1. Copy Username
+        let usr_str = usr_ctx.clone();
+        let pop_usr = popover.downgrade();
+        let status_usr = status_ctx.clone();
+        copy_user_btn.connect_clicked(move |_| {
+            if let Some(p) = pop_usr.upgrade() {
+                p.popdown();
+            }
+            copy_to_clipboard(&usr_str);
+            status_usr.set_label("User Copied!");
+            let status_reset = status_usr.clone();
+            glib::timeout_add_local_once(Duration::from_millis(1200), move || {
+                status_reset.set_label("Copy");
+            });
+        });
+
+        // 2. Copy Password
+        let pwd_str = pwd_ctx.clone();
+        let pop_pwd = popover.downgrade();
+        let status_pwd = status_ctx.clone();
+        copy_pass_btn.connect_clicked(move |_| {
+            if let Some(p) = pop_pwd.upgrade() {
+                p.popdown();
+            }
+            copy_to_clipboard(&pwd_str);
+            status_pwd.set_label("Copied!");
+            let status_reset = status_pwd.clone();
+            glib::timeout_add_local_once(Duration::from_millis(1200), move || {
+                status_reset.set_label("Copy");
+            });
+        });
+
+        // 3. Show / Hide Password
+        let rev_toggle = rev_ctx.clone();
+        let cont_rev = cont_ctx.clone();
+        let query_rev = query_ctx.clone();
+        let guard_rev = guard_ctx.clone();
+        let sync_rev = sync_ctx.clone();
+        let pop_rev = popover.downgrade();
+        reveal_btn.connect_clicked(move |_| {
+            if let Some(p) = pop_rev.upgrade() {
+                p.popdown();
+            }
+            {
+                let mut set = rev_toggle.borrow_mut();
+                if set.contains(&(from_locker, idx)) {
+                    set.remove(&(from_locker, idx));
+                } else {
+                    set.insert((from_locker, idx));
+                }
+            }
+            populate_password_list(&cont_rev, &query_rev, &rev_toggle, &guard_rev, &sync_rev);
+        });
+
+        // 4. Delete Login
+        let cont_del = cont_ctx.clone();
+        let query_del = query_ctx.clone();
+        let rev_del = rev_ctx.clone();
+        let guard_del = guard_ctx.clone();
+        let sync_del = sync_ctx.clone();
+        let pop_del = popover.downgrade();
+        delete_btn.connect_clicked(move |_| {
+            if let Some(p) = pop_del.upgrade() {
+                p.popdown();
+            }
+            if from_locker {
+                let _ = delete_locker_entry(idx);
+            } else {
+                delete_entry(idx);
+            }
+            rev_del.borrow_mut().remove(&(from_locker, idx));
+            sync_del();
+            populate_password_list(&cont_del, &query_del, &rev_del, &guard_del, &sync_del);
+        });
+
+        popover.popup();
+    });
+    btn.add_controller(right_click);
+
+    row_box.append(&btn);
+    container.append(&row_box);
 }

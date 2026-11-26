@@ -67,7 +67,10 @@ fn main() {
         let reload_cb = init_theme();
         *reload_theme_startup.borrow_mut() = Some(reload_cb);
     });
-    app.connect_shutdown(|_| clipboard::shutdown_watchers());
+    app.connect_shutdown(|_| {
+        clipboard::shutdown_watchers();
+        passwords::wipe_locker_ram_cache();
+    });
 
     // Store the trigger button so re-running `lily-dashboard` (e.g. via SUPER keybind)
     // toggles the already-running dashboard open/closed instead of spawning a second window!
@@ -1282,7 +1285,14 @@ fn build_ui(
             }
             Some("passwords") => {
                 if passwords_slot_c.first_child().is_none() {
-                    passwords_slot_c.append(&passwords::build_passwords_ui(guard_lazy.clone()));
+                    let stk_for_locker = stk.clone();
+                    let open_locker: Rc<dyn Fn()> = Rc::new(move || {
+                        stk_for_locker.set_visible_child_name("locker");
+                    });
+                    passwords_slot_c.append(&passwords::build_passwords_ui(
+                        guard_lazy.clone(),
+                        open_locker,
+                    ));
                 }
             }
             Some("clipboard") => {

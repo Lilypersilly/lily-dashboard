@@ -33,6 +33,12 @@ use std::time::Duration;
 const KEYFILE_NAME: &str = ".lily_master.key";
 const INDEX_FILENAME: &str = "vault.lilar";
 const RAM_EXTRACT_DIR: &str = "/dev/shm/lily-locker";
+const LOCKER_PASSWORDS_FILENAME: &str = "passwords.txt";
+
+thread_local! {
+    static ACTIVE_SESSION: RefCell<Option<Rc<RefCell<Option<UnlockedSession>>>>> = const { RefCell::new(None) };
+    static ACTIVE_REFRESH_CB: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+}
 
 const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB plaintext chunks
 const TAG_SIZE: usize = 16; // 16-byte AES-GCM authentication tag per chunk
@@ -520,6 +526,264 @@ fn stream_decrypt_file_from_blocks(
     Ok(())
 }
 
+/// Encrypts an in-memory byte slice directly into `.lilar` blocks (never touches disk/tmpfs in plaintext).
+fn encrypt_bytes_to_blocks(
+    vault_dir: &Path,
+    master_dek: &[u8; 32],
+    active_block_id: &mut u32,
+    data: &[u8],
+    display_name: String,
+) -> Result<VaultFileEntry, String> {
+    let orig_size = data.len() as u64;
+    let file_salt = random_fixed::<16>();
+    let stream_nonce = random_fixed::<7>();
+    let subkey = derive_file_subkey(master_dek, &file_salt);
+
+    let aead = Aes256Gcm::new((&subkey).into());
+    let mut encryptor_opt = Some(EncryptorBE32::from_aead(aead, (&stream_nonce).into()));
+
+    let mut segments: Vec<ChunkSegment> = Vec::new();
+    if *active_block_id == 0 {
+        *active_block_id = 1;
+    }
+
+    let mut offset = 0usize;
+    loop {
+        let end = (offset + CHUNK_SIZE).min(data.len());
+        let chunk_slice = &data[offset..end];
+        let is_eof = end >= data.len();
+
+        let ciphertext = if is_eof {
+            encryptor_opt
+                .take()
+                .ok_or_else(|| "Encryptor already consumed".to_string())?
+                .encrypt_last(Payload {
+                    msg: chunk_slice,
+                    aad: b"",
+                })
+                .map_err(|_| "Stream encrypt_last failed".to_string())?
+        } else {
+            encryptor_opt
+                .as_mut()
+                .ok_or_else(|| "Encryptor already consumed".to_string())?
+                .encrypt_next(Payload {
+                    msg: chunk_slice,
+                    aad: b"",
+                })
+                .map_err(|_| "Stream encrypt_next failed".to_string())?
+        };
+
+        let b_path = block_path(vault_dir, *active_block_id);
+        let cur_block_len = b_path.metadata().map(|m| m.len()).unwrap_or(0);
+        if cur_block_len > 0 && cur_block_len + (ciphertext.len() as u64) > MAX_BLOCK_SIZE {
+            *active_block_id += 1;
+        }
+
+        let target_block_id = *active_block_id;
+        let target_path = block_path(vault_dir, target_block_id);
+        let mut block_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&target_path)
+            .map_err(|e| format!("Block open error: {}", e))?;
+
+        let write_offset = block_file.metadata().map(|m| m.len()).unwrap_or(0);
+        block_file
+            .write_all(&ciphertext)
+            .map_err(|e| format!("Block write error: {}", e))?;
+
+        let c_len = ciphertext.len() as u64;
+        if let Some(last_seg) = segments.last_mut() {
+            if last_seg.block_id == target_block_id
+                && last_seg.offset + last_seg.cipher_len == write_offset
+            {
+                last_seg.cipher_len += c_len;
+            } else {
+                segments.push(ChunkSegment {
+                    block_id: target_block_id,
+                    offset: write_offset,
+                    cipher_len: c_len,
+                });
+            }
+        } else {
+            segments.push(ChunkSegment {
+                block_id: target_block_id,
+                offset: write_offset,
+                cipher_len: c_len,
+            });
+        }
+
+        offset = end;
+        if is_eof {
+            break;
+        }
+    }
+
+    Ok(VaultFileEntry {
+        name: display_name,
+        original_size: orig_size,
+        file_salt,
+        stream_nonce,
+        segments,
+    })
+}
+
+/// Decrypts a `VaultFileEntry` directly into an in-memory `Vec<u8>` (never writes plaintext to disk).
+fn decrypt_entry_to_bytes(
+    vault_dir: &Path,
+    master_dek: &[u8; 32],
+    entry: &VaultFileEntry,
+) -> Result<Vec<u8>, String> {
+    let subkey = derive_file_subkey(master_dek, &entry.file_salt);
+    let aead = Aes256Gcm::new((&subkey).into());
+    let mut decryptor_opt = Some(DecryptorBE32::from_aead(aead, (&entry.stream_nonce).into()));
+    let mut out = Vec::with_capacity(entry.original_size as usize);
+
+    for (seg_idx, seg) in entry.segments.iter().enumerate() {
+        let is_last_seg = seg_idx + 1 == entry.segments.len();
+        let b_path = block_path(vault_dir, seg.block_id);
+        let mut block_file =
+            File::open(&b_path).map_err(|e| format!("Missing block {:03}: {}", seg.block_id, e))?;
+        block_file
+            .seek(SeekFrom::Start(seg.offset))
+            .map_err(|e| format!("Seek error: {}", e))?;
+
+        let mut remaining_in_seg = seg.cipher_len as usize;
+        while remaining_in_seg > 0 {
+            let to_read = remaining_in_seg.min(CIPHER_CHUNK_SIZE);
+            let mut c_buf = vec![0u8; to_read];
+            block_file
+                .read_exact(&mut c_buf)
+                .map_err(|e| format!("Block read error: {}", e))?;
+
+            remaining_in_seg -= to_read;
+            let is_eof = is_last_seg && remaining_in_seg == 0;
+            let plaintext = if is_eof {
+                decryptor_opt
+                    .take()
+                    .ok_or_else(|| "Decryptor already consumed".to_string())?
+                    .decrypt_last(Payload {
+                        msg: &c_buf,
+                        aad: b"",
+                    })
+                    .map_err(|_| "Corrupted block or authentication tag mismatch!".to_string())?
+            } else {
+                decryptor_opt
+                    .as_mut()
+                    .ok_or_else(|| "Decryptor already consumed".to_string())?
+                    .decrypt_next(Payload {
+                        msg: &c_buf,
+                        aad: b"",
+                    })
+                    .map_err(|_| "Corrupted chunk authentication tag!".to_string())?
+            };
+
+            out.extend_from_slice(&plaintext);
+            if is_eof {
+                return Ok(out);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn notify_locker_ui_refresh() {
+    let cb = ACTIVE_REFRESH_CB.with(|c| c.borrow().clone());
+    if let Some(f) = cb {
+        f();
+    }
+}
+
+/// Returns `true` if the Locker vault is currently unlocked in memory.
+pub fn is_unlocked() -> bool {
+    ACTIVE_SESSION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|rc| rc.borrow().is_some())
+            .unwrap_or(false)
+    })
+}
+
+/// Loads `passwords.txt` from the unlocked Locker directly into RAM.
+/// If no `passwords.txt` exists in the vault yet, creates an empty encrypted one automatically.
+pub fn load_or_create_passwords_file() -> Result<String, String> {
+    let sess_rc = ACTIVE_SESSION
+        .with(|slot| slot.borrow().clone())
+        .ok_or_else(|| "LOCKED".to_string())?;
+
+    let existing = {
+        let borrow = sess_rc.borrow();
+        let Some(s) = borrow.as_ref() else {
+            return Err("LOCKED".to_string());
+        };
+        s.index
+            .files
+            .iter()
+            .find(|f| f.name == LOCKER_PASSWORDS_FILENAME)
+            .cloned()
+            .map(|entry| (s.vault_dir.clone(), s.dek, entry))
+    };
+
+    if let Some((vault_dir, dek, entry)) = existing {
+        let bytes = decrypt_entry_to_bytes(&vault_dir, &dek, &entry)?;
+        return Ok(String::from_utf8_lossy(&bytes).to_string());
+    }
+
+    // No passwords.txt in Locker yet — create an empty encrypted one
+    save_passwords_file("")?;
+    Ok(String::new())
+}
+
+/// Encrypts `content` directly from RAM into the unlocked Locker's `passwords.txt`.
+pub fn save_passwords_file(content: &str) -> Result<(), String> {
+    let sess_rc = ACTIVE_SESSION
+        .with(|slot| slot.borrow().clone())
+        .ok_or_else(|| "LOCKED".to_string())?;
+
+    {
+        let mut borrow = sess_rc.borrow_mut();
+        let Some(s) = borrow.as_mut() else {
+            return Err("LOCKED".to_string());
+        };
+
+        let mut next_blk = s.index.next_block_id;
+        let new_entry = encrypt_bytes_to_blocks(
+            &s.vault_dir,
+            &s.dek,
+            &mut next_blk,
+            content.as_bytes(),
+            LOCKER_PASSWORDS_FILENAME.to_string(),
+        )?;
+
+        if let Some(last_seg) = new_entry.segments.last() {
+            s.index.next_block_id = s.index.next_block_id.max(last_seg.block_id);
+        }
+
+        if let Some(pos) = s
+            .index
+            .files
+            .iter()
+            .position(|f| f.name == LOCKER_PASSWORDS_FILENAME)
+        {
+            let old = std::mem::replace(&mut s.index.files[pos], new_entry);
+            for seg in old.segments {
+                *s.index
+                    .dead_bytes_per_block
+                    .entry(seg.block_id)
+                    .or_insert(0) += seg.cipher_len;
+            }
+        } else {
+            s.index.files.push(new_entry);
+        }
+
+        save_vault_index(s)?;
+    }
+
+    notify_locker_ui_refresh();
+    Ok(())
+}
+
 /// Surgical Atomic Vacuum:
 /// Finds any block with dead space, streams all surviving segments into a brand-new block ID,
 /// updates the index, and returns the compacted index + list of old block IDs to delete after saving.
@@ -644,6 +908,9 @@ pub fn build_locker_ui(popover_guard: Rc<Cell<usize>>) -> Box {
     root.append(&stack);
 
     let session_rc: Rc<RefCell<Option<UnlockedSession>>> = Rc::new(RefCell::new(None));
+    ACTIVE_SESSION.with(|slot| {
+        *slot.borrow_mut() = Some(session_rc.clone());
+    });
     let (tx, rx) = mpsc::channel::<WorkerEvent>();
 
     // =========================================================================
@@ -1320,6 +1587,9 @@ pub fn build_locker_ui(popover_guard: Rc<Cell<usize>>) -> Box {
         });
 
         *self_rc.borrow_mut() = Some(closure.clone());
+        ACTIVE_REFRESH_CB.with(|c| {
+            *c.borrow_mut() = Some(closure.clone());
+        });
         closure
     };
 
@@ -1334,6 +1604,7 @@ pub fn build_locker_ui(popover_guard: Rc<Cell<usize>>) -> Box {
 
         Rc::new(move || {
             *sess_l.borrow_mut() = None;
+            crate::passwords::wipe_locker_ram_cache();
             let _ = fs::remove_dir_all(RAM_EXTRACT_DIR);
             pin_l.set_text("");
             err_l.set_label("");
