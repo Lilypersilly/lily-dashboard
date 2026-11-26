@@ -356,6 +356,9 @@ fn init_theme() -> Rc<dyn Fn()> {
                 calendar.lily-calendar > grid > label.day-number.other-month {{ opacity: 0.35; }}
                 
                 label {{ color: #{fg_main}; font-family: '{ui_font}', sans-serif; font-size: {fs_16}px; }}
+                entry {{ background-color: #{bg_recessed}; color: #{fg_main}; caret-color: #{accent2}; border: 1px solid {accent1_35}; border-radius: {r_sm}px; padding: 6px 10px; font-family: '{ui_font}', sans-serif; font-size: {fs_14}px; box-shadow: none; }}
+                entry:focus-within {{ border-color: #{accent1}; outline: none; box-shadow: none; }}
+                entry > text > placeholder {{ color: #{fg_muted}; }}
                 
                 .trigger-wrapper {{ min-width: 50px; min-height: {trig_h}px; }}
                 .trigger-btn {{ background-color: #{bg_pill}; border: 2px solid #{accent1}; {trig_edge_css} min-width: 50px; padding: 0; transition-property: transform, background-color; transition-duration: 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1); }}
