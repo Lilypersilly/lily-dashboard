@@ -107,10 +107,14 @@ struct UnlockedSession {
 
 impl Drop for UnlockedSession {
     fn drop(&mut self) {
-        // Zeroize DEK in memory on lock/drop
+        // Zeroize DEK in memory on lock/drop using write_volatile + compiler_fence
+        // so LLVM dead-store elimination cannot optimize the wipe away in release builds.
         for b in &mut self.dek {
-            *b = 0;
+            unsafe {
+                std::ptr::write_volatile(b, 0);
+            }
         }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -693,16 +697,6 @@ fn notify_locker_ui_refresh() {
     if let Some(f) = cb {
         f();
     }
-}
-
-/// Returns `true` if the Locker vault is currently unlocked in memory.
-pub fn is_unlocked() -> bool {
-    ACTIVE_SESSION.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|rc| rc.borrow().is_some())
-            .unwrap_or(false)
-    })
 }
 
 /// Loads `passwords.txt` from the unlocked Locker directly into RAM.

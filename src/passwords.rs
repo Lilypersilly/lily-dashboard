@@ -36,6 +36,7 @@ pub fn wipe_locker_ram_cache() {
                     std::ptr::write_volatile(b, 0);
                 }
             }
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
         }
     });
 }
