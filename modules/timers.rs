@@ -52,7 +52,7 @@ fn play_alert_sound(title: &str, message: &str) {
 
     // Play a standard freedesktop completion sound using paplay (PulseAudio/PipeWire)
     let _ = Command::new("paplay")
-        .arg("/usr/share/srounds/feedesktop/stereo/complete.oga")
+        .arg("/usr/share/sounds/freedesktop/stereo/complete.oga")
         .spawn();
 }
 
