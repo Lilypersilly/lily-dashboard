@@ -3900,9 +3900,312 @@ fn render_themes_page(
     }
     editor_card.append(&folder_flow);
 
-    // 6 core color inputs with live-painted preview swatches
+    // 6 core color inputs with clickable live-painted preview swatches + inline HSV Color Wheel
+    let hsv_to_rgb = |h_deg: f64, s: f64, v: f64| -> (f64, f64, f64) {
+        let h = ((h_deg % 360.0) + 360.0) % 360.0;
+        let c = v * s;
+        let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+        let m = v - c;
+        let (r1, g1, b1) = if h < 60.0 {
+            (c, x, 0.0)
+        } else if h < 120.0 {
+            (x, c, 0.0)
+        } else if h < 180.0 {
+            (0.0, c, x)
+        } else if h < 240.0 {
+            (0.0, x, c)
+        } else if h < 300.0 {
+            (x, 0.0, c)
+        } else {
+            (c, 0.0, x)
+        };
+        (r1 + m, g1 + m, b1 + m)
+    };
+    let rgb_to_hsv = |r: f64, g: f64, b: f64| -> (f64, f64, f64) {
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let d = max - min;
+        let h = if d < 1e-6 {
+            0.0
+        } else if (max - r).abs() < 1e-6 {
+            60.0 * (((g - b) / d) % 6.0)
+        } else if (max - g).abs() < 1e-6 {
+            60.0 * (((b - r) / d) + 2.0)
+        } else {
+            60.0 * (((r - g) / d) + 4.0)
+        };
+        let h = if h < 0.0 { h + 360.0 } else { h };
+        let s = if max < 1e-6 { 0.0 } else { d / max };
+        (h, s, max)
+    };
+
     let default_def = crate::themes::ThemeDefinition::default();
-    let make_color_row = |label: &str, init_hex: &str| -> (Box, Entry, DrawingArea) {
+    let wheel_hsv: Rc<Cell<(f64, f64, f64)>> = Rc::new(Cell::new((315.0, 0.5, 0.91)));
+    let active_slot_idx: Rc<Cell<usize>> = Rc::new(Cell::new(3)); // default to Accent
+    let syncing_hex: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let slot_names: [&str; 6] = ["Background", "Surface", "Text", "Accent", "Selection", "Secondary"];
+    let slot_entries: Rc<RefCell<Vec<Entry>>> = Rc::new(RefCell::new(Vec::new()));
+    let slot_swatches: Rc<RefCell<Vec<DrawingArea>>> = Rc::new(RefCell::new(Vec::new()));
+
+    // Inline HSV Color Wheel box (toggled by clicking any swatch circle)
+    let wheel_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .margin_top(4)
+        .visible(false)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .build();
+
+    let wheel_hdr_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let wheel_target_lbl = Label::builder()
+        .label("Picking: Accent")
+        .halign(Align::Start)
+        .hexpand(true)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .build();
+    let wheel_close_btn = Button::builder()
+        .label("Hide Wheel")
+        .css_classes(vec!["plan-close-btn".to_string()])
+        .build();
+    {
+        let wb = wheel_box.clone();
+        wheel_close_btn.connect_clicked(move |_| wb.set_visible(false));
+    }
+    wheel_hdr_row.append(&wheel_target_lbl);
+    wheel_hdr_row.append(&wheel_close_btn);
+    wheel_box.append(&wheel_hdr_row);
+
+    // Pre-render 168x168 Hue+Saturation wheel surface once for 120 FPS dragging
+    const WHEEL_SZ: i32 = 168;
+    let wheel_surface: Rc<Option<gtk4::cairo::ImageSurface>> = {
+        let mut surf = gtk4::cairo::ImageSurface::create(
+            gtk4::cairo::Format::ARgb32,
+            WHEEL_SZ,
+            WHEEL_SZ,
+        )
+        .ok();
+        if let Some(ref mut s) = surf {
+            let stride = s.stride() as usize;
+            if let Ok(mut data) = s.data() {
+                let half = WHEEL_SZ as f64 / 2.0;
+                let radius = half - 2.0;
+                for y in 0..WHEEL_SZ {
+                    for x in 0..WHEEL_SZ {
+                        let dx = (x as f64 + 0.5) - half;
+                        let dy = (y as f64 + 0.5) - half;
+                        let dist = (dx * dx + dy * dy).sqrt();
+                        let off = (y as usize) * stride + (x as usize) * 4;
+                        if dist <= radius + 1.0 {
+                            let sat = (dist / radius).clamp(0.0, 1.0);
+                            let angle = dy.atan2(dx).to_degrees();
+                            let hue = if angle < 0.0 { angle + 360.0 } else { angle };
+                            let (r, g, b) = hsv_to_rgb(hue, sat, 1.0);
+                            let alpha = if dist > radius {
+                                (1.0 - (dist - radius)).clamp(0.0, 1.0)
+                            } else {
+                                1.0
+                            };
+                            // Cairo ARGB32 on little-endian is premultiplied BGRA
+                            data[off] = (b * alpha * 255.0).round() as u8;
+                            data[off + 1] = (g * alpha * 255.0).round() as u8;
+                            data[off + 2] = (r * alpha * 255.0).round() as u8;
+                            data[off + 3] = (alpha * 255.0).round() as u8;
+                        } else {
+                            data[off] = 0;
+                            data[off + 1] = 0;
+                            data[off + 2] = 0;
+                            data[off + 3] = 0;
+                        }
+                    }
+                }
+            }
+        }
+        Rc::new(surf)
+    };
+
+    let wheel_area = DrawingArea::builder()
+        .content_width(WHEEL_SZ)
+        .content_height(WHEEL_SZ)
+        .halign(Align::Center)
+        .build();
+    {
+        let surf_rc = wheel_surface.clone();
+        let hsv_rc = wheel_hsv.clone();
+        wheel_area.set_draw_func(move |_, cr, w, h| {
+            let cx = w as f64 / 2.0;
+            let cy = h as f64 / 2.0;
+            let radius = (w.min(h) as f64 / 2.0) - 2.0;
+            if let Some(ref surf) = *surf_rc {
+                let _ = cr.set_source_surface(surf, cx - (WHEEL_SZ as f64 / 2.0), cy - (WHEEL_SZ as f64 / 2.0));
+                let _ = cr.paint();
+            }
+            let (hue, sat, val) = hsv_rc.get();
+            let rad = hue.to_radians();
+            let px = cx + rad.cos() * sat * radius;
+            let py = cy + rad.sin() * sat * radius;
+            let (r, g, b) = hsv_to_rgb(hue, sat, val);
+            cr.set_source_rgb(r, g, b);
+            cr.arc(px, py, 7.0, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill_preserve();
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+            cr.set_line_width(2.0);
+            let _ = cr.stroke();
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.65);
+            cr.arc(px, py, 8.2, 0.0, std::f64::consts::TAU);
+            cr.set_line_width(1.0);
+            let _ = cr.stroke();
+        });
+    }
+
+    let val_bar = DrawingArea::builder()
+        .content_height(22)
+        .hexpand(true)
+        .build();
+    {
+        let hsv_rc = wheel_hsv.clone();
+        val_bar.set_draw_func(move |_, cr, w, h| {
+            let wf = w as f64;
+            let hf = h as f64;
+            let (hue, sat, val) = hsv_rc.get();
+            let (fr, fg, fb) = hsv_to_rgb(hue, sat, 1.0);
+            let pat = gtk4::cairo::LinearGradient::new(4.0, 0.0, wf - 4.0, 0.0);
+            pat.add_color_stop_rgb(0.0, 0.0, 0.0, 0.0);
+            pat.add_color_stop_rgb(1.0, fr, fg, fb);
+            let r_rad = 6.0;
+            let x0 = 2.0;
+            let y0 = 3.0;
+            let rw = (wf - 4.0).max(1.0);
+            let rh = (hf - 6.0).max(1.0);
+            cr.new_sub_path();
+            cr.arc(x0 + rw - r_rad, y0 + r_rad, r_rad, -std::f64::consts::FRAC_PI_2, 0.0);
+            cr.arc(x0 + rw - r_rad, y0 + rh - r_rad, r_rad, 0.0, std::f64::consts::FRAC_PI_2);
+            cr.arc(x0 + r_rad, y0 + rh - r_rad, r_rad, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
+            cr.arc(x0 + r_rad, y0 + r_rad, r_rad, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+            cr.close_path();
+            let _ = cr.set_source(&pat);
+            let _ = cr.fill_preserve();
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.25);
+            cr.set_line_width(1.0);
+            let _ = cr.stroke();
+
+            let tx = (x0 + val.clamp(0.0, 1.0) * rw).clamp(x0 + 6.0, x0 + rw - 6.0);
+            let (cr_r, cr_g, cr_b) = hsv_to_rgb(hue, sat, val);
+            cr.set_source_rgb(cr_r, cr_g, cr_b);
+            cr.arc(tx, hf / 2.0, 7.5, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill_preserve();
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+            cr.set_line_width(2.0);
+            let _ = cr.stroke();
+        });
+    }
+
+    let push_hsv_to_active_entry: Rc<dyn Fn()> = {
+        let hsv_rc = wheel_hsv.clone();
+        let idx_rc = active_slot_idx.clone();
+        let entries_rc = slot_entries.clone();
+        let sync_rc = syncing_hex.clone();
+        let wa = wheel_area.clone();
+        let vb = val_bar.clone();
+        Rc::new(move || {
+            let (h, s, v) = hsv_rc.get();
+            let (r, g, b) = hsv_to_rgb(h, s, v);
+            let hex = format!(
+                "#{:02x}{:02x}{:02x}",
+                (r * 255.0).round().clamp(0.0, 255.0) as u8,
+                (g * 255.0).round().clamp(0.0, 255.0) as u8,
+                (b * 255.0).round().clamp(0.0, 255.0) as u8
+            );
+            sync_rc.set(true);
+            if let Some(e) = entries_rc.borrow().get(idx_rc.get()) {
+                e.set_text(&hex);
+            }
+            sync_rc.set(false);
+            wa.queue_draw();
+            vb.queue_draw();
+        })
+    };
+
+    // Drag/click handler on Hue+Saturation wheel
+    {
+        let drag = gtk4::GestureDrag::new();
+        let start_pt = Rc::new(Cell::new((0.0f64, 0.0f64)));
+        let update_from_xy: Rc<dyn Fn(f64, f64)> = {
+            let wa = wheel_area.clone();
+            let hsv_rc = wheel_hsv.clone();
+            let push_fn = push_hsv_to_active_entry.clone();
+            Rc::new(move |x: f64, y: f64| {
+                let cx = wa.width() as f64 / 2.0;
+                let cy = wa.height() as f64 / 2.0;
+                let radius = (wa.width().min(wa.height()) as f64 / 2.0 - 2.0).max(1.0);
+                let dx = x - cx;
+                let dy = y - cy;
+                let sat = ((dx * dx + dy * dy).sqrt() / radius).clamp(0.0, 1.0);
+                let angle = dy.atan2(dx).to_degrees();
+                let hue = if angle < 0.0 { angle + 360.0 } else { angle };
+                let (_, _, v) = hsv_rc.get();
+                hsv_rc.set((hue, sat, v));
+                push_fn();
+            })
+        };
+        let sp1 = start_pt.clone();
+        let u1 = update_from_xy.clone();
+        drag.connect_drag_begin(move |_, x, y| {
+            sp1.set((x, y));
+            u1(x, y);
+        });
+        let sp2 = start_pt.clone();
+        let u2 = update_from_xy.clone();
+        drag.connect_drag_update(move |_, ox, oy| {
+            let (sx, sy) = sp2.get();
+            u2(sx + ox, sy + oy);
+        });
+        wheel_area.add_controller(drag);
+    }
+
+    // Drag/click handler on Brightness (Value) bar
+    {
+        let drag = gtk4::GestureDrag::new();
+        let start_x = Rc::new(Cell::new(0.0f64));
+        let update_v: Rc<dyn Fn(f64)> = {
+            let vb = val_bar.clone();
+            let hsv_rc = wheel_hsv.clone();
+            let push_fn = push_hsv_to_active_entry.clone();
+            Rc::new(move |x: f64| {
+                let w = (vb.width() as f64 - 4.0).max(1.0);
+                let v = ((x - 2.0) / w).clamp(0.0, 1.0);
+                let (h, s, _) = hsv_rc.get();
+                hsv_rc.set((h, s, v));
+                push_fn();
+            })
+        };
+        let sx1 = start_x.clone();
+        let u1 = update_v.clone();
+        drag.connect_drag_begin(move |_, x, _| {
+            sx1.set(x);
+            u1(x);
+        });
+        let sx2 = start_x.clone();
+        let u2 = update_v.clone();
+        drag.connect_drag_update(move |_, ox, _| {
+            u2(sx2.get() + ox);
+        });
+        val_bar.add_controller(drag);
+    }
+
+    wheel_box.append(&wheel_area);
+    wheel_box.append(
+        &Label::builder()
+            .label("Brightness")
+            .halign(Align::Start)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build(),
+    );
+    wheel_box.append(&val_bar);
+
+    let make_color_row = |slot_idx: usize, label: &str, init_hex: &str| -> (Box, Entry, DrawingArea) {
         let row = Box::builder()
             .orientation(Orientation::Horizontal)
             .spacing(8)
@@ -3914,9 +4217,10 @@ fn render_themes_page(
             .css_classes(vec!["plan-body".to_string()])
             .build();
         let swatch = DrawingArea::builder()
-            .content_width(24)
-            .content_height(24)
+            .content_width(26)
+            .content_height(26)
             .valign(Align::Center)
+            .tooltip_text("Click to open Color Wheel for this slot")
             .build();
         let entry = Entry::builder()
             .text(&format!("#{}", init_hex))
@@ -3924,19 +4228,72 @@ fn render_themes_page(
             .build();
 
         let e_for_draw = entry.clone();
+        let active_draw = active_slot_idx.clone();
+        let wb_draw = wheel_box.clone();
         swatch.set_draw_func(move |_, cr, w, h| {
             let (r, g, b) = parse_hex_rgb(e_for_draw.text().as_str());
             cr.set_source_rgb(r, g, b);
             cr.arc(w as f64 / 2.0, h as f64 / 2.0, 9.5, 0.0, std::f64::consts::TAU);
             let _ = cr.fill_preserve();
-            cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
-            cr.set_line_width(1.2);
+            if wb_draw.is_visible() && active_draw.get() == slot_idx {
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+                cr.set_line_width(2.2);
+            } else {
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
+                cr.set_line_width(1.2);
+            }
             let _ = cr.stroke();
         });
+
+        // Clicking a swatch selects it & opens the inline Color Wheel
+        let click = gtk4::GestureClick::new();
+        {
+            let e_c = entry.clone();
+            let active_c = active_slot_idx.clone();
+            let hsv_c = wheel_hsv.clone();
+            let wb_c = wheel_box.clone();
+            let tl_c = wheel_target_lbl.clone();
+            let wa_c = wheel_area.clone();
+            let vb_c = val_bar.clone();
+            let all_sw = slot_swatches.clone();
+            click.connect_pressed(move |_, _, _, _| {
+                let already_open_same = wb_c.is_visible() && active_c.get() == slot_idx;
+                if already_open_same {
+                    wb_c.set_visible(false);
+                } else {
+                    active_c.set(slot_idx);
+                    let (r, g, b) = parse_hex_rgb(e_c.text().as_str());
+                    hsv_c.set(rgb_to_hsv(r, g, b));
+                    tl_c.set_label(&format!("Picking: {} (drag wheel & brightness)", slot_names[slot_idx]));
+                    wb_c.set_visible(true);
+                    wa_c.queue_draw();
+                    vb_c.queue_draw();
+                }
+                for sw in all_sw.borrow().iter() {
+                    sw.queue_draw();
+                }
+            });
+        }
+        swatch.add_controller(click);
+
         let sw_c = swatch.clone();
-        entry.connect_changed(move |_| {
+        let sync_c = syncing_hex.clone();
+        let active_c = active_slot_idx.clone();
+        let hsv_c = wheel_hsv.clone();
+        let wa_c = wheel_area.clone();
+        let vb_c = val_bar.clone();
+        entry.connect_changed(move |e| {
             sw_c.queue_draw();
+            if !sync_c.get() && active_c.get() == slot_idx {
+                let (r, g, b) = parse_hex_rgb(e.text().as_str());
+                hsv_c.set(rgb_to_hsv(r, g, b));
+                wa_c.queue_draw();
+                vb_c.queue_draw();
+            }
         });
+
+        slot_entries.borrow_mut().push(entry.clone());
+        slot_swatches.borrow_mut().push(swatch.clone());
 
         row.append(&lbl);
         row.append(&swatch);
@@ -3944,12 +4301,12 @@ fn render_themes_page(
         (row, entry, swatch)
     };
 
-    let (r_bg, e_bg, _) = make_color_row("Background", &default_def.bg_main);
-    let (r_pill, e_pill, _) = make_color_row("Surface", &default_def.bg_pill);
-    let (r_fg, e_fg, _) = make_color_row("Text", &default_def.fg_main);
-    let (r_acc, e_acc, _) = make_color_row("Accent", &default_def.accent);
-    let (r_sel, e_sel, _) = make_color_row("Selection", &default_def.selection);
-    let (r_mag, e_mag, _) = make_color_row("Secondary", &default_def.magenta);
+    let (r_bg, e_bg, _) = make_color_row(0, "Background", &default_def.bg_main);
+    let (r_pill, e_pill, _) = make_color_row(1, "Surface", &default_def.bg_pill);
+    let (r_fg, e_fg, _) = make_color_row(2, "Text", &default_def.fg_main);
+    let (r_acc, e_acc, _) = make_color_row(3, "Accent", &default_def.accent);
+    let (r_sel, e_sel, _) = make_color_row(4, "Selection", &default_def.selection);
+    let (r_mag, e_mag, _) = make_color_row(5, "Secondary", &default_def.magenta);
 
     editor_card.append(&r_bg);
     editor_card.append(&r_pill);
@@ -3957,6 +4314,7 @@ fn render_themes_page(
     editor_card.append(&r_acc);
     editor_card.append(&r_sel);
     editor_card.append(&r_mag);
+    editor_card.append(&wheel_box);
 
     let build_editor_def: Rc<dyn Fn() -> crate::themes::ThemeDefinition> = {
         let name_e = name_entry.clone();
@@ -3991,6 +4349,75 @@ fn render_themes_page(
         })
     };
 
+    // Live in-RAM dashboard preview (zero disk writes) + automatic restore on editor exit
+    let saved_preview_state: Rc<
+        RefCell<Option<(String, Option<std::collections::HashMap<String, String>>)>>,
+    > = Rc::new(RefCell::new(None));
+    let preview_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
+    let schedule_live_preview: Rc<dyn Fn()> = {
+        let ec = editor_card.clone();
+        let build_fn = build_editor_def.clone();
+        let saved_st = saved_preview_state.clone();
+        let pending = preview_pending.clone();
+        let rel_t = reload_theme.clone();
+        Rc::new(move || {
+            if !ec.is_visible() || pending.get() {
+                return;
+            }
+            pending.set(true);
+            let ec2 = ec.clone();
+            let bf2 = build_fn.clone();
+            let ss2 = saved_st.clone();
+            let pend2 = pending.clone();
+            let rel2 = rel_t.clone();
+            glib::timeout_add_local_once(Duration::from_millis(33), move || {
+                pend2.set(false);
+                if !ec2.is_visible() {
+                    return;
+                }
+                if ss2.borrow().is_none() {
+                    let cur = crate::config::get();
+                    *ss2.borrow_mut() = Some((cur.theme_preset, cur.custom_palette));
+                }
+                let def = bf2();
+                let pal = def.to_palette_map();
+                crate::config::update_in_memory(|c| {
+                    c.theme_preset = "custom".to_string();
+                    c.custom_palette = Some(pal);
+                });
+                rel2();
+            });
+        })
+    };
+
+    let revert_live_preview: Rc<dyn Fn()> = {
+        let saved_st = saved_preview_state.clone();
+        let rel_t = reload_theme.clone();
+        Rc::new(move || {
+            if let Some((old_preset, old_pal)) = saved_st.borrow_mut().take() {
+                crate::config::update_in_memory(|c| {
+                    c.theme_preset = old_preset;
+                    c.custom_palette = old_pal;
+                });
+                rel_t();
+            }
+        })
+    };
+
+    for e in [&e_bg, &e_pill, &e_fg, &e_acc, &e_sel, &e_mag] {
+        let sched = schedule_live_preview.clone();
+        e.connect_changed(move |_| sched());
+    }
+    {
+        let sched = schedule_live_preview.clone();
+        mode_btn.connect_clicked(move |_| sched());
+    }
+    {
+        let rev = revert_live_preview.clone();
+        editor_card.connect_unmap(move |_| rev());
+    }
+
     let ed_actions = Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(6)
@@ -4010,8 +4437,10 @@ fn render_themes_page(
     {
         let build_fn = build_editor_def.clone();
         let tx_c = tx.clone();
+        let rev = revert_live_preview.clone();
         save_btn.connect_clicked(move |_| {
             let def = build_fn();
+            rev();
             match crate::themes::save_user_theme(&def) {
                 Ok(_) => {
                     let _ = tx_c.send(SystemMsg::ThemeApplied(format!(
@@ -4028,8 +4457,10 @@ fn render_themes_page(
     {
         let build_fn = build_editor_def.clone();
         let tx_c = tx.clone();
+        let rev = revert_live_preview.clone();
         save_open_btn.connect_clicked(move |_| {
             let def = build_fn();
+            rev();
             match crate::themes::save_user_theme(&def) {
                 Ok(path) => {
                     let _ = Command::new("xdg-open").arg(&path).spawn();
@@ -4052,9 +4483,13 @@ fn render_themes_page(
 
     {
         let ec = editor_card.clone();
+        let rev = revert_live_preview.clone();
         editor_toggle_btn.connect_clicked(move |b| {
             let next = !ec.is_visible();
             ec.set_visible(next);
+            if !next {
+                rev();
+            }
             b.set_label(if next {
                 "− Hide Theme Editor"
             } else {
