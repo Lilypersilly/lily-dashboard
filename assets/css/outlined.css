@@ -1,0 +1,62 @@
+/* @name Outlined */
+.plan-fmt-btn,
+.plan-close-btn,
+.power-btn,
+.session-restore-btn,
+.ws-pill-btn,
+.top-tool-btn,
+.sticky-mini-btn,
+.fav-hide-btn {
+    background-color: @fg_04;
+    border: 1px solid @accent_38;
+}
+
+.plan-fmt-btn:hover,
+.plan-close-btn:hover,
+.power-btn:hover,
+.session-restore-btn:hover,
+.ws-pill-btn:hover,
+.top-tool-btn:hover,
+.sticky-mini-btn:hover,
+.fav-hide-btn:hover {
+    background-color: @accent_15;
+    border-color: @accent2;
+}
+
+.plan-fmt-btn.active,
+.plan-close-btn.active,
+.power-btn.active,
+.ws-pill-btn.active,
+.sticky-mini-btn.active,
+.primary-btn {
+    background-color: @accent_24;
+    border: 1px solid @accent2;
+}
+
+.sidebar-nav-btn {
+    border: 1px solid transparent;
+}
+
+.sidebar-nav-btn:hover {
+    background-color: @accent_15;
+    border-color: @accent_38;
+}
+
+.sidebar-nav-btn.selected {
+    background-color: @accent_15;
+    border: 1px solid @accent2;
+}
+
+.sidebar-nav-btn.selected label {
+    color: @accent2;
+}
+
+.plan-delete-menu-btn,
+.power-btn.armed {
+    background-color: transparent;
+    border: 1px solid rgba(243, 139, 168, 0.65);
+}
+
+.plan-delete-menu-btn:hover {
+    background-color: rgba(243, 139, 168, 0.18);
+}

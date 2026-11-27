@@ -127,6 +127,16 @@ styles, corner rounding, and font scaling:
   - `plan-detail-pane` : 400px slide-out detail pane container
   - Plain `gtk4::Entry`: Automatically live-themed!
 
+Custom CSS Style Themes (`~/.config/lily-dashboard/themes/css/*.css`):
+  Users can restyle ANY widget in the dashboard (including custom module widgets)
+  by dropping a `.css` file in `~/.config/lily-dashboard/themes/css/` and picking
+  it in System -> Settings -> CSS STYLE. Saving edits hot-reloads live!
+  Add `/* @name My Style */` on line 1 to set its display name, and use any of
+  the 17 live `@define-color` variables so your CSS adapts to all palettes:
+    @bg_main, @bg_pill, @bg_recessed, @bg_contrast, @fg_main, @fg_muted,
+    @accent, @accent2, @selection, @accent_15, @accent_24, @accent_38,
+    @accent_55, @fg_04, @fg_06, @fg_08, @fg_15
+
 
 --------------------------------------------------------------------------------
 5. COMPLETE MINIMAL EXAMPLE (`modules/hello.rs`)

@@ -68,6 +68,7 @@ fn main() {
     let reload_theme_startup = reload_theme_slot.clone();
     app.connect_startup(move |_| {
         config::ensure_bundled_fonts();
+        config::ensure_builtin_css_themes();
         let reload_cb = init_theme();
         *reload_theme_startup.borrow_mut() = Some(reload_cb);
     });
@@ -274,9 +275,18 @@ fn init_theme() -> Rc<dyn Fn()> {
         gtk4::STYLE_PROVIDER_PRIORITY_USER + 1,
     );
 
+    // User-editable CSS style theme provider (`~/.config/lily-dashboard/themes/css/<name>.css`)
+    let user_css_provider = CssProvider::new();
+    gtk4::style_context_add_provider_for_display(
+        &display,
+        &user_css_provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_USER + 2,
+    );
+
     let update_css: Rc<dyn Fn()> = {
         let provider = provider.clone();
         let scrollbar_provider = scrollbar_provider.clone();
+        let user_css_provider = user_css_provider.clone();
         Rc::new(move || {
             let cfg = config::get();
             let map = config::resolve_theme_colors(&cfg);
@@ -582,64 +592,29 @@ fn init_theme() -> Rc<dyn Fn()> {
                 "#
             );
 
-            // Button style overrides ("tonal" uses the base CSS above)
-            let pill_rad = if r_scale > 0.01 { 999 } else { 0 };
-            let btn_style_css = match cfg.button_style.as_str() {
-                "outlined" => format!(
-                    r#"
-                    .plan-fmt-btn, .plan-close-btn, .power-btn, .session-restore-btn, .ws-pill-btn, .top-tool-btn, .sticky-mini-btn, .fav-hide-btn {{ background-color: {fg_main_04}; border: 1px solid {accent1_38}; }}
-                    .plan-fmt-btn:hover, .plan-close-btn:hover, .power-btn:hover, .session-restore-btn:hover, .ws-pill-btn:hover, .top-tool-btn:hover, .sticky-mini-btn:hover, .fav-hide-btn:hover {{ background-color: {accent1_15}; border-color: #{accent2}; }}
-                    .plan-fmt-btn.active, .plan-close-btn.active, .power-btn.active, .ws-pill-btn.active, .sticky-mini-btn.active, .primary-btn {{ background-color: {accent1_24}; border: 1px solid #{accent2}; }}
-                    .sidebar-nav-btn {{ border: 1px solid transparent; }}
-                    .sidebar-nav-btn:hover {{ background-color: {accent1_15}; border-color: {accent1_38}; }}
-                    .sidebar-nav-btn.selected {{ background-color: {accent1_15}; border: 1px solid #{accent2}; }}
-                    .sidebar-nav-btn.selected label {{ color: #{accent2}; }}
-                    .plan-delete-menu-btn, .power-btn.armed {{ background-color: transparent; border: 1px solid rgba(243, 139, 168, 0.65); }}
-                    .plan-delete-menu-btn:hover {{ background-color: rgba(243, 139, 168, 0.18); }}
-                    "#
-                ),
-                "pill" => format!(
-                    r#"
-                    .plan-fmt-btn, .plan-close-btn, .primary-btn, .power-btn, .session-restore-btn, .ws-pill-btn, .top-tool-btn, .sticky-mini-btn, .fav-hide-btn, .plan-delete-menu-btn, .sidebar-nav-btn {{ border-radius: {pill_rad}px; }}
-                    .plan-fmt-btn.active, .plan-close-btn.active, .power-btn.active, .ws-pill-btn.active, .sticky-mini-btn.active, .primary-btn, .sidebar-nav-btn.selected {{ border: 1px solid {accent1_55}; background-color: {accent1_24}; }}
-                    .sidebar-nav-btn.selected label {{ color: #{accent2}; }}
-                    "#
-                ),
-                "solid" => format!(
-                    r#"
-                    .plan-fmt-btn, .plan-close-btn, .power-btn, .session-restore-btn, .ws-pill-btn, .top-tool-btn, .sticky-mini-btn, .fav-hide-btn {{ background-color: #{bg_pill}; border: 1px solid {fg_main_08}; }}
-                    .plan-fmt-btn:hover, .plan-close-btn:hover, .power-btn:hover, .session-restore-btn:hover, .ws-pill-btn:hover, .top-tool-btn:hover, .sticky-mini-btn:hover, .fav-hide-btn:hover {{ background-color: {accent1_24}; }}
-                    .plan-fmt-btn.active, .plan-close-btn.active, .power-btn.active, .ws-pill-btn.active, .sticky-mini-btn.active, .primary-btn, .sidebar-nav-btn.selected {{ background-color: #{accent2}; border: 1px solid #{accent2}; color: #{bg_contrast}; }}
-                    .plan-fmt-btn.active label, .plan-close-btn.active label, .power-btn.active label, .power-btn.active .power-btn-lbl, .ws-pill-btn.active label, .sticky-mini-btn.active label, .primary-btn label, .sidebar-nav-btn.selected label {{ color: #{bg_contrast}; }}
-                    .primary-btn:hover {{ background-color: #{accent1}; }}
-                    .primary-btn:hover label {{ color: #{bg_contrast}; }}
-                    .plan-delete-menu-btn, .power-btn.armed {{ background-color: #f38ba8; border: 1px solid #f38ba8; color: #{bg_contrast}; }}
-                    .plan-delete-menu-btn label, .power-btn.armed .power-btn-lbl {{ color: #{bg_contrast}; }}
-                    "#
-                ),
-                "neon" => format!(
-                    r#"
-                    .plan-fmt-btn, .plan-close-btn, .power-btn, .session-restore-btn, .ws-pill-btn, .top-tool-btn, .sticky-mini-btn, .fav-hide-btn {{ background-color: #{bg_recessed}; border: 1px solid {accent1_38}; }}
-                    .plan-fmt-btn:hover, .plan-close-btn:hover, .power-btn:hover, .session-restore-btn:hover, .ws-pill-btn:hover, .top-tool-btn:hover, .sticky-mini-btn:hover, .fav-hide-btn:hover {{ border-color: #{accent2}; box-shadow: 0px 0px 8px {accent1_55}; }}
-                    .plan-fmt-btn.active, .plan-close-btn.active, .power-btn.active, .ws-pill-btn.active, .sticky-mini-btn.active, .primary-btn, .sidebar-nav-btn.selected {{ background-color: {accent1_24}; border: 1px solid #{accent2}; box-shadow: 0px 0px 9px {accent1_55}; }}
-                    .sidebar-nav-btn:hover {{ border: 1px solid {accent1_38}; box-shadow: 0px 0px 6px {accent1_38}; }}
-                    .sidebar-nav-btn.selected label {{ color: #{accent2}; }}
-                    .plan-delete-menu-btn, .power-btn.armed {{ background-color: rgba(243, 139, 168, 0.14); border: 1px solid #f38ba8; box-shadow: 0px 0px 8px rgba(243, 139, 168, 0.45); }}
-                    "#
-                ),
-                "ghost" => format!(
-                    r#"
-                    .plan-fmt-btn, .plan-close-btn, .power-btn, .session-restore-btn, .ws-pill-btn, .top-tool-btn, .sticky-mini-btn, .fav-hide-btn {{ background-color: transparent; border: 1px solid transparent; }}
-                    .plan-fmt-btn:hover, .plan-close-btn:hover, .power-btn:hover, .session-restore-btn:hover, .ws-pill-btn:hover, .top-tool-btn:hover, .sticky-mini-btn:hover, .fav-hide-btn:hover {{ background-color: {fg_main_08}; }}
-                    .plan-fmt-btn.active, .plan-close-btn.active, .power-btn.active, .ws-pill-btn.active, .sticky-mini-btn.active, .primary-btn, .sidebar-nav-btn.selected {{ background-color: {fg_main_06}; border: none; border-bottom: 2px solid #{accent2}; border-radius: {r_chk}px {r_chk}px 2px 2px; }}
-                    .sidebar-nav-btn.selected label {{ color: #{accent2}; }}
-                    .plan-delete-menu-btn {{ background-color: transparent; }}
-                    .plan-delete-menu-btn:hover {{ background-color: rgba(243, 139, 168, 0.16); }}
-                    "#
-                ),
-                _ => String::new(),
-            };
+            // Expose active palette as GTK @define-color variables so user CSS files in
+            // `~/.config/lily-dashboard/themes/css/` automatically adapt to Dark/Light/custom themes!
+            let palette_vars_css = format!(
+                "@define-color bg_main #{bg_main};\n\
+                 @define-color bg_pill #{bg_pill};\n\
+                 @define-color bg_recessed #{bg_recessed};\n\
+                 @define-color bg_contrast #{bg_contrast};\n\
+                 @define-color fg_main #{fg_main};\n\
+                 @define-color fg_muted #{fg_muted};\n\
+                 @define-color accent #{accent1};\n\
+                 @define-color accent2 #{accent2};\n\
+                 @define-color selection #{selection};\n\
+                 @define-color accent_15 {accent1_15};\n\
+                 @define-color accent_24 {accent1_24};\n\
+                 @define-color accent_38 {accent1_38};\n\
+                 @define-color accent_55 {accent1_55};\n\
+                 @define-color fg_04 {fg_main_04};\n\
+                 @define-color fg_06 {fg_main_06};\n\
+                 @define-color fg_08 {fg_main_08};\n\
+                 @define-color fg_15 {fg_main_15};\n"
+            );
 
+            let pill_rad = if r_scale > 0.01 { 999 } else { 0 };
             let preview_css = format!(
                 r#"
                 .btn-preview-tonal {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 6px 11px; color: #{fg_main}; box-shadow: none; }}
@@ -662,8 +637,13 @@ fn init_theme() -> Rc<dyn Fn()> {
                 "#
             );
 
-            let full_css = format!("{}\n{}\n{}", css, btn_style_css, preview_css);
+            let full_css = format!("{}\n{}\n{}", palette_vars_css, css, preview_css);
             provider.load_from_data(&full_css);
+
+            // Load active CSS style theme file from `~/.config/lily-dashboard/themes/css/<name>.css`
+            let raw_style = config::load_css_theme_source(&cfg.button_style);
+            let user_style_css = format!("{}\n{}", palette_vars_css, raw_style);
+            user_css_provider.load_from_data(&user_style_css);
 
             let scrollbar_css = format!(
                 r#"
@@ -711,6 +691,24 @@ fn init_theme() -> Rc<dyn Fn()> {
             }
         });
         std::boxed::Box::leak(std::boxed::Box::new(monitor));
+    }
+
+    // Watch `~/.config/lily-dashboard/themes/css/` for live hot-reload when editing custom .css styles
+    let css_dir_file = gtk4::gio::File::for_path(config::css_themes_dir());
+    if let Ok(css_mon) = css_dir_file.monitor_directory(gtk4::gio::FileMonitorFlags::NONE, gtk4::gio::Cancellable::NONE) {
+        let cb = update_css.clone();
+        css_mon.connect_changed(move |_, _, _, event| {
+            if matches!(
+                event,
+                gtk4::gio::FileMonitorEvent::ChangesDoneHint
+                    | gtk4::gio::FileMonitorEvent::Created
+                    | gtk4::gio::FileMonitorEvent::Deleted
+                    | gtk4::gio::FileMonitorEvent::MovedIn
+            ) {
+                cb();
+            }
+        });
+        std::boxed::Box::leak(std::boxed::Box::new(css_mon));
     }
 
     update_css

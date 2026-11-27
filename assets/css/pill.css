@@ -1,0 +1,29 @@
+/* @name Pill */
+.plan-fmt-btn,
+.plan-close-btn,
+.primary-btn,
+.power-btn,
+.session-restore-btn,
+.ws-pill-btn,
+.top-tool-btn,
+.sticky-mini-btn,
+.fav-hide-btn,
+.plan-delete-menu-btn,
+.sidebar-nav-btn {
+    border-radius: 999px;
+}
+
+.plan-fmt-btn.active,
+.plan-close-btn.active,
+.power-btn.active,
+.ws-pill-btn.active,
+.sticky-mini-btn.active,
+.primary-btn,
+.sidebar-nav-btn.selected {
+    border: 1px solid @accent_55;
+    background-color: @accent_24;
+}
+
+.sidebar-nav-btn.selected label {
+    color: @accent2;
+}

@@ -5822,8 +5822,9 @@ fn render_settings_page(
     container.append(&cfg_card);
 
     // ------------------------------------------
-    // 1b. BUTTON STYLE (COLLAPSIBLE, LIVE PREVIEW)
+    // 1b. CSS STYLE THEMES (COLLAPSIBLE, LIVE HOT-RELOAD)
     // ------------------------------------------
+    let css_themes = crate::config::list_css_themes();
     let btn_card = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(8)
@@ -5831,8 +5832,10 @@ fn render_settings_page(
         .build();
     btn_card.append(
         &Label::builder()
-            .label("Each button previews its own style — click to apply live")
+            .label("Drop custom .css files in ~/.config/lily-dashboard/themes/css/ — edits hot-reload live")
             .halign(Align::Start)
+            .wrap(true)
+            .xalign(0.0)
             .css_classes(vec!["plan-subnote".to_string()])
             .build(),
     );
@@ -5846,21 +5849,21 @@ fn render_settings_page(
             .row_spacing(6)
             .build();
 
-        let styles: &[(&str, &str, &str)] = &[
-            ("tonal", "Tonal", "btn-preview-tonal"),
-            ("outlined", "Outlined", "btn-preview-outlined"),
-            ("pill", "Pill", "btn-preview-pill"),
-            ("solid", "Solid", "btn-preview-solid"),
-            ("neon", "Neon Glow", "btn-preview-neon"),
-            ("ghost", "Ghost", "btn-preview-ghost"),
-        ];
-
-        for &(val, title, preview_cls) in styles {
-            let active = cfg.button_style == val;
+        for (val, title) in &css_themes {
+            let active = cfg.button_style == *val;
             let text = if active {
                 format!("✓ {}", title)
             } else {
-                title.to_string()
+                title.clone()
+            };
+            let preview_cls = match val.as_str() {
+                "tonal" => "btn-preview-tonal",
+                "outlined" => "btn-preview-outlined",
+                "pill" => "btn-preview-pill",
+                "solid" => "btn-preview-solid",
+                "neon" => "btn-preview-neon",
+                "ghost" => "btn-preview-ghost",
+                _ => "plan-fmt-btn",
             };
             let mut classes = vec![preview_cls.to_string()];
             if active {
@@ -5869,8 +5872,9 @@ fn render_settings_page(
             let b = Button::builder()
                 .label(&text)
                 .css_classes(classes)
+                .tooltip_text(&format!("{}.css", val))
                 .build();
-            let v_str = val.to_string();
+            let v_str = val.clone();
             let c_box = container.clone();
             let rel_t = reload_theme.clone();
             let app_t = apply_tabs.clone();
@@ -5883,15 +5887,42 @@ fn render_settings_page(
         }
         btn_card.append(&style_flow);
     }
-    let btn_style_label = match cfg.button_style.as_str() {
-        "outlined" => "Outlined",
-        "pill" => "Pill",
-        "solid" => "Solid",
-        "neon" => "Neon",
-        "ghost" => "Ghost",
-        _ => "Tonal",
-    };
-    append_collapsible_section(container, "buttons", "BUTTON STYLE", btn_style_label, &btn_card);
+
+    let css_btn_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let open_css_dir_btn = Button::builder()
+        .label("Open CSS Folder")
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .hexpand(true)
+        .build();
+    open_css_dir_btn.connect_clicked(|_| {
+        let dir = crate::config::css_themes_dir();
+        let _ = Command::new("xdg-open").arg(&dir).spawn();
+    });
+    let edit_css_btn = Button::builder()
+        .label("Edit Active .css")
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .hexpand(true)
+        .build();
+    {
+        let cur_key = cfg.button_style.clone();
+        edit_css_btn.connect_clicked(move |_| {
+            let p = crate::config::css_themes_dir().join(format!("{}.css", cur_key));
+            let _ = Command::new("xdg-open").arg(&p).spawn();
+        });
+    }
+    css_btn_row.append(&open_css_dir_btn);
+    css_btn_row.append(&edit_css_btn);
+    btn_card.append(&css_btn_row);
+
+    let css_style_label = css_themes
+        .iter()
+        .find(|(k, _)| k == &cfg.button_style)
+        .map(|(_, t)| t.clone())
+        .unwrap_or_else(|| cfg.button_style.clone());
+    append_collapsible_section(container, "buttons", "CSS STYLE", &css_style_label, &btn_card);
 
     // ------------------------------------------
     // 1b2. FONT SELECTOR (COLLAPSIBLE, LIVE)

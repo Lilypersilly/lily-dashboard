@@ -1255,11 +1255,8 @@ pub fn import_theme_json(raw: &str) -> Result<(), String> {
             c.theme_preset = "custom".to_string();
             c.custom_palette = Some(parsed.palette.clone());
         }
-        if matches!(
-            parsed.button_style.as_str(),
-            "tonal" | "outlined" | "pill" | "solid" | "neon" | "ghost"
-        ) {
-            c.button_style = parsed.button_style.clone();
+        if !parsed.button_style.trim().is_empty() {
+            c.button_style = parsed.button_style.trim().to_string();
         }
         if !parsed.ui_font.trim().is_empty() {
             c.ui_font = parsed.ui_font.trim().to_string();
@@ -1277,4 +1274,106 @@ pub fn import_theme_json(raw: &str) -> Result<(), String> {
     let r_px = hypr_rounding_px(&updated.hyprland);
     hypr_set_keyword("decoration:rounding", &r_px.to_string());
     Ok(())
+}
+
+// ==========================================
+// CUSTOM CSS STYLE THEMES (`~/.config/lily-dashboard/themes/css/`)
+// ==========================================
+
+const BUILTIN_CSS_THEMES: &[(&str, &str)] = &[
+    ("tonal.css", include_str!("../assets/css/tonal.css")),
+    ("outlined.css", include_str!("../assets/css/outlined.css")),
+    ("pill.css", include_str!("../assets/css/pill.css")),
+    ("solid.css", include_str!("../assets/css/solid.css")),
+    ("neon.css", include_str!("../assets/css/neon.css")),
+    ("ghost.css", include_str!("../assets/css/ghost.css")),
+];
+
+pub fn css_themes_dir() -> PathBuf {
+    let dir = glib::user_config_dir()
+        .join("lily-dashboard")
+        .join("themes")
+        .join("css");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+/// Installs the 6 stock `.css` style themes into `~/.config/lily-dashboard/themes/css/`
+/// if they don't already exist (never overwrites user edits).
+pub fn ensure_builtin_css_themes() {
+    let dir = css_themes_dir();
+    for &(fname, content) in BUILTIN_CSS_THEMES {
+        let dest = dir.join(fname);
+        if !dest.exists() {
+            let _ = fs::write(&dest, content);
+        }
+    }
+}
+
+/// Returns `(key, display_name)` for every `.css` style file in `~/.config/lily-dashboard/themes/css/`.
+pub fn list_css_themes() -> Vec<(String, String)> {
+    ensure_builtin_css_themes();
+    let dir = css_themes_dir();
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("css") {
+                continue;
+            }
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let mut display = stem
+                .split(|c| c == '-' || c == '_')
+                .filter(|w| !w.is_empty())
+                .map(|w| {
+                    let mut ch = w.chars();
+                    match ch.next() {
+                        Some(f) => format!("{}{}", f.to_uppercase(), ch.as_str()),
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Ok(raw) = fs::read_to_string(&p) {
+                for line in raw.lines().take(5) {
+                    if let Some(rest) = line.trim().strip_prefix("/*") {
+                        let inner = rest.trim_end_matches("*/").trim();
+                        if let Some(n) = inner.strip_prefix("@name") {
+                            let n = n.trim();
+                            if !n.is_empty() {
+                                display = n.to_string();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            out.push((stem.to_string(), display));
+        }
+    }
+    // Keep stock order first, then custom user themes alphabetically
+    let stock_order = ["tonal", "outlined", "pill", "solid", "neon", "ghost"];
+    out.sort_by(|a, b| {
+        let ia = stock_order.iter().position(|&s| s == a.0).unwrap_or(99);
+        let ib = stock_order.iter().position(|&s| s == b.0).unwrap_or(99);
+        ia.cmp(&ib)
+            .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+    });
+    out
+}
+
+pub fn load_css_theme_source(key: &str) -> String {
+    let clean = key.trim().trim_end_matches(".css");
+    let path = css_themes_dir().join(format!("{}.css", clean));
+    if let Ok(raw) = fs::read_to_string(&path) {
+        return raw;
+    }
+    for &(fname, content) in BUILTIN_CSS_THEMES {
+        if fname.strip_suffix(".css") == Some(clean) {
+            return content.to_string();
+        }
+    }
+    String::new()
 }

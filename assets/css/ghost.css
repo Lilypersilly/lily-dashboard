@@ -1,0 +1,48 @@
+/* @name Ghost */
+.plan-fmt-btn,
+.plan-close-btn,
+.power-btn,
+.session-restore-btn,
+.ws-pill-btn,
+.top-tool-btn,
+.sticky-mini-btn,
+.fav-hide-btn {
+    background-color: transparent;
+    border: 1px solid transparent;
+}
+
+.plan-fmt-btn:hover,
+.plan-close-btn:hover,
+.power-btn:hover,
+.session-restore-btn:hover,
+.ws-pill-btn:hover,
+.top-tool-btn:hover,
+.sticky-mini-btn:hover,
+.fav-hide-btn:hover {
+    background-color: @fg_08;
+}
+
+.plan-fmt-btn.active,
+.plan-close-btn.active,
+.power-btn.active,
+.ws-pill-btn.active,
+.sticky-mini-btn.active,
+.primary-btn,
+.sidebar-nav-btn.selected {
+    background-color: @fg_06;
+    border: none;
+    border-bottom: 2px solid @accent2;
+    border-radius: 5px 5px 2px 2px;
+}
+
+.sidebar-nav-btn.selected label {
+    color: @accent2;
+}
+
+.plan-delete-menu-btn {
+    background-color: transparent;
+}
+
+.plan-delete-menu-btn:hover {
+    background-color: rgba(243, 139, 168, 0.16);
+}
