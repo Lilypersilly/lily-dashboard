@@ -257,6 +257,83 @@ fn main() {
     app.run();
 }
 
+/// Scopes top-level CSS rules from a homemade `.css` theme under `scope_prefix` (e.g.
+/// `.css-scope-cyber-scanner`) so its button in Settings -> CSS STYLE renders a live preview
+/// of itself even while another CSS style is active.
+fn scope_css_for_preview(scope_prefix: &str, raw_css: &str) -> String {
+    // Strip /* ... */ block comments first
+    let mut cleaned = String::with_capacity(raw_css.len());
+    let bytes = raw_css.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else {
+            cleaned.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+
+    let mut out = String::new();
+    let mut rest = cleaned.as_str();
+    while let Some(open_idx) = rest.find('{') {
+        let header = rest[..open_idx].trim();
+        let after_open = &rest[open_idx + 1..];
+        // Find matching closing brace (handles nested @keyframes blocks cleanly)
+        let mut depth = 1usize;
+        let mut close_idx = None;
+        for (idx, ch) in after_open.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(c_idx) = close_idx else {
+            break;
+        };
+        let body = &after_open[..c_idx];
+        rest = &after_open[c_idx + 1..];
+
+        // Skip @define-color lines that may precede the selector
+        let sel_header = header
+            .rsplit(';')
+            .next()
+            .unwrap_or(header)
+            .trim();
+        if sel_header.is_empty() {
+            continue;
+        }
+        if sel_header.starts_with("@keyframes") {
+            out.push_str(&format!("{} {{{}}}\n", sel_header, body));
+            continue;
+        }
+        if sel_header.starts_with('@') {
+            continue;
+        }
+        let scoped: Vec<String> = sel_header
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("{} {}", scope_prefix, s))
+            .collect();
+        if !scoped.is_empty() {
+            out.push_str(&format!("{} {{{}}}\n", scoped.join(", "), body));
+        }
+    }
+    out
+}
+
 fn init_theme() -> Rc<dyn Fn()> {
     let display = gdk::Display::default().expect("Could not connect to a display.");
     let provider = CssProvider::new();
@@ -637,13 +714,36 @@ fn init_theme() -> Rc<dyn Fn()> {
                 "#
             );
 
+            // Auto-generate scoped live self-previews for every homemade `.css` theme
+            // so custom styles preview themselves right in Settings -> CSS STYLE!
+            let mut custom_previews = String::new();
+            for (k, _) in config::list_css_themes() {
+                if matches!(k.as_str(), "tonal" | "outlined" | "pill" | "solid" | "neon" | "ghost") {
+                    continue;
+                }
+                let raw = config::load_css_theme_source(&k);
+                let scope_cls: String = k
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+                    .collect();
+                custom_previews.push_str(&scope_css_for_preview(&format!(".css-scope-{}", scope_cls), &raw));
+            }
+
             let full_css = format!("{}\n{}\n{}", palette_vars_css, css, preview_css);
             provider.load_from_data(&full_css);
 
             // Load active CSS style theme file from `~/.config/lily-dashboard/themes/css/<name>.css`
+            // plus scoped live self-previews for homemade themes at the same USER+2 priority
+            // so custom preview buttons always win over whichever stock style is active!
             let raw_style = config::load_css_theme_source(&cfg.button_style);
-            let user_style_css = format!("{}\n{}", palette_vars_css, raw_style);
+            let user_style_css = format!("{}\n{}\n{}", palette_vars_css, raw_style, custom_previews);
             user_css_provider.load_from_data(&user_style_css);
+
+            // Force every toplevel layer-shell window (dashboard, media popout, stickies)
+            // to repaint immediately on Wayland even when not hovered/clicked.
+            for w in gtk4::Window::list_toplevels() {
+                w.queue_draw();
+            }
 
             let scrollbar_css = format!(
                 r#"
@@ -700,10 +800,12 @@ fn init_theme() -> Rc<dyn Fn()> {
         css_mon.connect_changed(move |_, _, _, event| {
             if matches!(
                 event,
-                gtk4::gio::FileMonitorEvent::ChangesDoneHint
+                gtk4::gio::FileMonitorEvent::Changed
+                    | gtk4::gio::FileMonitorEvent::ChangesDoneHint
                     | gtk4::gio::FileMonitorEvent::Created
                     | gtk4::gio::FileMonitorEvent::Deleted
                     | gtk4::gio::FileMonitorEvent::MovedIn
+                    | gtk4::gio::FileMonitorEvent::Renamed
             ) {
                 cb();
             }

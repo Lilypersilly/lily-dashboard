@@ -5856,6 +5856,10 @@ fn render_settings_page(
             } else {
                 title.clone()
             };
+            let is_stock = matches!(
+                val.as_str(),
+                "tonal" | "outlined" | "pill" | "solid" | "neon" | "ghost"
+            );
             let preview_cls = match val.as_str() {
                 "tonal" => "btn-preview-tonal",
                 "outlined" => "btn-preview-outlined",
@@ -5866,12 +5870,13 @@ fn render_settings_page(
                 _ => "plan-fmt-btn",
             };
             let mut classes = vec![preview_cls.to_string()];
-            if active {
+            if active || !is_stock {
                 classes.push("active".to_string());
             }
             let b = Button::builder()
                 .label(&text)
                 .css_classes(classes)
+                .hexpand(true)
                 .tooltip_text(&format!("{}.css", val))
                 .build();
             let v_str = val.clone();
@@ -5883,7 +5888,20 @@ fn render_settings_page(
                 rel_t();
                 render_settings_page(&c_box, &rel_t, &app_t);
             });
-            style_flow.insert(&b, -1);
+            if is_stock {
+                style_flow.insert(&b, -1);
+            } else {
+                let scope_cls: String = val
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+                    .collect();
+                let wrap = Box::builder()
+                    .orientation(Orientation::Horizontal)
+                    .css_classes(vec![format!("css-scope-{}", scope_cls)])
+                    .build();
+                wrap.append(&b);
+                style_flow.insert(&wrap, -1);
+            }
         }
         btn_card.append(&style_flow);
     }
