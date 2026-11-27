@@ -796,18 +796,44 @@ fn apply_papirus_folder_color(is_light: bool, folder_color: &str) -> String {
     overlay_name.to_string()
 }
 
-/// Applies `theme` globally across Hyprland, GTK3/4, Qt6/Dolphin (dynamic KDE color scheme),
-/// Papirus folders, Kitty, btop, SwayNC, SwayOSD, Wofi, Starship, and Lily Dashboard.
+/// Applies `theme` globally across enabled `ThemeTargetsConfig` categories (only touching
+/// apps whose `~/.config/<app>` directory already exists on disk, so zero clutter is created).
 pub fn apply_global(d: &ThemeDefinition) -> String {
     let home = glib::home_dir();
     let cfg_dir = glib::user_config_dir();
     let data_dir = glib::user_data_dir();
+    let targets = crate::config::get().theme_targets;
     let is_light = d.mode.eq_ignore_ascii_case("light");
     let folder_color = d.resolved_folder_color();
-    let icon_theme = apply_papirus_folder_color(is_light, &folder_color);
+    let icon_theme = if targets.papirus_folders {
+        apply_papirus_folder_color(is_light, &folder_color)
+    } else if is_light {
+        "Papirus-Light".to_string()
+    } else {
+        "Papirus-Dark".to_string()
+    };
     let gtk_dark = if is_light { "0" } else { "1" };
     let gtk_theme = if is_light { "adw-gtk3" } else { "adw-gtk3-dark" };
     let g_scheme = if is_light { "prefer-light" } else { "prefer-dark" };
+    let sel_fg = &d.fg_on_contrast;
+
+    let default_term = ThemeDefinition::default().terminal;
+    let tc = |idx: usize| -> &str {
+        d.terminal
+            .get(idx)
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| default_term.get(idx).map(|s| s.as_str()).unwrap_or("cdd6f4"))
+    };
+
+    let proc_running = |name: &str| -> bool {
+        Command::new("pgrep")
+            .args(["-x", name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
 
     // 0. Write current.conf (keeps Lily Dashboard "auto" and external tools synced)
     let ts_dir = cfg_dir.join("theme-switch");
@@ -818,8 +844,8 @@ pub fn apply_global(d: &ThemeDefinition) -> String {
         d.fg_main, d.fg_muted, d.fg_on_contrast, d.accent, d.selection, d.magenta,
         d.starship_bg, d.starship_fg
     );
-    for (i, c) in d.terminal.iter().enumerate().take(16) {
-        cur_conf.push_str(&format!("color{} = {}\n", i, c));
+    for i in 0..16 {
+        cur_conf.push_str(&format!("color{} = {}\n", i, tc(i)));
     }
     let _ = fs::write(ts_dir.join("current.conf"), &cur_conf);
 
@@ -828,80 +854,254 @@ pub fn apply_global(d: &ThemeDefinition) -> String {
         c.custom_palette = None;
     });
 
-    // 1. Hyprland marshmellow.lua
-    let hypr_lua = format!(
-        "-- Dynamic Color Palette for Hyprland (Lily Dashboard)\nreturn {{\n    bg_light       = \"rgba({}ee)\",\n    bg_button      = \"rgba({}ee)\",\n    bg_inactive    = \"rgba({}aa)\",\n    bg_dark        = \"rgba({}ee)\",\n    accent         = \"rgba({}ee)\",\n    selection      = \"rgba({}ee)\",\n    magenta        = \"rgba({}ee)\",\n    text_dark      = \"rgba({}ff)\",\n    text_muted     = \"rgba({}aa)\",\n    shadow         = 0xee{},\n}}\n",
-        d.bg_main, d.bg_pill, d.bg_recessed, d.bg_contrast, d.accent, d.selection, d.magenta,
-        d.fg_main, d.fg_muted, d.bg_contrast
-    );
-    let hypr_dir = cfg_dir.join("hypr");
-    if hypr_dir.is_dir() {
-        let _ = fs::write(hypr_dir.join("marshmellow.lua"), hypr_lua);
-    }
+    // 1. Hyprland (`marshmellow.lua` for Hyprlua + `lily-colors.conf` for classic hyprland.conf)
+    if targets.hyprland {
+        let hypr_dir = cfg_dir.join("hypr");
+        if hypr_dir.is_dir() {
+            let hypr_lua = format!(
+                "-- Dynamic Color Palette for Hyprland (Lily Dashboard)\nreturn {{\n    bg_light       = \"rgba({}ee)\",\n    bg_button      = \"rgba({}ee)\",\n    bg_inactive    = \"rgba({}aa)\",\n    bg_dark        = \"rgba({}ee)\",\n    accent         = \"rgba({}ee)\",\n    selection      = \"rgba({}ee)\",\n    magenta        = \"rgba({}ee)\",\n    text_dark      = \"rgba({}ff)\",\n    text_muted     = \"rgba({}aa)\",\n    shadow         = 0xee{},\n}}\n",
+                d.bg_main, d.bg_pill, d.bg_recessed, d.bg_contrast, d.accent, d.selection, d.magenta,
+                d.fg_main, d.fg_muted, d.bg_contrast
+            );
+            let _ = fs::write(hypr_dir.join("marshmellow.lua"), hypr_lua);
 
-    // 2. Wofi CSS
-    let wofi_dir = cfg_dir.join("wofi");
-    if wofi_dir.is_dir() {
-        let wofi_css = format!(
-            "window {{ margin: 0px; border: 3px solid #{}; background-color: {}; border-radius: 14px; font-family: \"Josefin Sans\", sans-serif; font-size: 15px; font-weight: 600; }}\n#outer-box {{ margin: 12px; border: none; background-color: transparent; }}\n#input {{ margin: 4px 4px 12px 4px; padding: 10px 14px; border: 2px solid #{}; border-radius: 10px; color: #{}; background-color: #{}; outline: none; }}\n#input:focus {{ border: 2px solid #{}; }}\n#inner-box {{ margin: 4px; border: none; background-color: transparent; }}\n#scroll {{ margin: 0px; border: none; }}\n#text {{ margin: 4px 8px; border: none; color: #{}; }}\n#img {{ margin-right: 8px; }}\n#entry {{ padding: 8px 12px; margin: 3px 4px; border-radius: 10px; border: none; background-color: transparent; }}\n#entry:selected {{ background-color: #{}; border: 1px solid #{}; outline: none; }}\n#entry:selected #text {{ color: #{}; font-weight: bold; }}\n",
-            d.accent, rgba_css(&d.bg_main, 0.95), d.accent, d.fg_on_contrast, d.bg_contrast,
-            d.magenta, d.fg_main, d.selection, d.accent, d.fg_on_contrast
-        );
-        let _ = fs::write(wofi_dir.join("style.css"), wofi_css);
-    }
-
-    // 3. SwayNC & SwayOSD
-    let swaync_p = cfg_dir.join("swaync").join("style.css");
-    if let Ok(mut snc) = fs::read_to_string(&swaync_p) {
-        snc = replace_line_prefix(
-            &snc,
-            "@define-color bg-main",
-            &format!("@define-color bg-main {};", rgba_css(&d.bg_main, 0.88)),
-        );
-        snc = replace_line_prefix(
-            &snc,
-            "@define-color accent",
-            &format!("@define-color accent #{};", d.accent),
-        );
-        snc = replace_line_prefix(
-            &snc,
-            "@define-color text-dark",
-            &format!("@define-color text-dark #{};", d.fg_main),
-        );
-        snc = replace_line_prefix(
-            &snc,
-            "@define-color text-muted",
-            &format!("@define-color text-muted #{};", d.fg_muted),
-        );
-        let _ = fs::write(&swaync_p, snc);
-    }
-
-    let swayosd_p = cfg_dir.join("swayosd").join("style.css");
-    if swayosd_p.parent().map(|p| p.is_dir()).unwrap_or(false) {
-        let osd_css = format!(
-            "* {{ min-height: 0; margin: 0; padding: 0; }}\nwindow {{ padding: 0px 14px; background: {}; border: 2px solid #{}; border-radius: 999px; }}\n#osd {{ margin: 0px 4px; }}\nimage {{ color: #{}; min-width: 14px; min-height: 14px; margin-right: 8px; }}\nprogressbar trough {{ min-width: 120px; min-height: 3px; border-radius: 999px; background: {}; border: none; }}\nprogressbar progress {{ min-height: 3px; border-radius: 999px; background: #{}; border: none; }}\n",
-            rgba_css(&d.bg_main, 0.88), d.accent, d.magenta, rgba_css(&d.fg_muted, 0.35), d.accent
-        );
-        let _ = fs::write(&swayosd_p, osd_css);
-    }
-
-    // 4. Kitty
-    let kitty_dir = cfg_dir.join("kitty");
-    if kitty_dir.is_dir() {
-        let mut kitty = format!(
-            "background #{}\nforeground #{}\ncursor #{}\ncursor_text_color #{}\nselection_background #{}\nselection_foreground #{}\n",
-            d.bg_main, d.fg_main, d.accent, d.bg_main, d.selection, d.fg_main
-        );
-        for (i, c) in d.terminal.iter().enumerate().take(16) {
-            kitty.push_str(&format!("color{} #{}\n", i, c));
+            let hypr_conf = format!(
+                "# Dynamic Color Palette for Hyprland (Managed by Lily Dashboard)\n# Usage in hyprland.conf: source = ~/.config/hypr/lily-colors.conf\n$bg_main = rgba({bg_main}ee)\n$bg_pill = rgba({bg_pill}ee)\n$bg_recessed = rgba({bg_recessed}aa)\n$bg_contrast = rgba({bg_contrast}ee)\n$fg_main = rgba({fg_main}ff)\n$fg_muted = rgba({fg_muted}aa)\n$fg_on_contrast = rgba({sel_fg}ff)\n$accent = rgba({accent}ee)\n$selection = rgba({selection}ee)\n$magenta = rgba({magenta}ee)\n$shadow = rgba({bg_contrast}ee)\n\n$bg_main_hex = {bg_main}\n$bg_pill_hex = {bg_pill}\n$fg_main_hex = {fg_main}\n$accent_hex = {accent}\n$selection_hex = {selection}\n$magenta_hex = {magenta}\n",
+                bg_main = d.bg_main,
+                bg_pill = d.bg_pill,
+                bg_recessed = d.bg_recessed,
+                bg_contrast = d.bg_contrast,
+                fg_main = d.fg_main,
+                fg_muted = d.fg_muted,
+                sel_fg = sel_fg,
+                accent = d.accent,
+                selection = d.selection,
+                magenta = d.magenta,
+            );
+            let _ = fs::write(hypr_dir.join("lily-colors.conf"), hypr_conf);
         }
-        let _ = fs::write(kitty_dir.join("active-theme.conf"), kitty);
     }
 
-    // 5. GTK3 & GTK4 CSS + settings.ini + gsettings + GtkSourceView
-    let sel_fg = &d.fg_on_contrast;
-    let gtk_css = format!(
-        r#"@define-color window_bg_color #{bg_main};
+    // 2. App Launchers (Wofi, Rofi, Fuzzel)
+    if targets.launchers {
+        let wofi_dir = cfg_dir.join("wofi");
+        if wofi_dir.is_dir() {
+            let wofi_css = format!(
+                "window {{ margin: 0px; border: 3px solid #{}; background-color: {}; border-radius: 14px; font-family: \"Josefin Sans\", sans-serif; font-size: 15px; font-weight: 600; }}\n#outer-box {{ margin: 12px; border: none; background-color: transparent; }}\n#input {{ margin: 4px 4px 12px 4px; padding: 10px 14px; border: 2px solid #{}; border-radius: 10px; color: #{}; background-color: #{}; outline: none; }}\n#input:focus {{ border: 2px solid #{}; }}\n#inner-box {{ margin: 4px; border: none; background-color: transparent; }}\n#scroll {{ margin: 0px; border: none; }}\n#text {{ margin: 4px 8px; border: none; color: #{}; }}\n#img {{ margin-right: 8px; }}\n#entry {{ padding: 8px 12px; margin: 3px 4px; border-radius: 10px; border: none; background-color: transparent; }}\n#entry:selected {{ background-color: #{}; border: 1px solid #{}; outline: none; }}\n#entry:selected #text {{ color: #{}; font-weight: bold; }}\n",
+                d.accent, rgba_css(&d.bg_main, 0.95), d.accent, d.fg_on_contrast, d.bg_contrast,
+                d.magenta, d.fg_main, d.selection, d.accent, d.fg_on_contrast
+            );
+            let _ = fs::write(wofi_dir.join("style.css"), wofi_css);
+        }
+
+        let rofi_dir = cfg_dir.join("rofi");
+        if rofi_dir.is_dir() {
+            let rofi_rasi = format!(
+                "/* Managed by Lily Dashboard — add `@import \"lily-theme.rasi\"` to ~/.config/rofi/config.rasi */\n* {{\n    bg-main:        #{bg_main};\n    bg-pill:        #{bg_pill};\n    bg-recessed:    #{bg_recessed};\n    bg-contrast:    #{bg_contrast};\n    fg-main:        #{fg_main};\n    fg-muted:       #{fg_muted};\n    fg-on-contrast: #{sel_fg};\n    accent:         #{accent};\n    selection:      #{selection};\n    magenta:        #{magenta};\n\n    background-color:           @bg-main;\n    text-color:                 @fg-main;\n    border-color:               @accent;\n    selected-normal-background: @selection;\n    selected-normal-foreground: @fg-on-contrast;\n    alternate-normal-background: @bg-recessed;\n    normal-background:          @bg-main;\n    normal-foreground:          @fg-main;\n}}\n",
+                bg_main = d.bg_main,
+                bg_pill = d.bg_pill,
+                bg_recessed = d.bg_recessed,
+                bg_contrast = d.bg_contrast,
+                fg_main = d.fg_main,
+                fg_muted = d.fg_muted,
+                sel_fg = sel_fg,
+                accent = d.accent,
+                selection = d.selection,
+                magenta = d.magenta,
+            );
+            let _ = fs::write(rofi_dir.join("lily-theme.rasi"), rofi_rasi);
+        }
+
+        let fuzzel_dir = cfg_dir.join("fuzzel");
+        if fuzzel_dir.is_dir() {
+            let fuzzel_ini = format!(
+                "# Managed by Lily Dashboard — add `include=~/.config/fuzzel/lily-theme.ini` to ~/.config/fuzzel/fuzzel.ini\n[colors]\nbackground={bg_main}ee\ntext={fg_main}ff\nprompt={accent}ff\nplaceholder={fg_muted}ff\ninput={fg_main}ff\nmatch={magenta}ff\nselection={selection}ff\nselection-text={sel_fg}ff\nselection-match={accent}ff\ncounter={fg_muted}ff\nborder={accent}ff\n",
+                bg_main = d.bg_main,
+                fg_main = d.fg_main,
+                accent = d.accent,
+                fg_muted = d.fg_muted,
+                magenta = d.magenta,
+                selection = d.selection,
+                sel_fg = sel_fg,
+            );
+            let _ = fs::write(fuzzel_dir.join("lily-theme.ini"), fuzzel_ini);
+        }
+    }
+
+    // 3. Notification Daemons & OSD (SwayNC, SwayOSD, Mako, Dunst)
+    if targets.notifications {
+        let swaync_p = cfg_dir.join("swaync").join("style.css");
+        if let Ok(mut snc) = fs::read_to_string(&swaync_p) {
+            snc = replace_line_prefix(
+                &snc,
+                "@define-color bg-main",
+                &format!("@define-color bg-main {};", rgba_css(&d.bg_main, 0.88)),
+            );
+            snc = replace_line_prefix(
+                &snc,
+                "@define-color accent",
+                &format!("@define-color accent #{};", d.accent),
+            );
+            snc = replace_line_prefix(
+                &snc,
+                "@define-color text-dark",
+                &format!("@define-color text-dark #{};", d.fg_main),
+            );
+            snc = replace_line_prefix(
+                &snc,
+                "@define-color text-muted",
+                &format!("@define-color text-muted #{};", d.fg_muted),
+            );
+            let _ = fs::write(&swaync_p, snc);
+        }
+
+        let swayosd_p = cfg_dir.join("swayosd").join("style.css");
+        if swayosd_p.parent().map(|p| p.is_dir()).unwrap_or(false) {
+            let osd_css = format!(
+                "* {{ min-height: 0; margin: 0; padding: 0; }}\nwindow {{ padding: 0px 14px; background: {}; border: 2px solid #{}; border-radius: 999px; }}\n#osd {{ margin: 0px 4px; }}\nimage {{ color: #{}; min-width: 14px; min-height: 14px; margin-right: 8px; }}\nprogressbar trough {{ min-width: 120px; min-height: 3px; border-radius: 999px; background: {}; border: none; }}\nprogressbar progress {{ min-height: 3px; border-radius: 999px; background: #{}; border: none; }}\n",
+                rgba_css(&d.bg_main, 0.88), d.accent, d.magenta, rgba_css(&d.fg_muted, 0.35), d.accent
+            );
+            let _ = fs::write(&swayosd_p, osd_css);
+        }
+
+        let mako_dir = cfg_dir.join("mako");
+        if mako_dir.is_dir() {
+            let mako_cfg = format!(
+                "# Managed by Lily Dashboard — add `include=~/.config/mako/lily-theme` to ~/.config/mako/config\nbackground-color=#{bg_main}ee\ntext-color=#{fg_main}\nborder-color=#{accent}\nprogress-color=over #{selection}88\n\n[urgency=low]\nborder-color=#{fg_muted}\n\n[urgency=high]\nborder-color=#{magenta}\n",
+                bg_main = d.bg_main,
+                fg_main = d.fg_main,
+                accent = d.accent,
+                selection = d.selection,
+                fg_muted = d.fg_muted,
+                magenta = d.magenta,
+            );
+            let _ = fs::write(mako_dir.join("lily-theme"), mako_cfg);
+        }
+
+        let dunst_dir = cfg_dir.join("dunst");
+        if dunst_dir.is_dir() {
+            let dropin_dir = dunst_dir.join("dunstrc.d");
+            let _ = fs::create_dir_all(&dropin_dir);
+            let dunst_cfg = format!(
+                "# Managed by Lily Dashboard (auto-loaded by Dunst dunstrc.d drop-in support)\n[global]\n    frame_color = \"#{accent}\"\n    separator_color = frame\n    highlight = \"#{accent}\"\n\n[urgency_low]\n    background = \"#{bg_recessed}ee\"\n    foreground = \"#{fg_muted}\"\n    frame_color = \"#{bg_pill}\"\n\n[urgency_normal]\n    background = \"#{bg_main}ee\"\n    foreground = \"#{fg_main}\"\n    frame_color = \"#{accent}\"\n\n[urgency_critical]\n    background = \"#{bg_main}f5\"\n    foreground = \"#{fg_main}\"\n    frame_color = \"#{magenta}\"\n",
+                accent = d.accent,
+                bg_recessed = d.bg_recessed,
+                fg_muted = d.fg_muted,
+                bg_pill = d.bg_pill,
+                bg_main = d.bg_main,
+                fg_main = d.fg_main,
+                magenta = d.magenta,
+            );
+            let _ = fs::write(dropin_dir.join("99-lily-theme.conf"), dunst_cfg);
+        }
+    }
+
+    // 4. Terminals (Kitty, Alacritty, Foot, Ghostty)
+    if targets.terminals {
+        let kitty_dir = cfg_dir.join("kitty");
+        if kitty_dir.is_dir() {
+            let mut kitty = format!(
+                "background #{}\nforeground #{}\ncursor #{}\ncursor_text_color #{}\nselection_background #{}\nselection_foreground #{}\n",
+                d.bg_main, d.fg_main, d.accent, d.bg_main, d.selection, d.fg_main
+            );
+            for i in 0..16 {
+                kitty.push_str(&format!("color{} #{}\n", i, tc(i)));
+            }
+            let _ = fs::write(kitty_dir.join("active-theme.conf"), kitty);
+        }
+
+        let alacritty_dir = cfg_dir.join("alacritty");
+        if alacritty_dir.is_dir() {
+            let alacritty_toml = format!(
+                "# Managed by Lily Dashboard\n# Add to alacritty.toml: general.import = [\"~/.config/alacritty/lily-theme.toml\"]\n[colors.primary]\nbackground = \"#{bg_main}\"\nforeground = \"#{fg_main}\"\n\n[colors.cursor]\ntext = \"#{bg_main}\"\ncursor = \"#{accent}\"\n\n[colors.selection]\ntext = \"#{sel_fg}\"\nbackground = \"#{selection}\"\n\n[colors.normal]\nblack   = \"#{c0}\"\nred     = \"#{c1}\"\ngreen   = \"#{c2}\"\nyellow  = \"#{c3}\"\nblue    = \"#{c4}\"\nmagenta = \"#{c5}\"\ncyan    = \"#{c6}\"\nwhite   = \"#{c7}\"\n\n[colors.bright]\nblack   = \"#{c8}\"\nred     = \"#{c9}\"\ngreen   = \"#{c10}\"\nyellow  = \"#{c11}\"\nblue    = \"#{c12}\"\nmagenta = \"#{c13}\"\ncyan    = \"#{c14}\"\nwhite   = \"#{c15}\"\n",
+                bg_main = d.bg_main,
+                fg_main = d.fg_main,
+                accent = d.accent,
+                sel_fg = sel_fg,
+                selection = d.selection,
+                c0 = tc(0), c1 = tc(1), c2 = tc(2), c3 = tc(3),
+                c4 = tc(4), c5 = tc(5), c6 = tc(6), c7 = tc(7),
+                c8 = tc(8), c9 = tc(9), c10 = tc(10), c11 = tc(11),
+                c12 = tc(12), c13 = tc(13), c14 = tc(14), c15 = tc(15),
+            );
+            let _ = fs::write(alacritty_dir.join("lily-theme.toml"), alacritty_toml);
+        }
+
+        let foot_dir = cfg_dir.join("foot");
+        if foot_dir.is_dir() {
+            let mut foot_ini = format!(
+                "# Managed by Lily Dashboard\n# Add to foot.ini: include=~/.config/foot/lily-theme.ini\n[colors]\nbackground={bg_main}\nforeground={fg_main}\nselection-background={selection}\nselection-foreground={sel_fg}\n",
+                bg_main = d.bg_main,
+                fg_main = d.fg_main,
+                selection = d.selection,
+                sel_fg = sel_fg,
+            );
+            for i in 0..8 {
+                foot_ini.push_str(&format!("regular{}={}\n", i, tc(i)));
+            }
+            for i in 0..8 {
+                foot_ini.push_str(&format!("bright{}={}\n", i, tc(i + 8)));
+            }
+            let _ = fs::write(foot_dir.join("lily-theme.ini"), foot_ini);
+        }
+
+        let ghostty_dir = cfg_dir.join("ghostty");
+        if ghostty_dir.is_dir() {
+            let g_themes = ghostty_dir.join("themes");
+            let _ = fs::create_dir_all(&g_themes);
+            let mut ghostty = format!(
+                "# Managed by Lily Dashboard — set `theme = lily-dynamic` in ~/.config/ghostty/config\nbackground = #{bg_main}\nforeground = #{fg_main}\ncursor-color = #{accent}\ncursor-text = #{bg_main}\nselection-background = #{selection}\nselection-foreground = #{sel_fg}\n",
+                bg_main = d.bg_main,
+                fg_main = d.fg_main,
+                accent = d.accent,
+                selection = d.selection,
+                sel_fg = sel_fg,
+            );
+            for i in 0..16 {
+                ghostty.push_str(&format!("palette = {}=#{}\n", i, tc(i)));
+            }
+            let _ = fs::write(g_themes.join("lily-dynamic"), ghostty);
+        }
+    }
+
+    // 4b. Yazi Terminal File Manager
+    if targets.yazi {
+        let yazi_dir = cfg_dir.join("yazi");
+        if yazi_dir.is_dir() {
+            let yazi_toml = format!(
+                "# Managed by Lily Dashboard ({name})\n[mgr]\ncwd = {{ fg = \"#{accent}\" }}\nhovered = {{ fg = \"#{sel_fg}\", bg = \"#{selection}\", bold = true }}\npreview_hovered = {{ underline = true }}\nfind_keyword = {{ fg = \"#{magenta}\", bold = true }}\nfind_position = {{ fg = \"#{accent}\" }}\nmarker_copied = {{ fg = \"#{c2}\", bg = \"#{c2}\" }}\nmarker_cut = {{ fg = \"#{c1}\", bg = \"#{c1}\" }}\nmarker_selected = {{ fg = \"#{accent}\", bg = \"#{accent}\" }}\nborder_style = {{ fg = \"#{bg_pill}\" }}\n\n[mode]\nnormal_main = {{ fg = \"#{sel_fg}\", bg = \"#{accent}\", bold = true }}\nnormal_alt = {{ fg = \"#{fg_main}\", bg = \"#{bg_pill}\" }}\nselect_main = {{ fg = \"#{sel_fg}\", bg = \"#{magenta}\", bold = true }}\nselect_alt = {{ fg = \"#{fg_main}\", bg = \"#{bg_pill}\" }}\nunset_main = {{ fg = \"#{sel_fg}\", bg = \"#{c1}\", bold = true }}\nunset_alt = {{ fg = \"#{fg_main}\", bg = \"#{bg_pill}\" }}\n\n[status]\nsep_left = {{ open = \"\", close = \"\" }}\nsep_right = {{ open = \"\", close = \"\" }}\noverall = {{ fg = \"#{fg_main}\", bg = \"#{bg_recessed}\" }}\nprogress_label = {{ fg = \"#{fg_main}\", bold = true }}\nprogress_normal = {{ fg = \"#{accent}\", bg = \"#{bg_pill}\" }}\nprogress_error = {{ fg = \"#{c1}\", bg = \"#{bg_pill}\" }}\nperm_type = {{ fg = \"#{accent}\" }}\nperm_read = {{ fg = \"#{c3}\" }}\nperm_write = {{ fg = \"#{c1}\" }}\nperm_exec = {{ fg = \"#{c2}\" }}\nperm_sep = {{ fg = \"#{fg_muted}\" }}\n\n[input]\nborder = {{ fg = \"#{accent}\" }}\ntitle = {{ fg = \"#{accent}\" }}\nvalue = {{ fg = \"#{fg_main}\" }}\nselected = {{ bg = \"#{selection}\", fg = \"#{sel_fg}\" }}\n\n[pick]\nborder = {{ fg = \"#{accent}\" }}\nactive = {{ fg = \"#{magenta}\", bold = true }}\ninactive = {{ fg = \"#{fg_main}\" }}\n\n[confirm]\nborder = {{ fg = \"#{accent}\" }}\ntitle = {{ fg = \"#{accent}\" }}\n",
+                name = d.name,
+                accent = d.accent,
+                sel_fg = sel_fg,
+                selection = d.selection,
+                magenta = d.magenta,
+                bg_pill = d.bg_pill,
+                bg_recessed = d.bg_recessed,
+                fg_main = d.fg_main,
+                fg_muted = d.fg_muted,
+                c1 = tc(1),
+                c2 = tc(2),
+                c3 = tc(3),
+            );
+            let _ = fs::write(yazi_dir.join("lily-theme.toml"), &yazi_toml);
+            let main_yazi_theme = yazi_dir.join("theme.toml");
+            let can_write_main = if !main_yazi_theme.exists() {
+                true
+            } else {
+                fs::read_to_string(&main_yazi_theme)
+                    .map(|s| s.starts_with("# Managed by Lily Dashboard"))
+                    .unwrap_or(false)
+            };
+            if can_write_main {
+                let _ = fs::write(main_yazi_theme, &yazi_toml);
+            }
+        }
+    }
+
+    // 5. GTK3 & GTK4 CSS + settings.ini + gsettings + XDG portal
+    if targets.gtk {
+        let gtk_css = format!(
+            r#"@define-color window_bg_color #{bg_main};
 @define-color window_fg_color #{fg_main};
 @define-color view_bg_color #{bg_main};
 @define-color view_fg_color #{fg_main};
@@ -939,156 +1139,164 @@ tooltip, tooltip.background {{ background-color: #{bg_pill}; color: #{fg_main}; 
 tooltip label {{ color: #{fg_main}; }}
 textview {{ padding: 16px; }}
 "#,
-        bg_main = d.bg_main,
-        fg_main = d.fg_main,
-        bg_pill = d.bg_pill,
-        accent = d.accent,
-        bg_recessed = d.bg_recessed,
-        shade = rgba_css(&d.bg_contrast, 0.08),
-        sel_fg = sel_fg,
-        selection = d.selection,
-    );
+            bg_main = d.bg_main,
+            fg_main = d.fg_main,
+            bg_pill = d.bg_pill,
+            accent = d.accent,
+            bg_recessed = d.bg_recessed,
+            shade = rgba_css(&d.bg_contrast, 0.08),
+            sel_fg = sel_fg,
+            selection = d.selection,
+        );
 
-    for gdir in ["gtk-3.0", "gtk-4.0"] {
-        let dir = cfg_dir.join(gdir);
-        let _ = fs::create_dir_all(&dir);
-        let _ = fs::write(dir.join("gtk.css"), &gtk_css);
-        let s_ini = dir.join("settings.ini");
-        if let Ok(mut ini) = fs::read_to_string(&s_ini) {
-            ini = replace_line_prefix(&ini, "gtk-theme-name=", &format!("gtk-theme-name={}", gtk_theme));
-            ini = replace_line_prefix(&ini, "gtk-icon-theme-name=", &format!("gtk-icon-theme-name={}", icon_theme));
-            ini = replace_line_prefix(
-                &ini,
-                "gtk-application-prefer-dark-theme=",
-                &format!("gtk-application-prefer-dark-theme={}", gtk_dark),
-            );
-            let _ = fs::write(&s_ini, ini);
+        for gdir in ["gtk-3.0", "gtk-4.0"] {
+            let dir = cfg_dir.join(gdir);
+            let _ = fs::create_dir_all(&dir);
+            let _ = fs::write(dir.join("gtk.css"), &gtk_css);
+            let s_ini = dir.join("settings.ini");
+            if let Ok(mut ini) = fs::read_to_string(&s_ini) {
+                ini = replace_line_prefix(&ini, "gtk-theme-name=", &format!("gtk-theme-name={}", gtk_theme));
+                ini = replace_line_prefix(&ini, "gtk-icon-theme-name=", &format!("gtk-icon-theme-name={}", icon_theme));
+                ini = replace_line_prefix(
+                    &ini,
+                    "gtk-application-prefer-dark-theme=",
+                    &format!("gtk-application-prefer-dark-theme={}", gtk_dark),
+                );
+                let _ = fs::write(&s_ini, ini);
+            }
         }
+
+        let _ = Command::new("gsettings")
+            .args(["set", "org.gnome.desktop.interface", "color-scheme", g_scheme])
+            .status();
+        let _ = Command::new("gsettings")
+            .args(["set", "org.gnome.desktop.interface", "gtk-theme", gtk_theme])
+            .status();
+        let _ = Command::new("gsettings")
+            .args(["set", "org.gnome.desktop.interface", "icon-theme", &icon_theme])
+            .status();
+        let portal_scheme = if is_light { "'prefer-light'" } else { "'prefer-dark'" };
+        let _ = Command::new("dconf")
+            .args(["write", "/org/x/apps/portal/color-scheme", portal_scheme])
+            .status();
     }
 
-    let _ = Command::new("gsettings")
-        .args(["set", "org.gnome.desktop.interface", "color-scheme", g_scheme])
-        .status();
-    let _ = Command::new("gsettings")
-        .args(["set", "org.gnome.desktop.interface", "gtk-theme", gtk_theme])
-        .status();
-    let _ = Command::new("gsettings")
-        .args(["set", "org.gnome.desktop.interface", "icon-theme", &icon_theme])
-        .status();
-    let portal_scheme = if is_light { "'prefer-light'" } else { "'prefer-dark'" };
-    let _ = Command::new("dconf")
-        .args(["write", "/org/x/apps/portal/color-scheme", portal_scheme])
-        .status();
+    // 6. Qt5 (`qt5ct`), Qt6 (`qt6ct`), KDE ColorScheme & Dolphin
+    let dolphin_was_open = if targets.qt_dolphin {
+        let open = proc_running("dolphin");
+        if open {
+            let _ = Command::new("pkill").args(["-x", "dolphin"]).status();
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
 
-    // 7. Qt6 & Dolphin (DYNAMIC LilyDynamic.colors — fixes the pink bandaid!)
-    let dolphin_was_open = Command::new("pgrep")
-        .args(["-x", "dolphin"])
-        .stdout(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if dolphin_was_open {
-        let _ = Command::new("pkill").args(["-x", "dolphin"]).status();
-        std::thread::sleep(std::time::Duration::from_millis(120));
-    }
-
-    let cache_dir = home.join(".cache");
-    if let Ok(rd) = fs::read_dir(&cache_dir) {
-        for entry in rd.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("kdeglobals")
-                || name.starts_with("kioexec")
-                || name == "icon-cache.kcache"
-            {
-                let p = entry.path();
-                if p.is_dir() {
-                    let _ = fs::remove_dir_all(&p);
-                } else {
-                    let _ = fs::remove_file(&p);
+        let cache_dir = home.join(".cache");
+        if let Ok(rd) = fs::read_dir(&cache_dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("kdeglobals")
+                    || name.starts_with("kioexec")
+                    || name == "icon-cache.kcache"
+                {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        let _ = fs::remove_dir_all(&p);
+                    } else {
+                        let _ = fs::remove_file(&p);
+                    }
                 }
             }
         }
-    }
 
-    let qt_qss_dir = cfg_dir.join("qt6ct").join("qss");
-    let _ = fs::create_dir_all(&qt_qss_dir);
-    let qss = format!(
-        "QWidget {{ color: #{}; }}\nQAbstractItemView, QListView, QTreeView, QAbstractScrollArea, QAbstractScrollArea > QWidget {{ background-color: #{}; color: #{}; }}\nQMenu {{ background-color: {}; color: #{}; border: 2px solid #{}; border-radius: 14px; padding: 6px; }}\nQMenu::item {{ padding: 6px 24px 6px 12px; border-radius: 8px; margin: 2px 4px; background-color: transparent; }}\nQMenu::item:selected {{ background-color: #{}; color: #{}; }}\nQMenu::item:disabled {{ color: #{}; }}\nQMenu::separator {{ height: 1px; background: #{}; margin: 4px 10px; }}\n",
-        d.fg_main, d.bg_recessed, d.fg_main, rgba_css(&d.bg_main, 0.95), d.fg_main,
-        d.accent, d.selection, sel_fg, d.fg_muted, d.accent
-    );
-    let _ = fs::write(qt_qss_dir.join("marshmellow-menus.qss"), qss);
-
-    let qt_col_dir = cfg_dir.join("qt6ct").join("colors");
-    let _ = fs::create_dir_all(&qt_col_dir);
-    let qt_pal_path = qt_col_dir.join("marshmellow.conf");
-    let act = format!(
-        "#ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}",
-        d.fg_main, d.bg_pill, d.bg_main, d.bg_pill, d.bg_recessed, d.bg_main, d.fg_main,
-        d.fg_main, d.fg_main, d.bg_recessed, d.bg_main, d.bg_contrast, d.selection,
-        sel_fg, d.magenta, d.accent, d.bg_main, d.bg_main, d.bg_contrast, sel_fg,
-        d.fg_muted, d.accent
-    );
-    let _ = fs::write(
-        &qt_pal_path,
-        format!("[ColorScheme]\nactive_colors={0}\ndisabled_colors={0}\ninactive_colors={0}\n", act),
-    );
-
-    let qt_conf_p = cfg_dir.join("qt6ct").join("qt6ct.conf");
-    if let Ok(mut qt) = fs::read_to_string(&qt_conf_p) {
-        qt = replace_line_prefix(&qt, "icon_theme=", &format!("icon_theme={}", icon_theme));
-        qt = replace_line_prefix(
-            &qt,
-            "color_scheme_path=",
-            &format!("color_scheme_path={}", qt_pal_path.display()),
+        let qss = format!(
+            "QWidget {{ color: #{}; }}\nQAbstractItemView, QListView, QTreeView, QAbstractScrollArea, QAbstractScrollArea > QWidget {{ background-color: #{}; color: #{}; }}\nQMenu {{ background-color: {}; color: #{}; border: 2px solid #{}; border-radius: 14px; padding: 6px; }}\nQMenu::item {{ padding: 6px 24px 6px 12px; border-radius: 8px; margin: 2px 4px; background-color: transparent; }}\nQMenu::item:selected {{ background-color: #{}; color: #{}; }}\nQMenu::item:disabled {{ color: #{}; }}\nQMenu::separator {{ height: 1px; background: #{}; margin: 4px 10px; }}\n",
+            d.fg_main, d.bg_recessed, d.fg_main, rgba_css(&d.bg_main, 0.95), d.fg_main,
+            d.accent, d.selection, sel_fg, d.fg_muted, d.accent
         );
-        qt = replace_line_prefix(&qt, "custom_palette=", "custom_palette=true");
-        let _ = fs::write(&qt_conf_p, qt);
-    }
+        let act = format!(
+            "#ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}, #ff{}",
+            d.fg_main, d.bg_pill, d.bg_main, d.bg_pill, d.bg_recessed, d.bg_main, d.fg_main,
+            d.fg_main, d.fg_main, d.bg_recessed, d.bg_main, d.bg_contrast, d.selection,
+            sel_fg, d.magenta, d.accent, d.bg_main, d.bg_main, d.bg_contrast, sel_fg,
+            d.fg_muted, d.accent
+        );
+        let qt_scheme_body = format!(
+            "[ColorScheme]\nactive_colors={0}\ndisabled_colors={0}\ninactive_colors={0}\n",
+            act
+        );
 
-    // Dynamic KDE ColorScheme (replaces hardcoded MarshmellowDark.colors!)
-    let kde_scheme = build_kde_color_scheme(d, &icon_theme);
-    let cs_dir = data_dir.join("color-schemes");
-    let _ = fs::create_dir_all(&cs_dir);
-    let _ = fs::write(cs_dir.join("LilyDynamic.colors"), &kde_scheme);
-    let _ = fs::write(cfg_dir.join("kdeglobals"), &kde_scheme);
+        for (qt_dir_name, qt_conf_name) in [("qt6ct", "qt6ct.conf"), ("qt5ct", "qt5ct.conf")] {
+            let qt_base = cfg_dir.join(qt_dir_name);
+            if qt_base.is_dir() {
+                let qt_qss_dir = qt_base.join("qss");
+                let _ = fs::create_dir_all(&qt_qss_dir);
+                let _ = fs::write(qt_qss_dir.join("marshmellow-menus.qss"), &qss);
 
-    for drc in [
-        cfg_dir.join("dolphinrc"),
-        home.join(".local/state/dolphinstaterc"),
-    ] {
-        if let Ok(rc) = fs::read_to_string(&drc) {
-            let updated = if rc.contains("ColorScheme=") {
-                replace_line_prefix(&rc, "ColorScheme=", "ColorScheme=LilyDynamic")
-            } else if rc.contains("[UiSettings]") {
-                rc.replace("[UiSettings]", "[UiSettings]\nColorScheme=LilyDynamic")
-            } else {
-                format!("{}\n[UiSettings]\nColorScheme=LilyDynamic\n", rc)
-            };
-            let _ = fs::write(&drc, updated);
+                let qt_col_dir = qt_base.join("colors");
+                let _ = fs::create_dir_all(&qt_col_dir);
+                let qt_pal_path = qt_col_dir.join("marshmellow.conf");
+                let _ = fs::write(&qt_pal_path, &qt_scheme_body);
+
+                let qt_conf_p = qt_base.join(qt_conf_name);
+                if let Ok(mut qt) = fs::read_to_string(&qt_conf_p) {
+                    qt = replace_line_prefix(&qt, "icon_theme=", &format!("icon_theme={}", icon_theme));
+                    qt = replace_line_prefix(
+                        &qt,
+                        "color_scheme_path=",
+                        &format!("color_scheme_path={}", qt_pal_path.display()),
+                    );
+                    qt = replace_line_prefix(&qt, "custom_palette=", "custom_palette=true");
+                    let _ = fs::write(&qt_conf_p, qt);
+                }
+            }
         }
-    }
 
-    // 8. btop dynamic theme
-    let btop_dir = cfg_dir.join("btop").join("themes");
-    if btop_dir.parent().map(|p| p.is_dir()).unwrap_or(false) {
-        let _ = fs::create_dir_all(&btop_dir);
-        let p_cyan = d.terminal.get(6).map(|s| s.as_str()).unwrap_or("89dceb");
-        let p_red = d.terminal.get(1).map(|s| s.as_str()).unwrap_or("f38ba8");
-        let btop_theme = format!(
-            "theme[main_bg]=\"#{0}\"\ntheme[main_fg]=\"#{1}\"\ntheme[title]=\"#{2}\"\ntheme[hi_fg]=\"#{3}\"\ntheme[selected_bg]=\"#{4}\"\ntheme[selected_fg]=\"#{5}\"\ntheme[inactive_fg]=\"#{6}\"\ntheme[graph_text]=\"#{6}\"\ntheme[meter_bg]=\"#{7}\"\ntheme[proc_misc]=\"#{3}\"\ntheme[cpu_box]=\"#{2}\"\ntheme[mem_box]=\"#{2}\"\ntheme[net_box]=\"#{2}\"\ntheme[proc_box]=\"#{2}\"\ntheme[div_line]=\"#{2}\"\ntheme[temp_start]=\"#{3}\"\ntheme[temp_mid]=\"#{8}\"\ntheme[temp_end]=\"#{9}\"\ntheme[cpu_start]=\"#{3}\"\ntheme[cpu_mid]=\"#{2}\"\ntheme[cpu_end]=\"#{8}\"\ntheme[free_start]=\"#{3}\"\ntheme[free_mid]=\"#{2}\"\ntheme[free_end]=\"#{8}\"\ntheme[cached_start]=\"#{3}\"\ntheme[cached_mid]=\"#{2}\"\ntheme[cached_end]=\"#{8}\"\ntheme[available_start]=\"#{3}\"\ntheme[available_mid]=\"#{2}\"\ntheme[available_end]=\"#{8}\"\ntheme[used_start]=\"#{3}\"\ntheme[used_mid]=\"#{2}\"\ntheme[used_end]=\"#{8}\"\ntheme[download_start]=\"#{3}\"\ntheme[download_mid]=\"#{2}\"\ntheme[download_end]=\"#{8}\"\ntheme[upload_start]=\"#{3}\"\ntheme[upload_mid]=\"#{2}\"\ntheme[upload_end]=\"#{8}\"\ntheme[process_start]=\"#{3}\"\ntheme[process_mid]=\"#{2}\"\ntheme[process_end]=\"#{8}\"\n",
-            d.bg_main, d.fg_main, d.accent, p_cyan, d.selection, sel_fg, d.fg_muted, d.bg_recessed,
-            d.magenta, p_red
-        );
-        let _ = fs::write(btop_dir.join("marshmellow.theme"), btop_theme);
-    }
+        // Dynamic KDE ColorScheme (`LilyDynamic.colors` + `kdeglobals`)
+        let kde_scheme = build_kde_color_scheme(d, &icon_theme);
+        let cs_dir = data_dir.join("color-schemes");
+        let _ = fs::create_dir_all(&cs_dir);
+        let _ = fs::write(cs_dir.join("LilyDynamic.colors"), &kde_scheme);
+        let _ = fs::write(cfg_dir.join("kdeglobals"), &kde_scheme);
 
-    // 8b. Vesktop (Vencord) live theme CSS (supports Discord Visual Refresh + Dark/Darker/Midnight/Light)
-    let vesktop_themes_dir = cfg_dir.join("vesktop").join("themes");
-    if vesktop_themes_dir.is_dir() {
-        let fg_sub = blend_hex(&d.fg_main, &d.fg_muted, 0.35);
-        let vesktop_css = format!(
-            r#"/**
+        for drc in [
+            cfg_dir.join("dolphinrc"),
+            home.join(".local/state/dolphinstaterc"),
+        ] {
+            if let Ok(rc) = fs::read_to_string(&drc) {
+                let updated = if rc.contains("ColorScheme=") {
+                    replace_line_prefix(&rc, "ColorScheme=", "ColorScheme=LilyDynamic")
+                } else if rc.contains("[UiSettings]") {
+                    rc.replace("[UiSettings]", "[UiSettings]\nColorScheme=LilyDynamic")
+                } else {
+                    format!("{}\n[UiSettings]\nColorScheme=LilyDynamic\n", rc)
+                };
+                let _ = fs::write(&drc, updated);
+            }
+        }
+        open
+    } else {
+        false
+    };
+
+    // 7. Desktop & TUI Apps (btop + Vesktop/Vencord)
+    if targets.apps {
+        let btop_dir = cfg_dir.join("btop").join("themes");
+        if btop_dir.parent().map(|p| p.is_dir()).unwrap_or(false) {
+            let _ = fs::create_dir_all(&btop_dir);
+            let p_cyan = tc(6);
+            let p_red = tc(1);
+            let btop_theme = format!(
+                "theme[main_bg]=\"#{0}\"\ntheme[main_fg]=\"#{1}\"\ntheme[title]=\"#{2}\"\ntheme[hi_fg]=\"#{3}\"\ntheme[selected_bg]=\"#{4}\"\ntheme[selected_fg]=\"#{5}\"\ntheme[inactive_fg]=\"#{6}\"\ntheme[graph_text]=\"#{6}\"\ntheme[meter_bg]=\"#{7}\"\ntheme[proc_misc]=\"#{3}\"\ntheme[cpu_box]=\"#{2}\"\ntheme[mem_box]=\"#{2}\"\ntheme[net_box]=\"#{2}\"\ntheme[proc_box]=\"#{2}\"\ntheme[div_line]=\"#{2}\"\ntheme[temp_start]=\"#{3}\"\ntheme[temp_mid]=\"#{8}\"\ntheme[temp_end]=\"#{9}\"\ntheme[cpu_start]=\"#{3}\"\ntheme[cpu_mid]=\"#{2}\"\ntheme[cpu_end]=\"#{8}\"\ntheme[free_start]=\"#{3}\"\ntheme[free_mid]=\"#{2}\"\ntheme[free_end]=\"#{8}\"\ntheme[cached_start]=\"#{3}\"\ntheme[cached_mid]=\"#{2}\"\ntheme[cached_end]=\"#{8}\"\ntheme[available_start]=\"#{3}\"\ntheme[available_mid]=\"#{2}\"\ntheme[available_end]=\"#{8}\"\ntheme[used_start]=\"#{3}\"\ntheme[used_mid]=\"#{2}\"\ntheme[used_end]=\"#{8}\"\ntheme[download_start]=\"#{3}\"\ntheme[download_mid]=\"#{2}\"\ntheme[download_end]=\"#{8}\"\ntheme[upload_start]=\"#{3}\"\ntheme[upload_mid]=\"#{2}\"\ntheme[upload_end]=\"#{8}\"\ntheme[process_start]=\"#{3}\"\ntheme[process_mid]=\"#{2}\"\ntheme[process_end]=\"#{8}\"\n",
+                d.bg_main, d.fg_main, d.accent, p_cyan, d.selection, sel_fg, d.fg_muted, d.bg_recessed,
+                d.magenta, p_red
+            );
+            let _ = fs::write(btop_dir.join("marshmellow.theme"), btop_theme);
+        }
+
+        let vesktop_themes_dir = cfg_dir.join("vesktop").join("themes");
+        if vesktop_themes_dir.is_dir() {
+            let fg_sub = blend_hex(&d.fg_main, &d.fg_muted, 0.35);
+            let vesktop_css = format!(
+                r#"/**
  * @name Marshmellow
  * @author lilypersilly
  * @description Dynamic Lily Dashboard Theme ({name})
@@ -1295,45 +1503,99 @@ nav[class*="guilds_"] {{
     color: #{fg_sub} !important;
 }}
 "#,
-            name = d.name,
-            bg_main = d.bg_main,
-            bg_recessed = d.bg_recessed,
-            bg_pill = d.bg_pill,
-            fg_main = d.fg_main,
-            fg_sub = fg_sub,
-            fg_muted = d.fg_muted,
-            accent = d.accent,
-            selection = d.selection,
-            sel_fg = sel_fg,
-            magenta = d.magenta,
-            acc_08 = rgba_css(&d.accent, 0.08),
-            acc_12 = rgba_css(&d.accent, 0.12),
-            acc_18 = rgba_css(&d.accent, 0.18),
-            acc_22 = rgba_css(&d.accent, 0.22),
-            acc_25 = rgba_css(&d.accent, 0.25),
-            acc_28 = rgba_css(&d.accent, 0.28),
-            acc_35 = rgba_css(&d.accent, 0.35),
-        );
-        let lower_path = vesktop_themes_dir.join("marshmellow.theme.css");
-        let upper_path = vesktop_themes_dir.join("Marshmellow.theme.css");
-        if lower_path.exists() {
-            let _ = fs::write(&lower_path, &vesktop_css);
-        }
-        if upper_path.exists() || !lower_path.exists() {
-            let _ = fs::write(&upper_path, &vesktop_css);
+                name = d.name,
+                bg_main = d.bg_main,
+                bg_recessed = d.bg_recessed,
+                bg_pill = d.bg_pill,
+                fg_main = d.fg_main,
+                fg_sub = fg_sub,
+                fg_muted = d.fg_muted,
+                accent = d.accent,
+                selection = d.selection,
+                sel_fg = sel_fg,
+                magenta = d.magenta,
+                acc_08 = rgba_css(&d.accent, 0.08),
+                acc_12 = rgba_css(&d.accent, 0.12),
+                acc_18 = rgba_css(&d.accent, 0.18),
+                acc_22 = rgba_css(&d.accent, 0.22),
+                acc_25 = rgba_css(&d.accent, 0.25),
+                acc_28 = rgba_css(&d.accent, 0.28),
+                acc_35 = rgba_css(&d.accent, 0.35),
+            );
+            let lower_path = vesktop_themes_dir.join("marshmellow.theme.css");
+            let upper_path = vesktop_themes_dir.join("Marshmellow.theme.css");
+            if lower_path.exists() {
+                let _ = fs::write(&lower_path, &vesktop_css);
+            }
+            if upper_path.exists() || !lower_path.exists() {
+                let _ = fs::write(&upper_path, &vesktop_css);
+            }
         }
     }
 
-    // 9. Live desktop reloads
-    if dolphin_was_open {
+    // 8. Live desktop reloads (only for enabled targets & running daemons)
+    if targets.qt_dolphin && dolphin_was_open {
         let _ = Command::new("dolphin").spawn();
     }
-    crate::config::hypr_reload_preserving_overrides();
-    let _ = Command::new("pkill").args(["-USR1", "-x", "kitty"]).spawn();
-    let _ = Command::new("swaync-client").arg("-rs").spawn();
-    let _ = Command::new("sh")
-        .args(["-c", "pkill -x swayosd-server 2>/dev/null; sleep 0.1; command -v swayosd-server >/dev/null && swayosd-server &"])
-        .spawn();
+    if targets.hyprland {
+        crate::config::hypr_reload_preserving_overrides();
+    }
+    if targets.terminals && proc_running("kitty") {
+        let _ = Command::new("pkill").args(["-USR1", "-x", "kitty"]).spawn();
+    }
+    if targets.notifications {
+        if proc_running("swaync") && crate::config::bin_exists("swaync-client") {
+            let _ = Command::new("swaync-client").arg("-rs").spawn();
+        }
+        if proc_running("swayosd-server") || cfg_dir.join("swayosd").is_dir() {
+            let _ = Command::new("sh")
+                .args([
+                    "-c",
+                    "pkill -x swayosd-server 2>/dev/null; sleep 0.1; command -v swayosd-server >/dev/null && swayosd-server &",
+                ])
+                .spawn();
+        }
+        if proc_running("mako") && crate::config::bin_exists("makoctl") {
+            let _ = Command::new("makoctl").arg("reload").spawn();
+        }
+        if proc_running("dunst") && crate::config::bin_exists("dunstctl") {
+            let _ = Command::new("dunstctl").arg("reload").spawn();
+        }
+    }
 
-    format!("Applied '{}' globally (folders: {})!", d.name, folder_color)
+    // 9. Optional user hook script (`~/.config/lily-dashboard/theme-hook.sh`)
+    if targets.hook_script {
+        let hook_path = crate::config::theme_hook_path();
+        if hook_path.is_file() {
+            let mut cmd = Command::new("sh");
+            cmd.arg(&hook_path)
+                .env("LILY_THEME_KEY", &d.key)
+                .env("LILY_THEME_NAME", &d.name)
+                .env("LILY_MODE", &d.mode)
+                .env("LILY_FOLDER_COLOR", &folder_color)
+                .env("LILY_ICON_THEME", &icon_theme)
+                .env("LILY_BG_MAIN", &d.bg_main)
+                .env("LILY_BG_PILL", &d.bg_pill)
+                .env("LILY_BG_RECESSED", &d.bg_recessed)
+                .env("LILY_BG_CONTRAST", &d.bg_contrast)
+                .env("LILY_FG_MAIN", &d.fg_main)
+                .env("LILY_FG_MUTED", &d.fg_muted)
+                .env("LILY_FG_ON_CONTRAST", &d.fg_on_contrast)
+                .env("LILY_ACCENT", &d.accent)
+                .env("LILY_SELECTION", &d.selection)
+                .env("LILY_MAGENTA", &d.magenta)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            for i in 0..16 {
+                cmd.env(format!("LILY_COLOR{}", i), tc(i));
+            }
+            let _ = cmd.spawn();
+        }
+    }
+
+    if targets.papirus_folders {
+        format!("Applied '{}' globally (folders: {})!", d.name, folder_color)
+    } else {
+        format!("Applied '{}' globally!", d.name)
+    }
 }

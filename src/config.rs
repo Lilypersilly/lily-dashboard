@@ -423,6 +423,48 @@ impl Default for BindingsConfig {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
+pub struct ThemeTargetsConfig {
+    /// Hyprland (`marshmellow.lua` + `lily-colors.conf` + reload)
+    pub hyprland: bool,
+    /// GTK 3/4 `gtk.css`, `settings.ini`, `gsettings`, and XDG desktop portal color-scheme
+    pub gtk: bool,
+    /// Qt5 (`qt5ct`), Qt6 (`qt6ct`), `kdeglobals`, `LilyDynamic.colors`, and Dolphin
+    pub qt_dolphin: bool,
+    /// Atomic `~/.local/share/icons/Lily-Papirus-{Dark,Light}` folder icon color overlay
+    pub papirus_folders: bool,
+    /// Kitty, Alacritty, Foot, and Ghostty (only written when `~/.config/<term>` exists)
+    pub terminals: bool,
+    /// Yazi terminal file manager (`~/.config/yazi/lily-theme.toml`)
+    pub yazi: bool,
+    /// Wofi, Rofi (`lily-theme.rasi`), and Fuzzel (`lily-theme.ini`)
+    pub launchers: bool,
+    /// SwayNC, SwayOSD, Mako (`lily-theme`), and Dunst (`dunstrc.d/99-lily-theme.conf`)
+    pub notifications: bool,
+    /// Desktop/TUI apps: Vesktop (Vencord) and btop
+    pub apps: bool,
+    /// Optional user script `~/.config/lily-dashboard/theme-hook.sh` with `LILY_*` env vars
+    pub hook_script: bool,
+}
+
+impl Default for ThemeTargetsConfig {
+    fn default() -> Self {
+        Self {
+            hyprland: true,
+            gtk: true,
+            qt_dolphin: true,
+            papirus_folders: true,
+            terminals: true,
+            yazi: true,
+            launchers: true,
+            notifications: true,
+            apps: true,
+            hook_script: true,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct AppConfig {
     /// "auto" (read `paths.theme_conf_file`, fall back to marshmellow-dark), a built-in preset key, or "custom"
     pub theme_preset: String,
@@ -443,6 +485,7 @@ pub struct AppConfig {
     pub paths: PathsConfig,
     pub hyprland: HyprlandConfig,
     pub bindings: BindingsConfig,
+    pub theme_targets: ThemeTargetsConfig,
 }
 
 impl Default for AppConfig {
@@ -461,6 +504,7 @@ impl Default for AppConfig {
             paths: PathsConfig::default(),
             hyprland: HyprlandConfig::default(),
             bindings: BindingsConfig::default(),
+            theme_targets: ThemeTargetsConfig::default(),
         }
     }
 }
@@ -472,6 +516,14 @@ pub fn config_path() -> PathBuf {
     path.push("lily-dashboard");
     let _ = fs::create_dir_all(&path);
     path.push("config.json");
+    path
+}
+
+pub fn theme_hook_path() -> PathBuf {
+    let mut path = glib::user_config_dir();
+    path.push("lily-dashboard");
+    let _ = fs::create_dir_all(&path);
+    path.push("theme-hook.sh");
     path
 }
 

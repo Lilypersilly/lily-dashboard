@@ -3771,7 +3771,7 @@ fn render_themes_page(
     };
 
     // ==========================================
-    // 1. COLLAPSIBLE 6-COLOR THEME EDITOR
+    // 1. COLLAPSIBLE 6-COLOR THEME EDITOR & GLOBAL TARGETS
     // ==========================================
     let editor_top_row = Box::builder()
         .orientation(Orientation::Horizontal)
@@ -3779,9 +3779,14 @@ fn render_themes_page(
         .build();
 
     let editor_toggle_btn = Button::builder()
-        .label("+ 6-Color Theme Editor")
+        .label("+ 6-Color Editor")
         .css_classes(vec!["fav-item-btn".to_string()])
         .hexpand(true)
+        .build();
+    let targets_toggle_btn = Button::builder()
+        .label("Targets")
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .tooltip_text("Configure which desktop apps & configs 'Global' updates")
         .build();
     let open_dir_btn = Button::builder()
         .label("Themes Dir")
@@ -3793,8 +3798,201 @@ fn render_themes_page(
         let _ = Command::new("xdg-open").arg(&dir).spawn();
     });
     editor_top_row.append(&editor_toggle_btn);
+    editor_top_row.append(&targets_toggle_btn);
     editor_top_row.append(&open_dir_btn);
     container.append(&editor_top_row);
+
+    // Collapsible Global Targets card
+    let targets_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .visible(false)
+        .css_classes(vec!["sys-card".to_string()])
+        .build();
+
+    let tgt_hint = Label::builder()
+        .label("Choose which desktop categories 'Global' updates. Apps without an existing ~/.config/<app> folder are skipped automatically (zero clutter).")
+        .halign(Align::Start)
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .build();
+    targets_card.append(&tgt_hint);
+
+    let targets_flow = gtk4::FlowBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .column_spacing(6)
+        .row_spacing(6)
+        .max_children_per_line(2)
+        .min_children_per_line(2)
+        .homogeneous(true)
+        .build();
+
+    let init_t = cur_cfg.theme_targets.clone();
+    let make_target_chip = |label: &str, tooltip: &str, initial: bool, key: &'static str| -> Button {
+        let mut cls = vec!["fav-item-btn".to_string()];
+        if initial {
+            cls.push("pinned".to_string());
+        }
+        let b = Button::builder()
+            .label(if initial {
+                format!("✓ {}", label)
+            } else {
+                format!("  {}", label)
+            })
+            .tooltip_text(tooltip)
+            .css_classes(cls)
+            .hexpand(true)
+            .build();
+        let lbl_str = label.to_string();
+        b.connect_clicked(move |btn| {
+            let mut next_val = true;
+            crate::config::update(|c| {
+                let slot = match key {
+                    "hyprland" => &mut c.theme_targets.hyprland,
+                    "gtk" => &mut c.theme_targets.gtk,
+                    "qt_dolphin" => &mut c.theme_targets.qt_dolphin,
+                    "papirus_folders" => &mut c.theme_targets.papirus_folders,
+                    "terminals" => &mut c.theme_targets.terminals,
+                    "yazi" => &mut c.theme_targets.yazi,
+                    "launchers" => &mut c.theme_targets.launchers,
+                    "notifications" => &mut c.theme_targets.notifications,
+                    "apps" => &mut c.theme_targets.apps,
+                    "hook_script" => &mut c.theme_targets.hook_script,
+                    _ => return,
+                };
+                *slot = !*slot;
+                next_val = *slot;
+            });
+            if next_val {
+                btn.add_css_class("pinned");
+                btn.set_label(&format!("✓ {}", lbl_str));
+            } else {
+                btn.remove_css_class("pinned");
+                btn.set_label(&format!("  {}", lbl_str));
+            }
+        });
+        b
+    };
+
+    for chip in [
+        make_target_chip(
+            "Hyprland",
+            "Writes marshmellow.lua + lily-colors.conf and reloads Hyprland",
+            init_t.hyprland,
+            "hyprland",
+        ),
+        make_target_chip(
+            "GTK 3/4 & Portal",
+            "Updates GTK3/4 gtk.css, settings.ini, gsettings, and XDG portal color-scheme",
+            init_t.gtk,
+            "gtk",
+        ),
+        make_target_chip(
+            "Qt 5/6 & Dolphin",
+            "Updates qt5ct, qt6ct, kdeglobals, LilyDynamic.colors, and Dolphin",
+            init_t.qt_dolphin,
+            "qt_dolphin",
+        ),
+        make_target_chip(
+            "Papirus Folders",
+            "Builds atomic ~/.local/share/icons/Lily-Papirus-{Dark,Light} folder overlay",
+            init_t.papirus_folders,
+            "papirus_folders",
+        ),
+        make_target_chip(
+            "Terminals",
+            "Kitty (active-theme.conf), Alacritty (lily-theme.toml), Foot (lily-theme.ini), Ghostty (themes/lily-dynamic)",
+            init_t.terminals,
+            "terminals",
+        ),
+        make_target_chip(
+            "Yazi",
+            "Yazi file manager (~/.config/yazi/lily-theme.toml)",
+            init_t.yazi,
+            "yazi",
+        ),
+        make_target_chip(
+            "Launchers",
+            "Wofi (style.css), Rofi (lily-theme.rasi), Fuzzel (lily-theme.ini)",
+            init_t.launchers,
+            "launchers",
+        ),
+        make_target_chip(
+            "Notifications",
+            "SwayNC, SwayOSD, Mako (lily-theme), Dunst (dunstrc.d/99-lily-theme.conf)",
+            init_t.notifications,
+            "notifications",
+        ),
+        make_target_chip(
+            "Vesktop & btop",
+            "Updates Vesktop Marshmellow.theme.css and btop marshmellow.theme",
+            init_t.apps,
+            "apps",
+        ),
+        make_target_chip(
+            "Hook Script",
+            "Runs ~/.config/lily-dashboard/theme-hook.sh with LILY_* palette env vars",
+            init_t.hook_script,
+            "hook_script",
+        ),
+    ] {
+        targets_flow.insert(&chip, -1);
+    }
+    targets_card.append(&targets_flow);
+
+    let edit_hook_btn = Button::builder()
+        .label("Create / Edit theme-hook.sh")
+        .tooltip_text("Open ~/.config/lily-dashboard/theme-hook.sh (creates a documented starter script if missing)")
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .hexpand(true)
+        .build();
+    edit_hook_btn.connect_clicked(|_| {
+        let hook = crate::config::theme_hook_path();
+        if !hook.exists() {
+            let starter = r#"#!/usr/bin/env sh
+# Lily Dashboard — Custom Global Theme Hook
+# Executed automatically at the end of 'Global' theme switches when 'Hook Script' is enabled.
+#
+# Available environment variables (hex values without '#', except mode/names):
+#   LILY_THEME_KEY, LILY_THEME_NAME, LILY_MODE ("dark" or "light")
+#   LILY_FOLDER_COLOR, LILY_ICON_THEME
+#   LILY_BG_MAIN, LILY_BG_PILL, LILY_BG_RECESSED, LILY_BG_CONTRAST
+#   LILY_FG_MAIN, LILY_FG_MUTED, LILY_FG_ON_CONTRAST
+#   LILY_ACCENT, LILY_SELECTION, LILY_MAGENTA
+#   LILY_COLOR0 .. LILY_COLOR15 (16-color terminal ANSI palette)
+#
+# Example:
+#   # pywalfox / waybar / tmux / neovim / openrgbreload commands here
+"#;
+            let _ = fs::write(&hook, starter);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = fs::metadata(&hook) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o755);
+                    let _ = fs::set_permissions(&hook, perms);
+                }
+            }
+        }
+        let _ = Command::new("xdg-open").arg(&hook).spawn();
+    });
+    targets_card.append(&edit_hook_btn);
+    container.append(&targets_card);
+
+    {
+        let tc = targets_card.clone();
+        targets_toggle_btn.connect_clicked(move |b| {
+            let next = !tc.is_visible();
+            tc.set_visible(next);
+            if next {
+                b.add_css_class("pinned");
+            } else {
+                b.remove_css_class("pinned");
+            }
+        });
+    }
 
     let editor_card = Box::builder()
         .orientation(Orientation::Vertical)
@@ -4491,9 +4689,9 @@ fn render_themes_page(
                 rev();
             }
             b.set_label(if next {
-                "− Hide Theme Editor"
+                "− Hide Editor"
             } else {
-                "+ 6-Color Theme Editor"
+                "+ 6-Color Editor"
             });
         });
     }
