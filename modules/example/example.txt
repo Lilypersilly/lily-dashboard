@@ -1,0 +1,18 @@
+MODULE: example.rs (@dash-id: example)
+
+1. SUMMARY
+   Minimal starter example module showing a click counter, a themed text entry,
+   and a "Close Dashboard" button.
+
+2. IMPORTS & DASHPENDENCIES
+   - Dashpendencies (external crates): None
+   - Standard / core imports:
+     - `gtk4` (`Align`, `Box`, `Button`, `Entry`, `Label`, `Orientation`): UI widgets
+     - `std::cell::Cell`, `std::rc::Rc`: In-memory click counter state
+     - `crate::module_api::{ModuleContext, ModuleHandle}`: Dashboard module API
+
+3. FILESYSTEM ACCESS
+   None (all state lives strictly in RAM).
+
+4. SHELL COMMANDS & NETWORK ACCESS
+   None (spawns zero external processes and makes zero network requests).
