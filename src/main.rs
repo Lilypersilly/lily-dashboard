@@ -784,6 +784,23 @@ fn move_to_monitor(window: &ApplicationWindow, target: Option<&str>) {
         }
     }
 }
+/// Recursively pops down every visible `gtk4::Popover` in the widget tree (custom right-click
+/// menus, power/weather/tray popovers, and GTK4's built-in Entry/TextView context menus) so
+/// closing the drawer or unloading a stateless tab never leaves an orphaned Wayland popup grab.
+fn popdown_all_popovers(widget: &gtk4::Widget) {
+    if let Ok(pop) = widget.clone().downcast::<gtk4::Popover>() {
+        if pop.is_visible() {
+            pop.popdown();
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        let next = c.next_sibling();
+        popdown_all_popovers(&c);
+        child = next;
+    }
+}
+
 fn build_ui(
     app: &Application,
     media_handle: media_popout::MediaPopoutHandle,
@@ -1833,6 +1850,7 @@ fn build_ui(
                     }
                     if desc.lifecycle == module_api::ModuleLifecycle::Stateless {
                         if let Some(slot) = slots_sync.get(desc.id) {
+                            popdown_all_popovers(slot.upcast_ref());
                             while let Some(child) = slot.first_child() {
                                 slot.remove(&child);
                             }
@@ -2133,6 +2151,11 @@ fn build_ui(
             hovered_click.set(false);
             media_for_toggle.set_dashboard_open(false);
             stickies_for_toggle.set_dashboard_open(false);
+
+            // Cleanly dismiss every open Popover (right-click menus, Entry context menus, etc.)
+            // BEFORE shrinking the layer-shell input region so GTK4 never keeps an orphaned
+            // Wayland popup pointer grab that breaks clicking.
+            popdown_all_popovers(window_clone.upcast_ref());
 
             for h in handles_toggle.borrow().values() {
                 if let Some(ref dp) = h.detail_pane {
