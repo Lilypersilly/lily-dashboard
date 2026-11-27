@@ -905,7 +905,6 @@ fn build_ui(
             let cfg = config::get();
             let active_name = stk.visible_child_name().map(|s| s.to_string());
             let compiled = modules_gen::all_modules();
-            let mut shown_ids = std::collections::HashSet::new();
 
             for item in &cfg.layout.sidebar_items {
                 if item == "---" {
@@ -916,7 +915,6 @@ fn build_ui(
                         .build();
                     snav.append(&sep);
                 } else if let Some(desc) = compiled.iter().find(|m| m.id == item.as_str()) {
-                    shown_ids.insert(desc.id);
                     let lbl = Label::builder()
                         .label(desc.title)
                         .halign(gtk4::Align::Start)
@@ -938,37 +936,6 @@ fn build_ui(
                     snav.append(&btn);
                     nbtns.borrow_mut().push((desc.id.to_string(), btn));
                 }
-            }
-
-            // Automatically surface newly dropped-in third-party modules in the sidebar
-            for desc in &compiled {
-                if shown_ids.contains(desc.id) {
-                    continue;
-                }
-                let is_known_builtin = config::ALL_TAB_IDS.iter().any(|&(id, _)| id == desc.id);
-                if is_known_builtin {
-                    continue;
-                }
-                let lbl = Label::builder()
-                    .label(desc.title)
-                    .halign(gtk4::Align::Start)
-                    .hexpand(true)
-                    .build();
-                let mut classes = vec!["sidebar-nav-btn".to_string()];
-                if active_name.as_deref() == Some(desc.id) {
-                    classes.push("selected".to_string());
-                }
-                let btn = Button::builder()
-                    .child(&lbl)
-                    .css_classes(classes)
-                    .build();
-                let stack_click = stk.clone();
-                let id_s = desc.id.to_string();
-                btn.connect_clicked(move |_| {
-                    stack_click.set_visible_child_name(&id_s);
-                });
-                snav.append(&btn);
-                nbtns.borrow_mut().push((desc.id.to_string(), btn));
             }
         })
     };
@@ -1250,6 +1217,13 @@ fn build_ui(
             Rc::new(move || {
                 if pe.text().trim() == module_loader::CONFIRM_PHRASE {
                     module_loader::trust_modules(&untrusted);
+                    config::update(|c| {
+                        for um in &untrusted {
+                            if !c.layout.sidebar_items.iter().any(|x| x == &um.id) {
+                                c.layout.sidebar_items.push(um.id.clone());
+                            }
+                        }
+                    });
                     dlg_c.close();
                     sb(all_mods.clone());
                 } else {

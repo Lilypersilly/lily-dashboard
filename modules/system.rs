@@ -82,6 +82,7 @@ pub fn launch_capture(mode: CaptureMode, close_drawer: &Rc<dyn Fn()>) {
 
 /// Wayland color picker: uses built-in `slurp -p` + `grim -t ppm -` + `wl-copy`,
 /// `hyprpicker`, or a custom command from `config.json`.
+#[allow(dead_code)]
 pub fn launch_color_picker(close_drawer: &Rc<dyn Fn()>) {
     launch_color_picker_inner(close_drawer, None);
 }
@@ -5975,22 +5976,14 @@ fn render_settings_page(
         let c_box = container.clone();
         let rel_t = reload_theme.clone();
         let app_t = apply_tabs.clone();
+        let dyn_tab_opts: Vec<(&'static str, &'static str)> = crate::modules_gen::all_modules()
+            .into_iter()
+            .map(|m| (m.id, m.title))
+            .collect();
         make_choice_group(
             &lay_card,
             "Default Startup Tab",
-            &[
-                ("run", "Run"),
-                ("favs", "Favorites"),
-                ("clipboard", "Clipboard"),
-                ("plans", "Plans"),
-                ("calendar", "Calendar"),
-                ("timers", "Timers"),
-                ("music", "Music"),
-                ("drive", "Drive"),
-                ("passwords", "Passwords"),
-                ("locker", "Locker"),
-                ("system", "System"),
-            ],
+            &dyn_tab_opts,
             &cfg.layout.default_tab,
             Rc::new(move |val| {
                 crate::config::update(|c| c.layout.default_tab = val);
@@ -6145,18 +6138,15 @@ fn render_settings_page(
             .css_classes(vec!["plan-subnote".to_string()])
             .build(),
     );
-    let unloaded_scroll = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(190)
-        .max_content_height(190)
-        .build();
     let unloaded_list = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(3)
         .build();
+    let compiled_mods = crate::modules_gen::all_modules();
     let mut unloaded_count = 0usize;
-    for &(tab_id, title) in crate::config::ALL_TAB_IDS {
+    for m in &compiled_mods {
+        let tab_id = m.id;
+        let title = m.title;
         if !cfg.layout.sidebar_items.iter().any(|x| x == tab_id) {
             unloaded_count += 1;
             let row_btn = Button::builder()
@@ -6205,8 +6195,7 @@ fn render_settings_page(
                 .build(),
         );
     }
-    unloaded_scroll.set_child(Some(&unloaded_list));
-    left_col.append(&unloaded_scroll);
+    left_col.append(&unloaded_list);
 
     // RIGHT COLUMN: LOADED TABS & SEPARATORS (DRAG & DROP REORDER)
     let right_col = Box::builder()
@@ -6220,12 +6209,6 @@ fn render_settings_page(
             .css_classes(vec!["plan-subnote".to_string()])
             .build(),
     );
-    let loaded_scroll = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .min_content_height(190)
-        .max_content_height(190)
-        .build();
     let loaded_list = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(3)
@@ -6279,11 +6262,10 @@ fn render_settings_page(
             });
             row.append(&del_b);
         } else {
-            let title = crate::config::ALL_TAB_IDS
-                .iter()
-                .find(|(id, _)| *id == item.as_str())
-                .map(|(_, t)| *t)
-                .unwrap_or(item.as_str());
+            let Some(m_desc) = compiled_mods.iter().find(|m| m.id == item.as_str()) else {
+                continue;
+            };
+            let title = m_desc.title;
             row.append(
                 &Label::builder()
                     .label(title)
@@ -6375,8 +6357,7 @@ fn render_settings_page(
 
         loaded_list.append(&row);
     }
-    loaded_scroll.set_child(Some(&loaded_list));
-    right_col.append(&loaded_scroll);
+    right_col.append(&loaded_list);
 
     two_col.append(&left_col);
     two_col.append(&right_col);
@@ -6386,7 +6367,7 @@ fn render_settings_page(
         container,
         "sidebar_tabs",
         "SIDEBAR TABS",
-        &format!("{}/{}", loaded_tab_count, crate::config::ALL_TAB_IDS.len()),
+        &format!("{}/{}", loaded_tab_count, compiled_mods.len()),
         &tabs_ed_card,
     );
 
