@@ -1284,8 +1284,9 @@ fn build_ui(
         vbox.append(
             &Label::builder()
                 .label(&format!(
-                    "To continue, write:  {}  and press Enter:",
-                    module_loader::CONFIRM_PHRASE
+                    "To continue, write:  {}  and press Enter.\n(Or write \"{}\" to disable this warning permanently.)",
+                    module_loader::CONFIRM_PHRASE,
+                    module_loader::CONFIRM_PHRASE_PERMANENT
                 ))
                 .halign(gtk4::Align::Start)
                 .wrap(true)
@@ -1332,8 +1333,14 @@ fn build_ui(
             let all_mods = scan.modules.clone();
             let sb = start_build.clone();
             Rc::new(move || {
-                if pe.text().trim() == module_loader::CONFIRM_PHRASE {
-                    module_loader::trust_modules(&untrusted);
+                let typed = pe.text().trim().to_string();
+                let perm = typed == module_loader::CONFIRM_PHRASE_PERMANENT;
+                if perm || typed == module_loader::CONFIRM_PHRASE {
+                    if perm {
+                        module_loader::trust_all_permanently();
+                    } else {
+                        module_loader::trust_modules(&untrusted);
+                    }
                     config::update(|c| {
                         for um in &untrusted {
                             if !c.layout.sidebar_items.iter().any(|x| x == &um.id) {

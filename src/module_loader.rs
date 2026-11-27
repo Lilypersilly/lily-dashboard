@@ -17,6 +17,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const CONFIRM_PHRASE: &str = "I am not an idiot.";
+pub const CONFIRM_PHRASE_PERMANENT: &str = "I am not an idiot. I am smart!";
+const TRUST_ALL_KEY: &str = "__trust_all__";
 const DEP_START: &str = "# --- BEGIN MODULE DEPENDENCIES (managed by lily-dashboard) ---";
 const DEP_END: &str = "# --- END MODULE DEPENDENCIES ---";
 
@@ -91,6 +93,14 @@ pub fn trust_modules(mods: &[ScannedModule]) {
     for m in mods {
         map.insert(m.file_name.clone(), m.sha256.clone());
     }
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        let _ = fs::write(trusted_file_path(), json);
+    }
+}
+
+pub fn trust_all_permanently() {
+    let mut map = load_trusted_hashes();
+    map.insert(TRUST_ALL_KEY.to_string(), "true".to_string());
     if let Ok(json) = serde_json::to_string_pretty(&map) {
         let _ = fs::write(trusted_file_path(), json);
     }
@@ -198,6 +208,10 @@ fn parse_dashpendencies_line(raw: &str) -> Vec<(String, String)> {
 pub fn scan_modules(repo_path: &Path) -> ModuleScanResult {
     let mod_dir = repo_path.join("modules");
     let trusted_map = load_trusted_hashes();
+    let trust_all = trusted_map
+        .get(TRUST_ALL_KEY)
+        .map(|v| v == "true")
+        .unwrap_or(false);
     let mut modules = Vec::new();
 
     if let Ok(rd) = fs::read_dir(&mod_dir) {
@@ -277,7 +291,7 @@ pub fn scan_modules(repo_path: &Path) -> ModuleScanResult {
                 .get(&file_name)
                 .map(|h| h == &sha256)
                 .unwrap_or(false);
-            let is_trusted = is_official || is_user_trusted;
+            let is_trusted = trust_all || is_official || is_user_trusted;
 
             modules.push(ScannedModule {
                 file_name,
