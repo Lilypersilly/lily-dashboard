@@ -2094,7 +2094,10 @@ fn build_ui(
             media_for_toggle.set_dashboard_open(true);
             stickies_for_toggle.set_dashboard_open(true);
 
-            window_clone.set_keyboard_mode(KeyboardMode::OnDemand);
+            // Use Exclusive keyboard interactivity while open so pressing SUPER immediately
+            // steals and holds keyboard focus even when the cursor is over another window
+            // (Hyprland follow_mouse won't steal it back). Closing resets to None.
+            window_clone.set_keyboard_mode(KeyboardMode::Exclusive);
             // Pass the exact width of the dashboard to the hitbox
             update_input_region(&window_clone, true, dash_box_btn.width());
             window_clone.present();
@@ -2109,6 +2112,21 @@ fn build_ui(
                     }
                 }
             }
+
+            let open_kb = open_click.clone();
+            let stk_kb = stack_for_open.clone();
+            let handles_kb = handles_toggle.clone();
+            glib::timeout_add_local_once(Duration::from_millis(80), move || {
+                if open_kb.get() {
+                    if let Some(cur) = stk_kb.visible_child_name() {
+                        if let Some(h) = handles_kb.borrow().get(cur.as_str()) {
+                            if let Some(ref show_cb) = h.on_show {
+                                show_cb();
+                            }
+                        }
+                    }
+                }
+            });
         } else {
             open_click.set(false);
             closing_click.set(true);
@@ -2143,6 +2161,7 @@ fn build_ui(
     });
 
     let key_controller = EventControllerKey::new();
+    key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let btn_esc = trigger_btn.clone();
     let open_esc = is_open.clone();
     let stack_kbd = stack.clone();

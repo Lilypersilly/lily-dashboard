@@ -1328,7 +1328,7 @@ nav[class*="guilds_"] {{
     if dolphin_was_open {
         let _ = Command::new("dolphin").spawn();
     }
-    let _ = Command::new("hyprctl").arg("reload").spawn();
+    crate::config::hypr_reload_preserving_overrides();
     let _ = Command::new("pkill").args(["-USR1", "-x", "kitty"]).spawn();
     let _ = Command::new("swaync-client").arg("-rs").spawn();
     let _ = Command::new("sh")

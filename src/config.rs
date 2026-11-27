@@ -331,6 +331,7 @@ pub struct LayoutConfig {
     pub chrome: ChromeToggles,
 }
 
+#[allow(dead_code)]
 pub const ALL_TAB_IDS: &[(&str, &str)] = &[
     ("run", "Run"),
     ("favs", "Favorites"),
@@ -1028,6 +1029,18 @@ pub fn hypr_rounding_px(cfg: &HyprlandConfig) -> i32 {
 }
 
 /// Applies all saved Hyprland tweaks live in one IPC call (supports both Hyprlua and classic Hyprland).
+/// Runs `hyprctl reload` on a background thread and re-applies any saved live Hyprland
+/// overrides (blur, rounding, gaps, opacity) right after so reloading bindings or themes
+/// never resets your dashboard Hyprland tweaks.
+pub fn hypr_reload_preserving_overrides() {
+    let hypr = get().hyprland;
+    std::thread::spawn(move || {
+        let _ = Command::new("hyprctl").arg("reload").status();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        apply_hyprland_settings(&hypr);
+    });
+}
+
 pub fn apply_hyprland_settings(h: &HyprlandConfig) {
     let mut pairs: Vec<(&str, String)> = Vec::new();
     let r_px = hypr_rounding_px(h);

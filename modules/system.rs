@@ -1704,7 +1704,7 @@ fn append_keybind_to_file(
     content.push('\n');
 
     fs::write(&path, &content).map_err(|e| format!("Write failed: {}", e))?;
-    let _ = Command::new("hyprctl").arg("reload").spawn();
+    crate::config::hypr_reload_preserving_overrides();
 
     let fname = path
         .file_name()
@@ -1730,7 +1730,7 @@ fn delete_keybind_line(line_idx: usize) -> Result<(), String> {
         out.push('\n');
     }
     fs::write(&path, out).map_err(|e| format!("Write failed: {}", e))?;
-    let _ = Command::new("hyprctl").arg("reload").spawn();
+    crate::config::hypr_reload_preserving_overrides();
     Ok(())
 }
 
@@ -4573,7 +4573,7 @@ fn render_displays_page(
         .build();
     let ref_h = refresh_cb.clone();
     reload_hypr_btn.connect_clicked(move |_| {
-        let _ = Command::new("hyprctl").arg("reload").spawn();
+        crate::config::hypr_reload_preserving_overrides();
         ref_h("displays", false);
     });
     container.append(&reload_hypr_btn);
@@ -5080,7 +5080,7 @@ fn render_overview_page(
         .css_classes(vec!["plan-fmt-btn".to_string()])
         .build();
     hypr_reload_btn.connect_clicked(move |_| {
-        let _ = Command::new("hyprctl").arg("reload").spawn();
+        crate::config::hypr_reload_preserving_overrides();
     });
 
     row2.append(&suspend_btn);
@@ -7313,19 +7313,19 @@ fn render_settings_page(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "lily-dashboard".to_string());
 
-    let cli_targets: &[(&str, &str, &str)] = &[
-        ("Clipboard", "--tab clipboard", "V"),
-        ("Music", "--tab music", "M"),
-        ("Plans", "--tab plans", "P"),
-        ("Calendar", "--tab calendar", "C"),
-        ("Timers", "--tab timers", "T"),
-        ("Passwords", "--tab passwords", "K"),
-        ("Locker", "--tab locker", "L"),
-        ("System", "--tab system", "S"),
-        ("Run Launcher", "--tab run", "R"),
-    ];
-
-    for &(title, flag, default_key) in cli_targets {
+    for m in crate::modules_gen::all_modules() {
+        let title = m.title;
+        let flag = format!("--tab {}", m.id);
+        let default_key: String = match m.id {
+            "clipboard" => "V".to_string(),
+            "passwords" => "K".to_string(),
+            _ => m
+                .title
+                .chars()
+                .find(|c| c.is_ascii_alphanumeric())
+                .map(|c| c.to_ascii_uppercase().to_string())
+                .unwrap_or_else(|| "X".to_string()),
+        };
         let row = Box::builder()
             .orientation(Orientation::Horizontal)
             .spacing(5)
