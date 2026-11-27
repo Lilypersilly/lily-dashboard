@@ -1,3 +1,6 @@
+// @dash-id: plans
+// @dash-title: Plans
+// @dash-lifecycle: stateful
 //! Notes and checklist editor (`Plans` tab + 400px slide-out detail pane).
 //!
 //! Reads and writes plain-text/markdown plan files in `~/Documents/plans` (or
@@ -1359,5 +1362,15 @@ fn toggle_line_in_file(path: &Path, target_line: usize, checked: bool) {
             output.push('\n');
         }
         let _ = fs::write(path, output);
+    }
+}
+
+pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle {
+    let ui = build_plans_ui(ctx.popover_guard.clone(), move |_expand| {});
+    crate::module_api::ModuleHandle {
+        widget: ui.list_view.upcast(),
+        detail_pane: Some(ui.detail_view.upcast()),
+        on_show: None,
+        on_hide: None,
     }
 }

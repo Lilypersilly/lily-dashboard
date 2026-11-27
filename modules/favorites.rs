@@ -1,3 +1,8 @@
+// @dash-id: favs
+// @dash-title: Favorites
+// @dash-lifecycle: visible_only
+// @dash-hooks: visibility
+// Dashpendencies: notify = "6.1"
 //! Frequently-used files and folders tab.
 //!
 //! Watches user directories via `notify`, scores access frequency in RAM (flushing
@@ -636,4 +641,20 @@ fn build_file_row(
 
     row_box.append(&btn);
     row_box
+}
+
+pub fn set_enabled(enabled: bool) {
+    set_scoring_enabled(enabled);
+}
+
+pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle {
+    let ui = std::rc::Rc::new(build_favorites_ui(ctx.popover_guard.clone()));
+    let ui_show = ui.clone();
+    let ui_hide = ui.clone();
+    crate::module_api::ModuleHandle {
+        widget: ui.root.clone().upcast(),
+        detail_pane: None,
+        on_show: Some(std::rc::Rc::new(move || ui_show.set_active(true))),
+        on_hide: Some(std::rc::Rc::new(move || ui_hide.set_active(false))),
+    }
 }

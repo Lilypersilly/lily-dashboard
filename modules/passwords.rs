@@ -1,3 +1,7 @@
+// @dash-id: passwords
+// @dash-title: Passwords
+// @dash-lifecycle: stateless
+// @dash-hooks: init, shutdown
 //! Local password list tab with optional encrypted Locker vault integration.
 //!
 //! Everyday logins live in `~/.config/lily-dashboard/passwords.txt` (`0600`) for
@@ -103,7 +107,7 @@ fn append_locker_entry(service: &str, username: &str, password: &str) -> Result<
         Ok(next)
     })?;
 
-    crate::locker::save_passwords_file(&updated)?;
+    crate::module_api::save_vault_passwords(&updated)?;
     LOCKER_PASSWORDS_RAM.with(|slot| {
         *slot.borrow_mut() = Some(updated);
     });
@@ -127,7 +131,7 @@ fn delete_locker_entry(target_line_idx: usize) -> Result<(), String> {
         Ok(out)
     })?;
 
-    crate::locker::save_passwords_file(&updated)?;
+    crate::module_api::save_vault_passwords(&updated)?;
     LOCKER_PASSWORDS_RAM.with(|slot| {
         *slot.borrow_mut() = Some(updated);
     });
@@ -523,7 +527,7 @@ pub fn build_passwords_ui(
         let stl_l = save_to_locker.clone();
         let open_locker = open_locker_cb.clone();
         load_locker_btn.connect_clicked(move |btn| {
-            match crate::locker::load_or_create_passwords_file() {
+            match crate::module_api::load_or_create_vault_passwords() {
                 Ok(content) => {
                     LOCKER_PASSWORDS_RAM.with(|slot| {
                         *slot.borrow_mut() = Some(content);
@@ -1006,4 +1010,21 @@ fn append_entry_row(
 
     row_box.append(&btn);
     container.append(&row_box);
+}
+
+pub fn init() {
+    crate::module_api::register_ram_wipe_hook(wipe_locker_ram_cache);
+}
+
+pub fn shutdown() {
+    wipe_locker_ram_cache();
+}
+
+pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle {
+    let sw = ctx.switch_tab.clone();
+    let w = build_passwords_ui(
+        ctx.popover_guard.clone(),
+        std::rc::Rc::new(move || sw("locker")),
+    );
+    crate::module_api::ModuleHandle::simple(w)
 }

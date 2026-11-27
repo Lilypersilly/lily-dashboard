@@ -1,3 +1,6 @@
+// @dash-id: system
+// @dash-title: System
+// @dash-lifecycle: stateful
 //! System tab and 400px slide-out detail pane.
 //!
 //! Hosts Sound (`pactl`), Network (`nmcli`), Themes (`theme-switch`), Wallpapers
@@ -7484,5 +7487,20 @@ fn render_settings_page(
                 adj.set_value(v.min((adj.upper() - adj.page_size()).max(0.0)));
             });
         }
+    }
+}
+
+pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle {
+    let ui = std::rc::Rc::new(build_system_ui(
+        ctx.close_drawer.clone(),
+        ctx.reload_theme.clone(),
+        ctx.apply_tabs.clone(),
+    ));
+    let ui_show = ui.clone();
+    crate::module_api::ModuleHandle {
+        widget: ui.list_view.clone().upcast(),
+        detail_pane: Some(ui.detail_view.clone().upcast()),
+        on_show: Some(std::rc::Rc::new(move || ui_show.open_panel())),
+        on_hide: None,
     }
 }

@@ -1,3 +1,7 @@
+// @dash-id: run
+// @dash-title: Run
+// @dash-lifecycle: stateless
+// @dash-hooks: init
 //! Default `Run` application launcher tab.
 //!
 //! Reads installed `.desktop` entries via `gio::AppInfo`, supports instant filtering,
@@ -760,4 +764,22 @@ fn build_app_row(
 
     row_box.append(&btn);
     row_box
+}
+
+pub fn init() {
+    preload_configured_apps();
+}
+
+pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle {
+    let close_cb = ctx.close_drawer.clone();
+    let ui = build_launcher_ui(ctx.popover_guard.clone(), move || close_cb());
+    let entry = ui.search_entry.clone();
+    crate::module_api::ModuleHandle {
+        widget: ui.root.upcast(),
+        detail_pane: None,
+        on_show: Some(std::rc::Rc::new(move || {
+            entry.grab_focus();
+        })),
+        on_hide: None,
+    }
 }

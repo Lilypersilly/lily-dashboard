@@ -1,0 +1,209 @@
+================================================================================
+                    LILY DASHBOARD — MODULE AUTHORING GUIDE
+================================================================================
+
+Lily Dashboard is modular by design: every sidebar tab is a single self-contained
+Rust file inside the `modules/` directory.
+
+When you drop a `.rs` file into `modules/` and press "Reload Dashboard":
+  1. Lily Dashboard hashes every file in `modules/*.rs` (SHA-256).
+  2. Official stock modules are verified automatically against a built-in safe list.
+     Any new or modified third-party module triggers a security confirmation prompt
+     before anything is compiled.
+  3. Any `// Dashpendencies:` comments at the top of the file are merged into
+     `Cargo.toml` automatically.
+  4. `src/modules_gen.rs` is regenerated, `cargo build --release` compiles the new
+     binary, and the dashboard restarts cleanly.
+  5. If a module fails to compile, `Cargo.toml` and `src/modules_gen.rs` are
+     automatically rolled back so your running dashboard never breaks. Check
+     `/tmp/lily-reload.log` for compiler errors.
+
+
+--------------------------------------------------------------------------------
+1. QUICK START (3 STEPS)
+--------------------------------------------------------------------------------
+
+  1. Create a file in `modules/`, e.g. `modules/hello.rs`.
+  2. Add the metadata header comments and `pub fn build(...)` (example below).
+  3. Click "Reload Dashboard" in the sidebar footer, confirm the third-party
+     warning, and your new tab appears automatically in the sidebar!
+
+
+--------------------------------------------------------------------------------
+2. HEADER METADATA COMMENTS (TOP 40 LINES OF YOUR .rs FILE)
+--------------------------------------------------------------------------------
+
+All header lines are optional (sensible defaults are derived from the filename),
+but declaring them explicitly is recommended:
+
+  // @dash-id: hello
+      Unique tab ID (lowercase, no spaces). Used by CLI `--tab <id>`, config,
+      and `ctx.switch_tab("hello")`. Defaults to the filename stem.
+
+  // @dash-title: Hello
+      Label shown in the sidebar navigation button. Defaults to Title Case of
+      the filename.
+
+  // @dash-lifecycle: stateful
+      Controls RAM usage and widget lifetime:
+        - `stateless`    : Built when opened, destroyed when switching away
+                           (0 idle RAM — great for simple tools/lists).
+        - `stateful`     : Built lazily on first visit, kept alive for the
+                           session (use for timers, audio, uploads, state).
+        - `visible_only` : Built lazily, with `on_show` / `on_hide` called
+                           every time you enter or leave the tab.
+
+  // @dash-hooks: init, shutdown, visibility
+      Optional comma-separated lifecycle functions exported by your module:
+        - `init`       -> `pub fn init()`
+                          Called once when Lily Dashboard starts.
+        - `shutdown`   -> `pub fn shutdown()`
+                          Called when Lily Dashboard exits.
+        - `visibility` -> `pub fn set_enabled(enabled: bool)`
+                          Called when the user loads/unloads your tab in
+                          Settings -> Sidebar Tabs.
+
+  // Dashpendencies: rand = "0.8", chrono = { version = "0.4", features = ["serde"] }
+      Extra crates your module needs from crates.io. You can use multiple
+      `// Dashpendencies:` lines. Supported formats:
+        - Full TOML:   `// Dashpendencies: reqwest = "0.12", chrono = "0.4"`
+        - Inline table:`// Dashpendencies: reqwest = { version = "0.12", features = ["blocking"] }`
+        - Shorthand:   `// Dashpendencies: rand 0.8`
+
+      Already included in core (no need to list in Dashpendencies):
+        `gtk4`, `gtk4-layer-shell`, `serde`, `serde_json`, `sha2`
+
+
+--------------------------------------------------------------------------------
+3. MODULE API CONTRACT (`crate::module_api`)
+--------------------------------------------------------------------------------
+
+Every module MUST expose:
+
+  pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle
+
+What `ModuleContext` gives you:
+  - `ctx.popover_guard: Rc<Cell<usize>>`
+        Increment while a Popover is open so the dashboard doesn't auto-close.
+  - `ctx.close_drawer: Rc<dyn Fn()>`
+        Closes the dashboard drawer smoothly (e.g. after launching an app).
+  - `ctx.reload_theme: Rc<dyn Fn()>`
+        Re-applies the live GTK CSS theme immediately.
+  - `ctx.apply_tabs: Rc<dyn Fn()>`
+        Refreshes sidebar tab layout & chrome settings.
+  - `ctx.switch_tab: Rc<dyn Fn(&str)>`
+        Jumps to another tab by ID (e.g. `(ctx.switch_tab)("music")`).
+
+What `ModuleHandle` returns:
+  - `ModuleHandle::simple(widget)`
+        Shortest way to return a single GTK4 widget with no detail pane/hooks.
+  - Or full struct:
+      ModuleHandle {
+          widget: root.upcast(),
+          detail_pane: Some(pane.upcast()), // Optional 400px slide-out pane
+          on_show: Some(Rc::new(|| { ... })), // Called when entering this tab
+          on_hide: Some(Rc::new(|| { ... })), // Called when leaving this tab
+      }
+
+
+--------------------------------------------------------------------------------
+4. REUSING LILY DASHBOARD'S LIVE THEME CSS CLASSES
+--------------------------------------------------------------------------------
+
+Avoid hardcoding hex colors — use these built-in CSS classes so your module
+automatically matches all 17+ Light/Dark themes, custom 6-color themes, button
+styles, corner rounding, and font scaling:
+
+  - `fav-group-header` : Uppercase section header label
+  - `sys-card`         : Rounded surface card container
+  - `fav-item-btn`     : Standard themed button (add `pinned` for highlighted)
+  - `primary-btn`      : Accent-colored primary action button
+  - `plan-h1`          : Large heading label
+  - `plan-h2`          : Medium heading label
+  - `plan-body`        : Standard body text label
+  - `plan-subnote`     : Monospace/muted secondary subtitle label
+  - `plan-close-btn`   : Compact pill button
+  - `plan-line-del-btn`: Compact destructive/remove button
+  - `plan-detail-pane` : 400px slide-out detail pane container
+  - Plain `gtk4::Entry`: Automatically live-themed!
+
+
+--------------------------------------------------------------------------------
+5. COMPLETE MINIMAL EXAMPLE (`modules/hello.rs`)
+--------------------------------------------------------------------------------
+
+```rust
+// @dash-id: hello
+// @dash-title: Hello
+// @dash-lifecycle: stateless
+// Dashpendencies: rand = "0.8"
+
+use gtk4::prelude::*;
+use gtk4::{Align, Box, Button, Label, Orientation};
+
+pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle {
+    let root = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(10)
+        .margin_top(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+    root.append(
+        &Label::builder()
+            .label("HELLO MODULE")
+            .halign(Align::Start)
+            .css_classes(vec!["fav-group-header".to_string()])
+            .build(),
+    );
+
+    let out = Label::builder()
+        .label("Press the button to roll a number!")
+        .halign(Align::Start)
+        .css_classes(vec!["plan-body".to_string()])
+        .build();
+
+    let btn = Button::builder()
+        .label("Roll 1..100")
+        .css_classes(vec!["primary-btn".to_string()])
+        .build();
+
+    let out_c = out.clone();
+    btn.connect_clicked(move |_| {
+        let n: u8 = rand::random::<u8>() % 100 + 1;
+        out_c.set_label(&format!("You rolled: {}", n));
+    });
+
+    let close_btn = Button::builder()
+        .label("Close Dashboard")
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .build();
+    let close_cb = ctx.close_drawer.clone();
+    close_btn.connect_clicked(move |_| close_cb());
+
+    root.append(&out);
+    root.append(&btn);
+    root.append(&close_btn);
+
+    crate::module_api::ModuleHandle::simple(root)
+}
+```
+
+
+--------------------------------------------------------------------------------
+6. TIPS & BEST PRACTICES
+--------------------------------------------------------------------------------
+
+  - Never block the GTK main thread: run shell commands, network calls, or heavy
+    work in `std::thread::spawn` and send results back over `std::sync::mpsc`
+    polled with `glib::timeout_add_local`.
+  - Respect SSD wear: keep ephemeral caches in RAM or `/tmp`, and debounce any
+    config writes to `~/.config/lily-dashboard/`.
+  - Keep it portable: use `glib::home_dir()`, `glib::user_config_dir()`, and
+    `crate::config::bin_exists("tool")` instead of hardcoded usernames/paths.
+  - Debugging: if "Reload Dashboard" shows "Build failed!", open
+    `/tmp/lily-reload.log` to see the exact `rustc` / `cargo` output.
+  - Security: approved third-party module hashes are stored in
+    `~/.config/lily-dashboard/trusted_modules.json`. Editing a trusted module
+    changes its SHA-256 and prompts you to confirm again on next reload.

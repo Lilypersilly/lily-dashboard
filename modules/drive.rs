@@ -1,3 +1,6 @@
+// @dash-id: drive
+// @dash-title: Drive
+// @dash-lifecycle: stateful
 //! Cloud upload tab wrapping `rclone copy`.
 //!
 //! Lets the user pick a file or directory, set a remote path and optional bandwidth
@@ -385,4 +388,8 @@ pub fn build_drive_ui() -> Box {
     });
 
     root
+}
+
+pub fn build(_ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle {
+    crate::module_api::ModuleHandle::simple(build_drive_ui())
 }

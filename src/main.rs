@@ -6,20 +6,12 @@
 //! quick capture/color-picker actions.
 
 mod config;
-mod favorites;
-mod launcher;
-mod passwords;
-mod music;
-mod plans;
+mod module_api;
+mod module_loader;
+mod modules_gen;
 mod session;
-mod drive;
-mod locker;
 mod weather;
-mod timers;
-mod system;
 mod themes;
-mod clipboard;
-mod calendar;
 mod media_popout;
 mod stickies;
 mod tray;
@@ -80,8 +72,11 @@ fn main() {
         *reload_theme_startup.borrow_mut() = Some(reload_cb);
     });
     app.connect_shutdown(|_| {
-        clipboard::shutdown_watchers();
-        passwords::wipe_locker_ram_cache();
+        for m in modules_gen::all_modules() {
+            if let Some(shut) = m.shutdown {
+                shut();
+            }
+        }
     });
 
     // Store the dashboard handle so re-running `lily-dashboard` (or `lily-dashboard --tab clipboard`)
@@ -102,7 +97,11 @@ fn main() {
             }
 
             session::init_session_tracker();
-            clipboard::init_clipboard_watcher();
+            for m in modules_gen::all_modules() {
+                if let Some(init_fn) = m.init {
+                    init_fn();
+                }
+            }
             let media_handle = media_popout::init_media_popout(app);
             let stickies_handle = stickies::init_stickies(app);
 
@@ -518,6 +517,8 @@ fn init_theme() -> Rc<dyn Fn()> {
                 popover.fav-popover > contents {{ background-color: {bg_main_glass}; border: 1px solid {accent1_35}; border-radius: {r_lg}px; padding: 6px; }}
                 tooltip, tooltip.background {{ background-color: #{bg_pill}; color: #{fg_main}; border: 1px solid {accent1_35}; border-radius: {r_sm}px; padding: 4px 8px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25); }}
                 tooltip label {{ color: #{fg_main}; font-size: {fs_13}px; }}
+                window.trust-dialog-win {{ background-color: #{bg_main}; color: #{fg_main}; border: 1.5px solid #{accent1}; border-radius: {r_lg}px; }}
+                .trust-dialog-box {{ background-color: #{bg_main}; padding: 18px; }}
                 .fav-hide-btn {{ background-color: {fg_main_08}; border: none; border-radius: {r_sm}px; padding: 6px 12px; color: #{fg_main}; box-shadow: none; transition: background-color 0.15s ease; }}
                 .fav-hide-btn:hover {{ background-color: {fg_main_15}; }}
                 
@@ -903,6 +904,8 @@ fn build_ui(
 
             let cfg = config::get();
             let active_name = stk.visible_child_name().map(|s| s.to_string());
+            let compiled = modules_gen::all_modules();
+            let mut shown_ids = std::collections::HashSet::new();
 
             for item in &cfg.layout.sidebar_items {
                 if item == "---" {
@@ -912,14 +915,15 @@ fn build_ui(
                         .css_classes(vec!["sidebar-sep".to_string()])
                         .build();
                     snav.append(&sep);
-                } else if let Some(&(_, title)) = config::ALL_TAB_IDS.iter().find(|(id, _)| *id == item.as_str()) {
+                } else if let Some(desc) = compiled.iter().find(|m| m.id == item.as_str()) {
+                    shown_ids.insert(desc.id);
                     let lbl = Label::builder()
-                        .label(title)
+                        .label(desc.title)
                         .halign(gtk4::Align::Start)
                         .hexpand(true)
                         .build();
                     let mut classes = vec!["sidebar-nav-btn".to_string()];
-                    if active_name.as_deref() == Some(item.as_str()) {
+                    if active_name.as_deref() == Some(desc.id) {
                         classes.push("selected".to_string());
                     }
                     let btn = Button::builder()
@@ -927,13 +931,44 @@ fn build_ui(
                         .css_classes(classes)
                         .build();
                     let stack_click = stk.clone();
-                    let id_s = item.clone();
+                    let id_s = desc.id.to_string();
                     btn.connect_clicked(move |_| {
                         stack_click.set_visible_child_name(&id_s);
                     });
                     snav.append(&btn);
-                    nbtns.borrow_mut().push((item.clone(), btn));
+                    nbtns.borrow_mut().push((desc.id.to_string(), btn));
                 }
+            }
+
+            // Automatically surface newly dropped-in third-party modules in the sidebar
+            for desc in &compiled {
+                if shown_ids.contains(desc.id) {
+                    continue;
+                }
+                let is_known_builtin = config::ALL_TAB_IDS.iter().any(|&(id, _)| id == desc.id);
+                if is_known_builtin {
+                    continue;
+                }
+                let lbl = Label::builder()
+                    .label(desc.title)
+                    .halign(gtk4::Align::Start)
+                    .hexpand(true)
+                    .build();
+                let mut classes = vec!["sidebar-nav-btn".to_string()];
+                if active_name.as_deref() == Some(desc.id) {
+                    classes.push("selected".to_string());
+                }
+                let btn = Button::builder()
+                    .child(&lbl)
+                    .css_classes(classes)
+                    .build();
+                let stack_click = stk.clone();
+                let id_s = desc.id.to_string();
+                btn.connect_clicked(move |_| {
+                    stack_click.set_visible_child_name(&id_s);
+                });
+                snav.append(&btn);
+                nbtns.borrow_mut().push((desc.id.to_string(), btn));
             }
         })
     };
@@ -945,10 +980,13 @@ fn build_ui(
         let pwr_slot = power_rebuild_slot.clone();
         let lay_slot = layout_rebuild_slot.clone();
         Rc::new(move || {
-            let vis = config::get().visible_tabs;
+            let items = config::get().layout.sidebar_items;
             rebuild_nav();
-            favorites::set_scoring_enabled(vis.favorites);
-            clipboard::set_watcher_enabled(vis.clipboard);
+            for m in modules_gen::all_modules() {
+                if let Some(vis_fn) = m.on_visibility {
+                    vis_fn(items.iter().any(|it| it == m.id));
+                }
+            }
             if let Some(rebuild_pwr) = pwr_slot.borrow().as_ref() {
                 rebuild_pwr();
             }
@@ -974,6 +1012,7 @@ fn build_ui(
 
     let app_for_reload = app.clone();
     let lbl_for_reload = reload_lbl.clone();
+    let win_for_reload = window.clone();
     reload_btn.connect_clicked(move |btn| {
         let repo_dir_str = config::get().paths.source_repo_dir;
         let repo_path = config::expand_path(&repo_dir_str);
@@ -992,79 +1031,251 @@ fn build_ui(
             return;
         }
 
-        btn.set_sensitive(false);
-        lbl_for_reload.set_label("Building...");
+        let start_build: Rc<dyn Fn(Vec<module_loader::ScannedModule>)> = {
+            let btn_b = btn.clone();
+            let lbl_b = lbl_for_reload.clone();
+            let app_b = app_for_reload.clone();
+            let repo_b = repo_path.clone();
+            Rc::new(move |scanned_mods: Vec<module_loader::ScannedModule>| {
+                btn_b.set_sensitive(false);
+                lbl_b.set_label("Building...");
 
-        let (tx, rx) = std::sync::mpsc::channel::<Result<std::path::PathBuf, String>>();
+                let (tx, rx) = std::sync::mpsc::channel::<Result<std::path::PathBuf, String>>();
+                let repo_bg = repo_b.clone();
 
-        std::thread::spawn(move || {
-            let run_cargo = |offline: bool| {
-                let mut cmd = std::process::Command::new("cargo");
-                cmd.args(["build", "--release"]);
-                if offline {
-                    cmd.arg("--offline");
-                }
-                cmd.current_dir(&repo_path).output()
+                std::thread::spawn(move || {
+                    let backup = match module_loader::sync_modules_to_repo(&repo_bg, &scanned_mods) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let _ = std::fs::write("/tmp/lily-reload.log", &e);
+                            let _ = tx.send(Err(e));
+                            return;
+                        }
+                    };
+
+                    let run_cargo = |offline: bool| {
+                        let mut cmd = std::process::Command::new("cargo");
+                        cmd.args(["build", "--release"]);
+                        if offline {
+                            cmd.arg("--offline");
+                        }
+                        cmd.current_dir(&repo_bg).output()
+                    };
+
+                    let target_bin = repo_bg.join("target/release/lily-dashboard");
+                    let res = match run_cargo(false) {
+                        Ok(out) if out.status.success() => Ok(target_bin),
+                        first => match run_cargo(true) {
+                            Ok(out) if out.status.success() => Ok(target_bin),
+                            Ok(out) => {
+                                module_loader::restore_backup(&repo_bg, &backup);
+                                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                                let _ = std::fs::write("/tmp/lily-reload.log", &stderr);
+                                let last = stderr
+                                    .lines()
+                                    .rev()
+                                    .find(|l| !l.trim().is_empty())
+                                    .unwrap_or("See /tmp/lily-reload.log")
+                                    .to_string();
+                                Err(last)
+                            }
+                            Err(e) => {
+                                module_loader::restore_backup(&repo_bg, &backup);
+                                let msg = format!("Failed to invoke cargo ({:?}): {}", first.err(), e);
+                                let _ = std::fs::write("/tmp/lily-reload.log", &msg);
+                                Err(msg)
+                            }
+                        },
+                    };
+                    let _ = tx.send(res);
+                });
+
+                let app_quit = app_b.clone();
+                let lbl_status = lbl_b.clone();
+                let btn_status = btn_b.clone();
+
+                glib::timeout_add_local(Duration::from_millis(100), move || {
+                    if let Ok(result) = rx.try_recv() {
+                        match result {
+                            Ok(bin_path) => {
+                                let bin_str = bin_path.to_string_lossy().replace('\'', "'\\''");
+                                let _ = std::process::Command::new("sh")
+                                    .arg("-c")
+                                    .arg(format!("sleep 0.2 && '{}' &", bin_str))
+                                    .spawn();
+                                app_quit.quit();
+                            }
+                            Err(err_line) => {
+                                lbl_status.set_label("Build failed!");
+                                btn_status.set_tooltip_text(Some(&format!(
+                                    "Build failed (log: /tmp/lily-reload.log): {}",
+                                    err_line
+                                )));
+                                btn_status.set_sensitive(true);
+                                let lbl_reset = lbl_status.clone();
+                                glib::timeout_add_local_once(Duration::from_millis(2500), move || {
+                                    lbl_reset.set_label("Reload Dashboard");
+                                });
+                            }
+                        }
+                        return glib::ControlFlow::Break;
+                    }
+                    glib::ControlFlow::Continue
+                });
+            })
+        };
+
+        let scan = module_loader::scan_modules(&repo_path);
+        if scan.untrusted.is_empty() {
+            start_build(scan.modules);
+            return;
+        }
+
+        // Third-party / modified module trust gate!
+        let dlg = gtk4::Window::builder()
+            .title("Third-Party Module Warning")
+            .transient_for(&win_for_reload)
+            .modal(true)
+            .default_width(480)
+            .resizable(false)
+            .css_classes(vec!["trust-dialog-win".to_string()])
+            .build();
+        let vbox = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(10)
+            .css_classes(vec!["trust-dialog-box".to_string()])
+            .build();
+
+        vbox.append(
+            &Label::builder()
+                .label("Warning: You are about to load a third-party module")
+                .halign(gtk4::Align::Start)
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(vec!["plan-h1".to_string()])
+                .build(),
+        );
+        vbox.append(
+            &Label::builder()
+                .label("These are raw Rust code and therefore have access to your entire PC (at compile time and runtime). Only continue if you have read and trust the source code:")
+                .halign(gtk4::Align::Start)
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(vec!["plan-body".to_string()])
+                .build(),
+        );
+
+        let list_card = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(6)
+            .css_classes(vec!["sys-card".to_string()])
+            .build();
+        for um in &scan.untrusted {
+            let deps_txt = if um.dashpendencies.is_empty() {
+                "no extra crates".to_string()
+            } else {
+                um.dashpendencies
+                    .iter()
+                    .map(|(k, v)| format!("{} = {}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             };
+            list_card.append(
+                &Label::builder()
+                    .label(&format!(
+                        "• modules/{}  [{}…]\n  deps: {}",
+                        um.file_name,
+                        &um.sha256[..12.min(um.sha256.len())],
+                        deps_txt
+                    ))
+                    .halign(gtk4::Align::Start)
+                    .wrap(true)
+                    .xalign(0.0)
+                    .css_classes(vec!["plan-subnote".to_string()])
+                    .build(),
+            );
+        }
+        vbox.append(&list_card);
 
-            let target_bin = repo_path.join("target/release/lily-dashboard");
-            let res = match run_cargo(false) {
-                Ok(out) if out.status.success() => Ok(target_bin),
-                first => match run_cargo(true) {
-                    Ok(out) if out.status.success() => Ok(target_bin),
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                        let _ = std::fs::write("/tmp/lily-reload.log", &stderr);
-                        let last = stderr
-                            .lines()
-                            .rev()
-                            .find(|l| !l.trim().is_empty())
-                            .unwrap_or("See /tmp/lily-reload.log")
-                            .to_string();
-                        Err(last)
-                    }
-                    Err(e) => {
-                        let msg = format!("Failed to invoke cargo ({:?}): {}", first.err(), e);
-                        let _ = std::fs::write("/tmp/lily-reload.log", &msg);
-                        Err(msg)
-                    }
-                },
-            };
-            let _ = tx.send(res);
-        });
+        vbox.append(
+            &Label::builder()
+                .label(&format!(
+                    "To continue, write:  {}  and press Enter:",
+                    module_loader::CONFIRM_PHRASE
+                ))
+                .halign(gtk4::Align::Start)
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(vec!["plan-body".to_string()])
+                .build(),
+        );
 
-        let app_quit = app_for_reload.clone();
-        let lbl_status = lbl_for_reload.clone();
-        let btn_status = btn.clone();
+        let phrase_entry = gtk4::Entry::builder()
+            .placeholder_text(module_loader::CONFIRM_PHRASE)
+            .hexpand(true)
+            .build();
+        let err_lbl = Label::builder()
+            .label("")
+            .halign(gtk4::Align::Start)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .visible(false)
+            .build();
+        vbox.append(&phrase_entry);
+        vbox.append(&err_lbl);
 
-        glib::timeout_add_local(Duration::from_millis(100), move || {
-            if let Ok(result) = rx.try_recv() {
-                match result {
-                    Ok(bin_path) => {
-                        let bin_str = bin_path.to_string_lossy().replace('\'', "'\\''");
-                        let _ = std::process::Command::new("sh")
-                            .arg("-c")
-                            .arg(format!("sleep 0.2 && '{}' &", bin_str))
-                            .spawn();
-                        app_quit.quit();
-                    }
-                    Err(err_line) => {
-                        lbl_status.set_label("Build failed!");
-                        btn_status.set_tooltip_text(Some(&format!(
-                            "Build failed (log: /tmp/lily-reload.log): {}",
-                            err_line
-                        )));
-                        btn_status.set_sensitive(true);
-                        let lbl_reset = lbl_status.clone();
-                        glib::timeout_add_local_once(Duration::from_millis(2500), move || {
-                            lbl_reset.set_label("Reload Dashboard");
-                        });
-                    }
+        let btn_row = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(8)
+            .halign(gtk4::Align::End)
+            .build();
+        let cancel_btn = Button::builder()
+            .label("Cancel")
+            .css_classes(vec!["fav-item-btn".to_string()])
+            .build();
+        let confirm_btn = Button::builder()
+            .label("Trust & Rebuild")
+            .css_classes(vec!["primary-btn".to_string()])
+            .build();
+
+        let dlg_cancel = dlg.clone();
+        cancel_btn.connect_clicked(move |_| dlg_cancel.close());
+
+        let do_confirm: Rc<dyn Fn()> = {
+            let pe = phrase_entry.clone();
+            let el = err_lbl.clone();
+            let dlg_c = dlg.clone();
+            let untrusted = scan.untrusted.clone();
+            let all_mods = scan.modules.clone();
+            let sb = start_build.clone();
+            Rc::new(move || {
+                if pe.text().trim() == module_loader::CONFIRM_PHRASE {
+                    module_loader::trust_modules(&untrusted);
+                    dlg_c.close();
+                    sb(all_mods.clone());
+                } else {
+                    el.set_label(&format!(
+                        "Exact phrase required: {}",
+                        module_loader::CONFIRM_PHRASE
+                    ));
+                    el.set_visible(true);
                 }
-                return glib::ControlFlow::Break;
-            }
-            glib::ControlFlow::Continue
-        });
+            })
+        };
+        {
+            let dc = do_confirm.clone();
+            confirm_btn.connect_clicked(move |_| dc());
+        }
+        {
+            let dc = do_confirm.clone();
+            phrase_entry.connect_activate(move |_| dc());
+        }
+
+        btn_row.append(&cancel_btn);
+        btn_row.append(&confirm_btn);
+        vbox.append(&btn_row);
+        dlg.set_child(Some(&vbox));
+        dlg.present();
+        phrase_entry.grab_focus();
     });
 
     // 3-button Session row: Load | Save | Auto-save toggle (OFF by default to avoid SSD wear)
@@ -1482,16 +1693,6 @@ fn build_ui(
     let is_open = Rc::new(Cell::new(false));
     let is_closing = Rc::new(Cell::new(false));
 
-    let plans_ui = plans::build_plans_ui(popover_guard.clone(), move |_expand| {
-        // We don't need to manually update the hitbox here anymore!
-        // The bulletproof win_tick callback perfectly handles width expansions for us automatically.
-    });
-
-    stack.add_titled(&plans_ui.list_view, Some("plans"), "Plans");
-
-    let favs_ui = favorites::build_favorites_ui(popover_guard.clone());
-    stack.add_titled(&favs_ui.root, Some("favs"), "Favorites");
-
     let trigger_wrapper = Box::builder()
         .css_classes(vec!["trigger-wrapper".to_string()])
         .valign(gtk4::Align::Center)
@@ -1505,43 +1706,6 @@ fn build_ui(
 
     trigger_wrapper.append(&trigger_btn);
 
-    // Keep background app RAM-preloading on startup without building Run UI widgets until opened
-    launcher::preload_configured_apps();
-
-    let make_lazy_slot = || {
-        Box::builder()
-            .orientation(Orientation::Vertical)
-            .hexpand(true)
-            .vexpand(true)
-            .build()
-    };
-
-    let run_slot = make_lazy_slot();
-    stack.add_titled(&run_slot, Some("run"), "Run");
-
-    let passwords_slot = make_lazy_slot();
-    stack.add_titled(&passwords_slot, Some("passwords"), "Passwords");
-
-    let drive_slot = make_lazy_slot();
-    stack.add_titled(&drive_slot, Some("drive"), "Drive");
-
-    let locker_slot = make_lazy_slot();
-    stack.add_titled(&locker_slot, Some("locker"), "Locker");
-
-    let music_slot = make_lazy_slot();
-    let timers_slot = make_lazy_slot();
-    let calendar_slot = make_lazy_slot();
-    let clipboard_slot = make_lazy_slot();
-    let system_slot = make_lazy_slot();
-
-    let run_search_slot: Rc<RefCell<Option<gtk4::SearchEntry>>> = Rc::new(RefCell::new(None));
-    let system_ui_slot: Rc<RefCell<Option<system::SystemUi>>> = Rc::new(RefCell::new(None));
-
-    let detail_tab = plans_ui.detail_view.clone();
-    let dash_for_sys = dash_box.clone();
-    let guard_lazy = popover_guard.clone();
-    let btn_on_launch = trigger_btn.clone();
-    let open_on_launch = is_open.clone();
     let close_drawer_cb: Rc<dyn Fn()> = {
         let btn_c = trigger_btn.clone();
         let open_c = is_open.clone();
@@ -1578,12 +1742,12 @@ fn build_ui(
             .build();
         let close_cap_l = close_drawer_cb.clone();
         cap_btn.connect_clicked(move |_| {
-            system::launch_capture(system::CaptureMode::RegionEditor, &close_cap_l);
+            module_api::launch_capture(module_api::CaptureMode::RegionEditor, &close_cap_l);
         });
         let cap_rc = GestureClick::builder().button(3).build();
         let close_cap_r = close_drawer_cb.clone();
         cap_rc.connect_pressed(move |_, _, _, _| {
-            system::launch_capture(system::CaptureMode::Monitor, &close_cap_r);
+            module_api::launch_capture(module_api::CaptureMode::Monitor, &close_cap_r);
         });
         cap_btn.add_controller(cap_rc);
 
@@ -1594,7 +1758,7 @@ fn build_ui(
             .build();
         let close_pick = close_drawer_cb.clone();
         picker_btn.connect_clicked(move |_| {
-            system::launch_color_picker(&close_pick);
+            module_api::launch_color_picker(&close_pick);
         });
 
         top_tools.append(&sticky_btn);
@@ -1603,22 +1767,68 @@ fn build_ui(
         workspaces_widget.append(&top_tools);
     }
 
-    let close_for_sys = close_drawer_cb.clone();
-    let reload_theme_for_sys = reload_theme.clone();
-    let apply_tabs_for_sys = apply_tab_visibility.clone();
-    let run_slot_c = run_slot.clone();
-    let passwords_slot_c = passwords_slot.clone();
-    let drive_slot_c = drive_slot.clone();
-    let locker_slot_c = locker_slot.clone();
-    let music_slot_c = music_slot.clone();
-    let timers_slot_c = timers_slot.clone();
-    let calendar_slot_c = calendar_slot.clone();
-    let clipboard_slot_c = clipboard_slot.clone();
-    let system_slot_c = system_slot.clone();
-    let run_search_c = run_search_slot.clone();
-    let system_ui_c = system_ui_slot.clone();
+    // ==========================================
+    // DYNAMIC MODULAR TAB REGISTRY (`modules/*.rs`)
+    // ==========================================
+    let compiled_modules = modules_gen::all_modules();
+    let module_slots: Rc<std::collections::HashMap<String, Box>> = {
+        let mut map = std::collections::HashMap::new();
+        for desc in &compiled_modules {
+            let slot = Box::builder()
+                .orientation(Orientation::Vertical)
+                .hexpand(true)
+                .vexpand(true)
+                .build();
+            stack.add_titled(&slot, Some(desc.id), desc.title);
+            map.insert(desc.id.to_string(), slot);
+        }
+        if compiled_modules.is_empty() {
+            let empty_box = Box::builder()
+                .orientation(Orientation::Vertical)
+                .spacing(8)
+                .valign(gtk4::Align::Center)
+                .margin_start(16)
+                .margin_end(16)
+                .build();
+            empty_box.append(
+                &Label::builder()
+                    .label("No modules installed")
+                    .css_classes(vec!["plan-h2".to_string()])
+                    .build(),
+            );
+            empty_box.append(
+                &Label::builder()
+                    .label("Drop `.rs` modules into `modules/` and click Reload Dashboard.")
+                    .wrap(true)
+                    .css_classes(vec!["plan-subnote".to_string()])
+                    .build(),
+            );
+            stack.add_titled(&empty_box, Some("empty"), "Empty");
+        }
+        Rc::new(map)
+    };
 
+    let loaded_handles: Rc<RefCell<std::collections::HashMap<String, module_api::ModuleHandle>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
+    let module_ctx = module_api::ModuleContext {
+        popover_guard: popover_guard.clone(),
+        close_drawer: close_drawer_cb.clone(),
+        reload_theme: reload_theme.clone(),
+        apply_tabs: apply_tab_visibility.clone(),
+        switch_tab: {
+            let stk_sw = stack.clone();
+            Rc::new(move |id: &str| {
+                stk_sw.set_visible_child_name(id);
+            })
+        },
+    };
+
+    let dash_for_mods = dash_box.clone();
     let nav_buttons_sync = nav_buttons_rc.clone();
+    let slots_sync = module_slots.clone();
+    let handles_sync = loaded_handles.clone();
+    let ctx_sync = module_ctx.clone();
+    let mods_sync = compiled_modules.clone();
 
     stack.connect_visible_child_name_notify(move |stk| {
         let current = stk.visible_child_name();
@@ -1632,129 +1842,70 @@ fn build_ui(
             }
         }
 
-        if name != Some("plans") {
-            detail_tab.set_visible(false);
-        }
-        if name != Some("system") {
-            if let Some(sys) = system_ui_c.borrow().as_ref() {
-                sys.detail_view.set_visible(false);
-            }
-        }
-
-        // Only keep Favorites row widgets built while Favorites is the active tab
-        favs_ui.set_active(name == Some("favs"));
-
-        // Unload stateless tabs when switching away so unused modules don't sit in RAM
-        if name != Some("run") {
-            *run_search_c.borrow_mut() = None;
-            while let Some(child) = run_slot_c.first_child() {
-                run_slot_c.remove(&child);
-            }
-        }
-        if name != Some("passwords") {
-            while let Some(child) = passwords_slot_c.first_child() {
-                passwords_slot_c.remove(&child);
-            }
-        }
-        if name != Some("clipboard") {
-            while let Some(child) = clipboard_slot_c.first_child() {
-                clipboard_slot_c.remove(&child);
-            }
-        }
-        if name != Some("calendar") {
-            while let Some(child) = calendar_slot_c.first_child() {
-                calendar_slot_c.remove(&child);
-            }
-        }
-
-        match name {
-            Some("run") => {
-                if run_slot_c.first_child().is_none() {
-                    let btn_l = btn_on_launch.clone();
-                    let open_l = open_on_launch.clone();
-                    let launcher_ui = launcher::build_launcher_ui(guard_lazy.clone(), move || {
-                        if open_l.get() {
-                            btn_l.emit_clicked();
-                        }
-                    });
-                    run_slot_c.append(&launcher_ui.root);
-                    *run_search_c.borrow_mut() = Some(launcher_ui.search_entry);
+        // Hide inactive detail panes, invoke on_hide, and unload stateless modules
+        {
+            let mut handles = handles_sync.borrow_mut();
+            let mut to_remove = Vec::new();
+            for desc in &mods_sync {
+                if name == Some(desc.id) {
+                    continue;
                 }
-                if let Some(entry) = run_search_c.borrow().as_ref() {
-                    entry.grab_focus();
-                }
-            }
-            Some("passwords") => {
-                if passwords_slot_c.first_child().is_none() {
-                    let stk_for_locker = stk.clone();
-                    let open_locker: Rc<dyn Fn()> = Rc::new(move || {
-                        stk_for_locker.set_visible_child_name("locker");
-                    });
-                    passwords_slot_c.append(&passwords::build_passwords_ui(
-                        guard_lazy.clone(),
-                        open_locker,
-                    ));
-                }
-            }
-            Some("clipboard") => {
-                if clipboard_slot_c.first_child().is_none() {
-                    clipboard_slot_c.append(&clipboard::build_clipboard_ui(guard_lazy.clone()));
-                }
-            }
-            Some("calendar") => {
-                if calendar_slot_c.first_child().is_none() {
-                    calendar_slot_c.append(&calendar::build_calendar_ui());
-                }
-            }
-            // Stateful tabs (active uploads, unlocked vault, playing music, active timers)
-            // are lazy-built on first visit and kept alive once opened.
-            Some("drive") => {
-                if drive_slot_c.first_child().is_none() {
-                    drive_slot_c.append(&drive::build_drive_ui());
-                }
-            }
-            Some("locker") => {
-                if locker_slot_c.first_child().is_none() {
-                    locker_slot_c.append(&locker::build_locker_ui(guard_lazy.clone()));
-                }
-            }
-            Some("music") => {
-                if music_slot_c.first_child().is_none() {
-                    music_slot_c.append(&music::build_music_ui());
-                }
-            }
-            Some("timers") => {
-                if timers_slot_c.first_child().is_none() {
-                    timers_slot_c.append(&timers::build_timers_ui());
-                }
-            }
-            Some("system") => {
-                if system_ui_c.borrow().is_none() {
-                    let sys_ui = system::build_system_ui(
-                        close_for_sys.clone(),
-                        reload_theme_for_sys.clone(),
-                        apply_tabs_for_sys.clone(),
-                    );
-                    system_slot_c.append(&sys_ui.list_view);
-                    if config::get().layout.side == "right" {
-                        dash_for_sys.prepend(&sys_ui.detail_view);
-                    } else {
-                        dash_for_sys.append(&sys_ui.detail_view);
+                if let Some(h) = handles.get(desc.id) {
+                    if let Some(ref dp) = h.detail_pane {
+                        dp.set_visible(false);
                     }
-                    *system_ui_c.borrow_mut() = Some(sys_ui);
-                }
-                if let Some(sys) = system_ui_c.borrow().as_ref() {
-                    sys.open_panel();
+                    if let Some(ref hide_cb) = h.on_hide {
+                        hide_cb();
+                    }
+                    if desc.lifecycle == module_api::ModuleLifecycle::Stateless {
+                        if let Some(slot) = slots_sync.get(desc.id) {
+                            while let Some(child) = slot.first_child() {
+                                slot.remove(&child);
+                            }
+                        }
+                        if let Some(ref dp) = h.detail_pane {
+                            dash_for_mods.remove(dp);
+                        }
+                        to_remove.push(desc.id.to_string());
+                    }
                 }
             }
-            _ => {}
+            for id in to_remove {
+                handles.remove(&id);
+            }
+        }
+
+        // Build active module lazily on demand and invoke on_show
+        if let Some(active_id) = name {
+            if let Some(desc) = mods_sync.iter().find(|m| m.id == active_id) {
+                let needs_build = !handles_sync.borrow().contains_key(active_id);
+                if needs_build {
+                    let handle = (desc.build)(&ctx_sync);
+                    if let Some(slot) = slots_sync.get(active_id) {
+                        slot.append(&handle.widget);
+                    }
+                    if let Some(ref dp) = handle.detail_pane {
+                        if config::get().layout.side == "right" {
+                            dash_for_mods.prepend(dp);
+                        } else {
+                            dash_for_mods.append(dp);
+                        }
+                    }
+                    handles_sync.borrow_mut().insert(active_id.to_string(), handle);
+                }
+                if let Some(h) = handles_sync.borrow().get(active_id) {
+                    if let Some(ref show_cb) = h.on_show {
+                        show_cb();
+                    }
+                }
+            }
         }
     });
 
     let stack_clamp = gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Never) 
+        .hscrollbar_policy(gtk4::PolicyType::Never)
         .vscrollbar_policy(gtk4::PolicyType::Never)
-        .propagate_natural_width(false)                
+        .propagate_natural_width(false)
         .min_content_width(288)
         .max_content_width(288)
         .width_request(288)
@@ -1782,17 +1933,17 @@ fn build_ui(
     main_col.append(&body_row);
 
     dash_box.append(&main_col);
-    dash_box.append(&plans_ui.detail_view);
 
-    stack.add_titled(&music_slot, Some("music"), "Music");
-    stack.add_titled(&timers_slot, Some("timers"), "Timers");
-    stack.add_titled(&calendar_slot, Some("calendar"), "Calendar");
-    stack.add_titled(&clipboard_slot, Some("clipboard"), "Clipboard");
-    stack.add_titled(&system_slot, Some("system"), "System");
-
-    // Default to the user's configured default tab on startup
+    // Default to the user's configured default tab (or first installed module, or "empty")
     let startup_tab = config::get().layout.default_tab;
-    stack.set_visible_child_name(if startup_tab.is_empty() { "run" } else { &startup_tab });
+    let chosen_tab = if compiled_modules.iter().any(|m| m.id == startup_tab.as_str()) {
+        startup_tab
+    } else if let Some(first) = compiled_modules.first() {
+        first.id.to_string()
+    } else {
+        "empty".to_string()
+    };
+    stack.set_visible_child_name(&chosen_tab);
 
     // Live Layout & Chrome applier (full left/right mirror, flush trigger, monitor pin,
     // panel width, and individual chrome toggles)
@@ -1808,8 +1959,7 @@ fn build_ui(
         let tw_l = trigger_wrapper.clone();
         let tb_l = trigger_btn.clone();
         let open_l = is_open.clone();
-        let plan_det_l = plans_ui.detail_view.clone();
-        let sys_slot_l = system_ui_slot.clone();
+        let handles_l = loaded_handles.clone();
         let ws_w = workspaces_widget.clone();
         let tr_w = tray_widget.clone();
         let st_w = status_strip.clone();
@@ -1839,21 +1989,19 @@ fn build_ui(
             });
             if is_right {
                 dc_l.reorder_child_after(&db_l, Some(&tw_l));
-                // Mirror sidebar nav to hug the right screen edge
                 br_l.reorder_child_after(&sbc_l, Some(&sc_l));
-                // Mirror detail panes inward (to the left of main_col)
-                db_l.reorder_child_after(&mc_l, Some(&plan_det_l));
-                if let Some(sys) = sys_slot_l.borrow().as_ref() {
-                    db_l.reorder_child_after(&sys.detail_view, Some(&plan_det_l));
-                    db_l.reorder_child_after(&mc_l, Some(&sys.detail_view));
+                for h in handles_l.borrow().values() {
+                    if let Some(ref dp) = h.detail_pane {
+                        db_l.reorder_child_after(&mc_l, Some(dp));
+                    }
                 }
             } else {
                 dc_l.reorder_child_after(&tw_l, Some(&db_l));
-                // Standard left-edge layout: sidebar on left, detail panes on right
                 br_l.reorder_child_after(&sc_l, Some(&sbc_l));
-                db_l.reorder_child_after(&plan_det_l, Some(&mc_l));
-                if let Some(sys) = sys_slot_l.borrow().as_ref() {
-                    db_l.reorder_child_after(&sys.detail_view, Some(&plan_det_l));
+                for h in handles_l.borrow().values() {
+                    if let Some(ref dp) = h.detail_pane {
+                        db_l.reorder_child_after(dp, Some(&mc_l));
+                    }
                 }
             }
 
@@ -1952,11 +2100,9 @@ fn build_ui(
     window.add_controller(win_click);
 
     let drawer_clone = drawer_container.clone();
-    let detail_clone = plans_ui.detail_view.clone();
-    let system_ui_close = system_ui_slot.clone();
+    let handles_toggle = loaded_handles.clone();
     let media_for_toggle = media_handle.clone();
     let stickies_for_toggle = stickies_handle.clone();
-    let run_search_open = run_search_slot.clone();
     let stack_for_open = stack.clone();
     let window_clone = window.clone();
     let hovered_click = is_hovered.clone();
@@ -1982,9 +2128,11 @@ fn build_ui(
             btn.add_css_class("riding");
             drawer_clone.add_css_class("open");
 
-            if stack_for_open.visible_child_name().as_deref() == Some("run") {
-                if let Some(entry) = run_search_open.borrow().as_ref() {
-                    entry.grab_focus();
+            if let Some(cur) = stack_for_open.visible_child_name() {
+                if let Some(h) = handles_toggle.borrow().get(cur.as_str()) {
+                    if let Some(ref show_cb) = h.on_show {
+                        show_cb();
+                    }
                 }
             }
         } else {
@@ -1994,9 +2142,10 @@ fn build_ui(
             media_for_toggle.set_dashboard_open(false);
             stickies_for_toggle.set_dashboard_open(false);
 
-            detail_clone.set_visible(false);
-            if let Some(sys) = system_ui_close.borrow().as_ref() {
-                sys.detail_view.set_visible(false);
+            for h in handles_toggle.borrow().values() {
+                if let Some(ref dp) = h.detail_pane {
+                    dp.set_visible(false);
+                }
             }
             window_clone.set_keyboard_mode(KeyboardMode::None);
             drawer_clone.remove_css_class("open");

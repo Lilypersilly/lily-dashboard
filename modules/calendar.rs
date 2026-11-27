@@ -1,3 +1,6 @@
+// @dash-id: calendar
+// @dash-title: Calendar
+// @dash-lifecycle: stateless
 //! Monthly calendar tab with per-day notes and reminders.
 //!
 //! Dates with entries are marked on the GTK calendar widget and persisted to
@@ -309,4 +312,8 @@ pub fn build_calendar_ui() -> Box {
     }
 
     root
+}
+
+pub fn build(_ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle {
+    crate::module_api::ModuleHandle::simple(build_calendar_ui())
 }

@@ -1,3 +1,7 @@
+// @dash-id: clipboard
+// @dash-title: Clipboard
+// @dash-lifecycle: stateless
+// @dash-hooks: init, shutdown, visibility
 //! Clipboard history tab backed by background `wl-paste --watch` listeners.
 //!
 //! Tracks up to 200 text entries and 20 PNG images (15 MB cap) entirely in RAM so
@@ -863,4 +867,20 @@ fn build_clip_row(
 
     row_box.append(&btn);
     row_box
+}
+
+pub fn init() {
+    init_clipboard_watcher();
+}
+
+pub fn shutdown() {
+    shutdown_watchers();
+}
+
+pub fn set_enabled(enabled: bool) {
+    set_watcher_enabled(enabled);
+}
+
+pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle {
+    crate::module_api::ModuleHandle::simple(build_clipboard_ui(ctx.popover_guard.clone()))
 }

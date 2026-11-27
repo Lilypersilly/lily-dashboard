@@ -1,3 +1,6 @@
+// @dash-id: timers
+// @dash-title: Timers
+// @dash-lifecycle: stateful
 //! Countdown timers and process-watcher alerts tab.
 //!
 //! Supports simple durations (`15m`, `2h`, `45s`) as well as watching a running PID
@@ -428,4 +431,8 @@ pub fn build_timers_ui() -> Box {
     });
 
     app_box
+}
+
+pub fn build(_ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle {
+    crate::module_api::ModuleHandle::simple(build_timers_ui())
 }

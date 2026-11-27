@@ -1,3 +1,8 @@
+// @dash-id: locker
+// @dash-title: Locker
+// @dash-lifecycle: stateful
+// @dash-hooks: init
+// Dashpendencies: aes-gcm = "0.10", aead = { version = "0.5", features = ["stream"] }, argon2 = "0.5", hkdf = "0.12"
 //! Encrypted local file locker tab.
 //!
 //! Uses Argon2id + HKDF-SHA256 + streaming AES-256-GCM (1 MB chunks) packed into
@@ -1598,7 +1603,7 @@ pub fn build_locker_ui(popover_guard: Rc<Cell<usize>>) -> Box {
 
         Rc::new(move || {
             *sess_l.borrow_mut() = None;
-            crate::passwords::wipe_locker_ram_cache();
+            crate::module_api::trigger_ram_wipe();
             let _ = fs::remove_dir_all(RAM_EXTRACT_DIR);
             pin_l.set_text("");
             err_l.set_label("");
@@ -2190,4 +2195,12 @@ pub fn build_locker_ui(popover_guard: Rc<Cell<usize>>) -> Box {
     }
 
     root
+}
+
+pub fn init() {
+    crate::module_api::register_vault_bridge(load_or_create_passwords_file, save_passwords_file);
+}
+
+pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle {
+    crate::module_api::ModuleHandle::simple(build_locker_ui(ctx.popover_guard.clone()))
 }

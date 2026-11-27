@@ -1,3 +1,7 @@
+// @dash-id: music
+// @dash-title: Music
+// @dash-lifecycle: stateful
+// Dashpendencies: souvlaki = { version = "0.7", default-features = false, features = ["use_zbus"] }, zbus = "3.15"
 //! YouTube Music player tab backed by `yt-dlp` and a local `mpv` IPC socket.
 //!
 //! Handles playlists, search, play-next / queue management, seek and volume controls,
@@ -3884,4 +3888,8 @@ fn render_queue_view(
     if remaining_below > 0 {
         container.append(&Box::builder().height_request((remaining_below as i32) * ROW_HEIGHT_PX).build());
     }
+}
+
+pub fn build(_ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle {
+    crate::module_api::ModuleHandle::simple(build_music_ui())
 }
