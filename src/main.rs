@@ -2240,8 +2240,12 @@ fn build_ui(
     // ----------------------------------
 
     // --- START HYPRLAND IPC LISTENER ---
-    let (tx_mon, rx_mon) = std::sync::mpsc::channel::<String>();
-    
+    enum HyprIpcEvent {
+        Monitor(String),
+        ExternalFocus,
+    }
+    let (tx_ipc, rx_ipc) = std::sync::mpsc::channel::<HyprIpcEvent>();
+
     std::thread::spawn(move || {
         let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").unwrap_or_default();
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".to_string());
@@ -2253,12 +2257,17 @@ fn build_ui(
                 for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
                     if let Some(rest) = line.strip_prefix("focusedmon>>") {
                         if let Some((mon_name, _)) = rest.split_once(',') {
-                            let _ = tx_mon.send(mon_name.to_string());
+                            let _ = tx_ipc.send(HyprIpcEvent::Monitor(mon_name.to_string()));
                         }
+                    } else if line.starts_with("activewindowv2>>")
+                        || line.starts_with("workspace>>")
+                        || line.starts_with("openwindow>>")
+                    {
+                        let _ = tx_ipc.send(HyprIpcEvent::ExternalFocus);
                     }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_secs(2)); 
+            std::thread::sleep(std::time::Duration::from_secs(2));
         }
     });
 
@@ -2268,17 +2277,25 @@ fn build_ui(
 
     glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
         let mut latest_mon: Option<String> = None;
-        while let Ok(mon) = rx_mon.try_recv() {
-            latest_mon = Some(mon);
+        let mut yield_focus = false;
+        while let Ok(ev) = rx_ipc.try_recv() {
+            match ev {
+                HyprIpcEvent::Monitor(mon) => latest_mon = Some(mon),
+                HyprIpcEvent::ExternalFocus => yield_focus = true,
+            }
         }
-        
+
+        if yield_focus && open_focus.get() {
+            win_focus.set_keyboard_mode(KeyboardMode::OnDemand);
+        }
+
         if let Some(mon_name) = latest_mon {
             move_to_monitor(&win_focus, Some(&mon_name));
 
             let win_region = win_focus.clone();
             let o = open_focus.get();
             let db_w = dash_box_ipc.width();
-            
+
             glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
                 update_input_region(&win_region, o, db_w);
             });

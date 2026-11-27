@@ -211,6 +211,20 @@ fn build_sticky_window(
     win.set_size_request(note.w.max(200), note.h.max(160));
     win.set_default_size(note.w.max(200), note.h.max(160));
 
+    // When clicking a sticky note, relax the main dashboard from Exclusive -> OnDemand
+    // so Hyprland immediately transfers keyboard focus into this sticky's TextView.
+    let focus_click = gtk4::GestureClick::new();
+    focus_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let app_for_focus = app.clone();
+    focus_click.connect_pressed(move |_, _, _, _| {
+        for w in app_for_focus.windows() {
+            if w.namespace().as_deref() == Some("lily-dashboard") {
+                w.set_keyboard_mode(KeyboardMode::OnDemand);
+            }
+        }
+    });
+    win.add_controller(focus_click);
+
     if let Some(mon) = active_gdk_monitor() {
         win.set_monitor(&mon);
     }
