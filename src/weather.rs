@@ -42,6 +42,7 @@ struct GeoResult {
 struct CurrentData {
     temperature_2m: f64,
     weather_code: u8,
+    #[allow(dead_code)]
     precipitation: f64,
     wind_speed_10m: f64,
     relative_humidity_2m: f64,

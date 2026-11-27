@@ -401,6 +401,27 @@ pub fn sync_visible_tabs_from_sidebar(cfg: &mut AppConfig) {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
+pub struct BindingsConfig {
+    /// Press Escape to close the dashboard drawer when open
+    pub esc_to_close: bool,
+    /// Press Ctrl+1..9 or Alt+1..9 to jump directly to loaded sidebar tabs
+    pub tab_jump_enabled: bool,
+    /// Modifier for number tab jumping: "ctrl" or "alt"
+    pub tab_jump_mod: String,
+}
+
+impl Default for BindingsConfig {
+    fn default() -> Self {
+        Self {
+            esc_to_close: true,
+            tab_jump_enabled: true,
+            tab_jump_mod: "ctrl".to_string(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct AppConfig {
     /// "auto" (read `paths.theme_conf_file`, fall back to marshmellow-dark), a built-in preset key, or "custom"
     pub theme_preset: String,
@@ -420,6 +441,7 @@ pub struct AppConfig {
     pub tools: ToolsConfig,
     pub paths: PathsConfig,
     pub hyprland: HyprlandConfig,
+    pub bindings: BindingsConfig,
 }
 
 impl Default for AppConfig {
@@ -437,6 +459,7 @@ impl Default for AppConfig {
             tools: ToolsConfig::default(),
             paths: PathsConfig::default(),
             hyprland: HyprlandConfig::default(),
+            bindings: BindingsConfig::default(),
         }
     }
 }

@@ -290,10 +290,32 @@ struct KeybindEntry {
     editable: bool,
 }
 
+#[derive(Clone, Debug)]
+struct BluetoothDevice {
+    mac: String,
+    name: String,
+    icon: String,
+    connected: bool,
+    paired: bool,
+    trusted: bool,
+    battery: Option<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct BluetoothSnapshot {
+    available: bool,
+    powered: bool,
+    discovering: bool,
+    controller_name: String,
+    devices: Vec<BluetoothDevice>,
+}
+
 enum SystemMsg {
     Audio(AudioSnapshot),
     Network(NetworkSnapshot),
     NetworkAction(String),
+    Bluetooth(BluetoothSnapshot),
+    BluetoothAction(String),
     Displays(Vec<MonitorInfo>),
     Keybinds(Vec<KeybindEntry>),
     Overview(OverviewSnapshot),
@@ -315,6 +337,153 @@ enum SystemMsg {
 // ==========================================
 // DATA FETCHERS (run on background threads)
 // ==========================================
+
+fn fetch_bluetooth_snapshot() -> BluetoothSnapshot {
+    if !crate::config::bin_exists("bluetoothctl") {
+        return BluetoothSnapshot {
+            available: false,
+            powered: false,
+            discovering: false,
+            controller_name: String::new(),
+            devices: Vec::new(),
+        };
+    }
+
+    let show_out = Command::new("bluetoothctl")
+        .arg("show")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
+    let mut powered = false;
+    let mut discovering = false;
+    let mut controller_name = "Bluetooth Adapter".to_string();
+    let mut has_controller = false;
+    for line in show_out.lines() {
+        let t = line.trim();
+        if t.starts_with("Controller ") {
+            has_controller = true;
+        } else if let Some(v) = t.strip_prefix("Name:") {
+            controller_name = v.trim().to_string();
+        } else if let Some(v) = t.strip_prefix("Powered:") {
+            powered = v.trim().eq_ignore_ascii_case("yes");
+        } else if let Some(v) = t.strip_prefix("Discovering:") {
+            discovering = v.trim().eq_ignore_ascii_case("yes");
+        }
+    }
+
+    if !has_controller {
+        return BluetoothSnapshot {
+            available: true,
+            powered: false,
+            discovering: false,
+            controller_name: "No Bluetooth controller found".to_string(),
+            devices: Vec::new(),
+        };
+    }
+
+    let dev_out = Command::new("bluetoothctl")
+        .arg("devices")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
+    let mut devices = Vec::new();
+    for line in dev_out.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("Device ") else {
+            continue;
+        };
+        let mut parts = rest.splitn(2, ' ');
+        let Some(mac) = parts.next() else {
+            continue;
+        };
+        let fallback_name = parts.next().unwrap_or(mac).trim().to_string();
+
+        let info_out = Command::new("bluetoothctl")
+            .args(["info", mac])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+
+        let mut name = fallback_name;
+        let mut icon = String::new();
+        let mut connected = false;
+        let mut paired = false;
+        let mut trusted = false;
+        let mut battery: Option<u8> = None;
+
+        for il in info_out.lines() {
+            let it = il.trim();
+            if let Some(v) = it.strip_prefix("Alias:") {
+                let a = v.trim();
+                if !a.is_empty() {
+                    name = a.to_string();
+                }
+            } else if let Some(v) = it.strip_prefix("Icon:") {
+                icon = v.trim().to_string();
+            } else if let Some(v) = it.strip_prefix("Connected:") {
+                connected = v.trim().eq_ignore_ascii_case("yes");
+            } else if let Some(v) = it.strip_prefix("Paired:") {
+                paired = v.trim().eq_ignore_ascii_case("yes");
+            } else if let Some(v) = it.strip_prefix("Trusted:") {
+                trusted = v.trim().eq_ignore_ascii_case("yes");
+            } else if let Some(v) = it.strip_prefix("Battery Percentage:") {
+                // e.g. "0x50 (80)"
+                if let Some(start) = v.find('(') {
+                    if let Some(end) = v[start + 1..].find(')') {
+                        if let Ok(pct) = v[start + 1..start + 1 + end].trim().parse::<u8>() {
+                            battery = Some(pct);
+                        }
+                    }
+                }
+            }
+        }
+
+        devices.push(BluetoothDevice {
+            mac: mac.to_string(),
+            name,
+            icon,
+            connected,
+            paired,
+            trusted,
+            battery,
+        });
+    }
+
+    devices.sort_by(|a, b| {
+        b.connected
+            .cmp(&a.connected)
+            .then_with(|| b.paired.cmp(&a.paired))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    BluetoothSnapshot {
+        available: true,
+        powered,
+        discovering,
+        controller_name,
+        devices,
+    }
+}
+
+fn bt_device_glyph(icon: &str) -> &'static str {
+    if icon.contains("headset") || icon.contains("headphone") || icon.contains("audio-card") {
+        "󰋋"
+    } else if icon.contains("mouse") {
+        "󰍽"
+    } else if icon.contains("keyboard") {
+        "󰌌"
+    } else if icon.contains("speaker") {
+        "󰓃"
+    } else if icon.contains("gaming") || icon.contains("joystick") {
+        "󰖺"
+    } else if icon.contains("phone") {
+        "󰄜"
+    } else {
+        "󰂯"
+    }
+}
 
 fn parse_pactl_volume(val: &Value) -> f64 {
     let Some(vol_obj) = val.get("volume").and_then(|v| v.as_object()) else {
@@ -1644,6 +1813,7 @@ pub fn build_system_ui(
 
     let sound_cat_btn = make_cat_btn("", "Sound", "Outputs, mics & app volumes");
     let net_cat_btn = make_cat_btn("󰤨", "Network", "Connections, Wi-Fi & VPNs");
+    let bt_cat_btn = make_cat_btn("󰂯", "Bluetooth", "Devices, pairing & battery");
     let theme_cat_btn = make_cat_btn("󰏘", "Themes", "Live desktop color palettes");
     let wall_cat_btn = make_cat_btn("󰸉", "Wallpapers", "Multi-monitor wallpaper picker");
     let disp_cat_btn = make_cat_btn("󰍹", "Displays", "Monitors, refresh & focus");
@@ -1653,6 +1823,7 @@ pub fn build_system_ui(
 
     list_view.append(&sound_cat_btn);
     list_view.append(&net_cat_btn);
+    list_view.append(&bt_cat_btn);
     list_view.append(&theme_cat_btn);
     list_view.append(&wall_cat_btn);
     list_view.append(&disp_cat_btn);
@@ -1778,6 +1949,23 @@ pub fn build_system_ui(
     net_box.append(&net_status_lbl);
     net_box.append(&net_content_box);
     detail_stack.add_named(&net_scroll, Some("network"));
+
+    // PAGE 2b: BLUETOOTH
+    let (bt_scroll, bt_box) = make_scroll_page();
+    let bt_status_lbl = Label::builder()
+        .label("")
+        .halign(Align::Start)
+        .wrap(true)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .visible(false)
+        .build();
+    let bt_content_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(10)
+        .build();
+    bt_box.append(&bt_status_lbl);
+    bt_box.append(&bt_content_box);
+    detail_stack.add_named(&bt_scroll, Some("bluetooth"));
 
     // PAGE 3: THEMES
     let (theme_scroll, theme_box) = make_scroll_page();
@@ -2060,6 +2248,7 @@ pub fn build_system_ui(
     let cat_buttons = vec![
         ("sound", sound_cat_btn.clone()),
         ("network", net_cat_btn.clone()),
+        ("bluetooth", bt_cat_btn.clone()),
         ("themes", theme_cat_btn.clone()),
         ("wallpapers", wall_cat_btn.clone()),
         ("displays", disp_cat_btn.clone()),
@@ -2088,6 +2277,11 @@ pub fn build_system_ui(
                 "network" => {
                     std::thread::spawn(move || {
                         let _ = tx_bg.send(SystemMsg::Network(fetch_network_snapshot(rescan_wifi)));
+                    });
+                }
+                "bluetooth" => {
+                    std::thread::spawn(move || {
+                        let _ = tx_bg.send(SystemMsg::Bluetooth(fetch_bluetooth_snapshot()));
                     });
                 }
                 "themes" => {
@@ -2141,6 +2335,7 @@ pub fn build_system_ui(
             d_title.set_label(match sec {
                 "sound" => "SOUND",
                 "network" => "NETWORK",
+                "bluetooth" => "BLUETOOTH",
                 "themes" => "THEME SWITCH",
                 "wallpapers" => "WALLPAPERS",
                 "displays" => "DISPLAYS",
@@ -2168,6 +2363,10 @@ pub fn build_system_ui(
     {
         let open_s = open_section.clone();
         net_cat_btn.connect_clicked(move |_| open_s("network"));
+    }
+    {
+        let open_s = open_section.clone();
+        bt_cat_btn.connect_clicked(move |_| open_s("bluetooth"));
     }
     {
         let open_s = open_section.clone();
@@ -2279,6 +2478,8 @@ pub fn build_system_ui(
     let sound_box_r = sound_box.clone();
     let net_box_r = net_content_box.clone();
     let net_status_r = net_status_lbl.clone();
+    let bt_box_r = bt_content_box.clone();
+    let bt_status_r = bt_status_lbl.clone();
     let theme_box_r = theme_content_box.clone();
     let theme_status_r = theme_status_lbl.clone();
     let wall_box_r = wall_content_box.clone();
@@ -2339,6 +2540,14 @@ pub fn build_system_ui(
                     net_status_r.set_label(&status);
                     net_status_r.set_visible(true);
                     refresh_for_ui("network", false);
+                }
+                SystemMsg::Bluetooth(snap) => {
+                    render_bluetooth_page(&bt_box_r, &bt_status_r, &snap, &tx_for_ui);
+                }
+                SystemMsg::BluetoothAction(status) => {
+                    bt_status_r.set_label(&status);
+                    bt_status_r.set_visible(true);
+                    refresh_for_ui("bluetooth", false);
                 }
                 SystemMsg::Themes(themes) => {
                     render_themes_page(
@@ -3157,6 +3366,375 @@ fn render_network_page(
             container.append(&btn);
         }
     }
+}
+
+fn render_bluetooth_page(
+    container: &Box,
+    status_lbl: &Label,
+    snap: &BluetoothSnapshot,
+    tx: &mpsc::Sender<SystemMsg>,
+) {
+    clear_box(container);
+
+    if !snap.available {
+        let card = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(6)
+            .css_classes(vec!["sys-card".to_string()])
+            .build();
+        card.append(
+            &Label::builder()
+                .label("Requires bluetoothctl (bluez-utils)")
+                .halign(Align::Start)
+                .css_classes(vec!["plan-h2".to_string()])
+                .build(),
+        );
+        card.append(
+            &Label::builder()
+                .label("Install with: sudo pacman -S bluez bluez-utils && sudo systemctl enable --now bluetooth")
+                .halign(Align::Start)
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build(),
+        );
+        container.append(&card);
+        return;
+    }
+
+    // Adapter header card (Power + Scan)
+    let ctrl_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .css_classes(vec!["sys-card".to_string()])
+        .build();
+
+    let ctrl_top = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    let ctrl_lbl = Label::builder()
+        .label(&format!("󰂯  {}", snap.controller_name))
+        .halign(Align::Start)
+        .hexpand(true)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .css_classes(vec!["plan-body".to_string()])
+        .build();
+    let pwr_state_lbl = Label::builder()
+        .label(if snap.powered { "ON" } else { "OFF" })
+        .css_classes(vec!["fav-score-badge".to_string()])
+        .build();
+    ctrl_top.append(&ctrl_lbl);
+    ctrl_top.append(&pwr_state_lbl);
+    ctrl_card.append(&ctrl_top);
+
+    let ctrl_btns = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+
+    let pwr_btn = Button::builder()
+        .label(if snap.powered { "Turn Off" } else { "Turn On" })
+        .css_classes(if snap.powered {
+            vec!["fav-item-btn".to_string(), "pinned".to_string()]
+        } else {
+            vec!["fav-item-btn".to_string()]
+        })
+        .hexpand(true)
+        .build();
+    {
+        let next_on = !snap.powered;
+        let tx_c = tx.clone();
+        let st_c = status_lbl.clone();
+        pwr_btn.connect_clicked(move |_| {
+            st_c.set_label(if next_on {
+                "Powering Bluetooth on..."
+            } else {
+                "Powering Bluetooth off..."
+            });
+            st_c.set_visible(true);
+            let tx_bg = tx_c.clone();
+            std::thread::spawn(move || {
+                let arg = if next_on { "on" } else { "off" };
+                let ok = Command::new("bluetoothctl")
+                    .args(["power", arg])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                let msg = if ok {
+                    format!("Bluetooth turned {}", arg)
+                } else {
+                    format!("Failed to turn Bluetooth {} (is bluetooth.service running?)", arg)
+                };
+                let _ = tx_bg.send(SystemMsg::BluetoothAction(msg));
+            });
+        });
+    }
+
+    let scan_btn = Button::builder()
+        .label(if snap.discovering { "Scanning..." } else { "Scan (8s)" })
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .sensitive(snap.powered && !snap.discovering)
+        .hexpand(true)
+        .build();
+    {
+        let tx_c = tx.clone();
+        let st_c = status_lbl.clone();
+        scan_btn.connect_clicked(move |b| {
+            b.set_sensitive(false);
+            b.set_label("Scanning...");
+            st_c.set_label("Scanning for nearby Bluetooth devices (8s)...");
+            st_c.set_visible(true);
+            let tx_bg = tx_c.clone();
+            std::thread::spawn(move || {
+                let _ = Command::new("bluetoothctl")
+                    .args(["--timeout", "8", "scan", "on"])
+                    .output();
+                let _ = tx_bg.send(SystemMsg::BluetoothAction("Bluetooth scan complete".to_string()));
+            });
+        });
+    }
+
+    ctrl_btns.append(&pwr_btn);
+    ctrl_btns.append(&scan_btn);
+    ctrl_card.append(&ctrl_btns);
+    container.append(&ctrl_card);
+
+    if !snap.powered {
+        container.append(
+            &Label::builder()
+                .label("Bluetooth is powered off. Click Turn On to manage devices.")
+                .halign(Align::Start)
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build(),
+        );
+        return;
+    }
+
+    if snap.devices.is_empty() {
+        container.append(
+            &Label::builder()
+                .label("No paired or discovered devices yet. Click Scan (8s) to search.")
+                .halign(Align::Start)
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build(),
+        );
+        return;
+    }
+
+    let paired_devs: Vec<&BluetoothDevice> = snap.devices.iter().filter(|d| d.paired || d.connected).collect();
+    let avail_devs: Vec<&BluetoothDevice> = snap.devices.iter().filter(|d| !d.paired && !d.connected).collect();
+
+    let render_dev_list = |title: &str, devs: &[&BluetoothDevice]| {
+        if devs.is_empty() {
+            return;
+        }
+        container.append(
+            &Label::builder()
+                .label(title)
+                .halign(Align::Start)
+                .css_classes(vec!["fav-group-header".to_string()])
+                .margin_top(4)
+                .build(),
+        );
+        for dev in devs {
+            let mut cls = vec!["sys-card".to_string()];
+            if dev.connected {
+                cls.push("pinned".to_string());
+            }
+            let card = Box::builder()
+                .orientation(Orientation::Vertical)
+                .spacing(6)
+                .css_classes(cls)
+                .build();
+
+            let top = Box::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(8)
+                .build();
+            let glyph = Label::builder()
+                .label(bt_device_glyph(&dev.icon))
+                .css_classes(vec!["plan-h2".to_string()])
+                .build();
+            let info_col = Box::builder()
+                .orientation(Orientation::Vertical)
+                .spacing(1)
+                .hexpand(true)
+                .build();
+            let name_lbl = Label::builder()
+                .label(&dev.name)
+                .halign(Align::Start)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .css_classes(vec!["plan-body".to_string()])
+                .build();
+            let mut sub_parts = Vec::new();
+            if dev.connected {
+                sub_parts.push("Connected".to_string());
+            } else if dev.paired {
+                sub_parts.push("Paired".to_string());
+            } else {
+                sub_parts.push("Available".to_string());
+            }
+            if let Some(pct) = dev.battery {
+                sub_parts.push(format!("󰥈 {}%", pct));
+            }
+            sub_parts.push(dev.mac.clone());
+            let sub_lbl = Label::builder()
+                .label(&sub_parts.join(" • "))
+                .halign(Align::Start)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build();
+            info_col.append(&name_lbl);
+            info_col.append(&sub_lbl);
+
+            top.append(&glyph);
+            top.append(&info_col);
+            card.append(&top);
+
+            let act_row = Box::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(6)
+                .build();
+
+            if dev.connected {
+                let disc_btn = Button::builder()
+                    .label("Disconnect")
+                    .css_classes(vec!["fav-item-btn".to_string()])
+                    .hexpand(true)
+                    .build();
+                let mac = dev.mac.clone();
+                let dname = dev.name.clone();
+                let tx_c = tx.clone();
+                let st_c = status_lbl.clone();
+                disc_btn.connect_clicked(move |_| {
+                    st_c.set_label(&format!("Disconnecting {}...", dname));
+                    st_c.set_visible(true);
+                    let m = mac.clone();
+                    let n = dname.clone();
+                    let tx_bg = tx_c.clone();
+                    std::thread::spawn(move || {
+                        let ok = Command::new("bluetoothctl")
+                            .args(["disconnect", &m])
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false);
+                        let msg = if ok {
+                            format!("Disconnected {}", n)
+                        } else {
+                            format!("Failed to disconnect {}", n)
+                        };
+                        let _ = tx_bg.send(SystemMsg::BluetoothAction(msg));
+                    });
+                });
+                act_row.append(&disc_btn);
+            } else if dev.paired {
+                let conn_btn = Button::builder()
+                    .label("Connect")
+                    .css_classes(vec!["fav-item-btn".to_string(), "pinned".to_string()])
+                    .hexpand(true)
+                    .build();
+                let mac = dev.mac.clone();
+                let dname = dev.name.clone();
+                let tx_c = tx.clone();
+                let st_c = status_lbl.clone();
+                conn_btn.connect_clicked(move |_| {
+                    st_c.set_label(&format!("Connecting to {}...", dname));
+                    st_c.set_visible(true);
+                    let m = mac.clone();
+                    let n = dname.clone();
+                    let tx_bg = tx_c.clone();
+                    std::thread::spawn(move || {
+                        let ok = Command::new("bluetoothctl")
+                            .args(["connect", &m])
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false);
+                        let msg = if ok {
+                            format!("Connected to {}", n)
+                        } else {
+                            format!("Could not connect to {} (make sure it's awake)", n)
+                        };
+                        let _ = tx_bg.send(SystemMsg::BluetoothAction(msg));
+                    });
+                });
+                act_row.append(&conn_btn);
+            } else {
+                let pair_btn = Button::builder()
+                    .label("Pair & Connect")
+                    .css_classes(vec!["fav-item-btn".to_string(), "pinned".to_string()])
+                    .hexpand(true)
+                    .build();
+                let mac = dev.mac.clone();
+                let dname = dev.name.clone();
+                let tx_c = tx.clone();
+                let st_c = status_lbl.clone();
+                pair_btn.connect_clicked(move |_| {
+                    st_c.set_label(&format!("Pairing & connecting {}...", dname));
+                    st_c.set_visible(true);
+                    let m = mac.clone();
+                    let n = dname.clone();
+                    let tx_bg = tx_c.clone();
+                    std::thread::spawn(move || {
+                        let _ = Command::new("bluetoothctl").args(["trust", &m]).status();
+                        let paired = Command::new("bluetoothctl")
+                            .args(["pair", &m])
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false);
+                        let conn = Command::new("bluetoothctl")
+                            .args(["connect", &m])
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false);
+                        let msg = if conn {
+                            format!("Paired & connected {}", n)
+                        } else if paired {
+                            format!("Paired {} (click Connect to link)", n)
+                        } else {
+                            format!("Failed to pair {}", n)
+                        };
+                        let _ = tx_bg.send(SystemMsg::BluetoothAction(msg));
+                    });
+                });
+                act_row.append(&pair_btn);
+            }
+
+            if dev.paired || dev.trusted {
+                let rem_btn = Button::builder()
+                    .label("Forget")
+                    .css_classes(vec!["plan-line-del-btn".to_string()])
+                    .tooltip_text("Remove / unpair device")
+                    .build();
+                let mac = dev.mac.clone();
+                let dname = dev.name.clone();
+                let tx_c = tx.clone();
+                let st_c = status_lbl.clone();
+                rem_btn.connect_clicked(move |_| {
+                    st_c.set_label(&format!("Removing {}...", dname));
+                    st_c.set_visible(true);
+                    let m = mac.clone();
+                    let n = dname.clone();
+                    let tx_bg = tx_c.clone();
+                    std::thread::spawn(move || {
+                        let _ = Command::new("bluetoothctl").args(["remove", &m]).status();
+                        let _ = tx_bg.send(SystemMsg::BluetoothAction(format!("Removed {}", n)));
+                    });
+                });
+                act_row.append(&rem_btn);
+            }
+
+            card.append(&act_row);
+            container.append(&card);
+        }
+    };
+
+    render_dev_list("PAIRED & CONNECTED", &paired_devs);
+    render_dev_list("DISCOVERED NEARBY", &avail_devs);
 }
 
 fn render_themes_page(
@@ -6632,6 +7210,235 @@ fn render_settings_page(
         "Source Repo (optional, for Reload rebuild)",
         &cfg.paths.source_repo_dir,
         "Leave blank for prebuilt binary restart",
+    );
+
+    // ------------------------------------------
+    // 5b. DASHBOARD BINDINGS & CLI TAB SHORTCUTS
+    // ------------------------------------------
+    let bind_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .build();
+
+    let bind_status = Label::builder()
+        .label("")
+        .halign(Align::Start)
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .visible(false)
+        .build();
+    bind_card.append(&bind_status);
+
+    // Esc to close toggle
+    let esc_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    esc_row.append(
+        &Label::builder()
+            .label("Esc closes drawer")
+            .halign(Align::Start)
+            .hexpand(true)
+            .css_classes(vec!["plan-body".to_string()])
+            .build(),
+    );
+    let esc_btn = Button::builder()
+        .label(if cfg.bindings.esc_to_close { "ON" } else { "OFF" })
+        .css_classes(if cfg.bindings.esc_to_close {
+            vec!["plan-fmt-btn".to_string(), "active".to_string()]
+        } else {
+            vec!["plan-fmt-btn".to_string()]
+        })
+        .build();
+    {
+        let cb = container.clone();
+        let rt = reload_theme.clone();
+        let at = apply_tabs.clone();
+        esc_btn.connect_clicked(move |_| {
+            crate::config::update(|c| c.bindings.esc_to_close = !c.bindings.esc_to_close);
+            render_settings_page(&cb, &rt, &at);
+        });
+    }
+    esc_row.append(&esc_btn);
+    bind_card.append(&esc_row);
+
+    // Number tab-jump selector (Off / Ctrl+1..9 / Alt+1..9)
+    bind_card.append(
+        &Label::builder()
+            .label("Quick Tab Jump (while open)")
+            .halign(Align::Start)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build(),
+    );
+    let jump_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .homogeneous(true)
+        .build();
+    let jump_modes: &[(&str, &str)] = &[("off", "Off"), ("ctrl", "Ctrl + 1..9"), ("alt", "Alt + 1..9")];
+    let cur_jump = if !cfg.bindings.tab_jump_enabled {
+        "off"
+    } else if cfg.bindings.tab_jump_mod.eq_ignore_ascii_case("alt") {
+        "alt"
+    } else {
+        "ctrl"
+    };
+    for &(val, lbl) in jump_modes {
+        let b = Button::builder()
+            .label(lbl)
+            .css_classes(if cur_jump == val {
+                vec!["plan-fmt-btn".to_string(), "active".to_string()]
+            } else {
+                vec!["plan-fmt-btn".to_string()]
+            })
+            .build();
+        let v = val.to_string();
+        let cb = container.clone();
+        let rt = reload_theme.clone();
+        let at = apply_tabs.clone();
+        b.connect_clicked(move |_| {
+            crate::config::update(|c| {
+                if v == "off" {
+                    c.bindings.tab_jump_enabled = false;
+                } else {
+                    c.bindings.tab_jump_enabled = true;
+                    c.bindings.tab_jump_mod = v.clone();
+                }
+            });
+            render_settings_page(&cb, &rt, &at);
+        });
+        jump_row.append(&b);
+    }
+    bind_card.append(&jump_row);
+
+    // Hyprland Direct Tab CLI Binds
+    bind_card.append(
+        &Label::builder()
+            .label("Hyprland Direct Tab Binds (adds to your keybinds file)")
+            .halign(Align::Start)
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .margin_top(6)
+            .build(),
+    );
+
+    let exe_bin = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "lily-dashboard".to_string());
+
+    let cli_targets: &[(&str, &str, &str)] = &[
+        ("Clipboard", "--tab clipboard", "V"),
+        ("Music", "--tab music", "M"),
+        ("Plans", "--tab plans", "P"),
+        ("Calendar", "--tab calendar", "C"),
+        ("Timers", "--tab timers", "T"),
+        ("Passwords", "--tab passwords", "K"),
+        ("Locker", "--tab locker", "L"),
+        ("System", "--tab system", "S"),
+        ("Run Launcher", "--tab run", "R"),
+    ];
+
+    for &(title, flag, default_key) in cli_targets {
+        let row = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(5)
+            .build();
+        let name_l = Label::builder()
+            .label(title)
+            .halign(Align::Start)
+            .width_chars(12)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .css_classes(vec!["plan-body".to_string()])
+            .build();
+        let key_e = Entry::builder()
+            .text(&format!("SUPER+SHIFT+{}", default_key))
+            .hexpand(true)
+            .tooltip_text("Key combo, e.g. SUPER+V or SUPER+SHIFT+M")
+            .build();
+        let full_cmd = format!("{} {}", exe_bin, flag);
+
+        let copy_b = Button::builder()
+            .label("Copy")
+            .css_classes(vec!["fav-item-btn".to_string()])
+            .tooltip_text(&full_cmd)
+            .build();
+        {
+            let cmd_c = full_cmd.clone();
+            let st_c = bind_status.clone();
+            copy_b.connect_clicked(move |_| {
+                if let Ok(mut child) = Command::new("wl-copy").stdin(std::process::Stdio::piped()).spawn() {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(cmd_c.as_bytes());
+                    }
+                    let _ = child.wait();
+                }
+                st_c.set_label(&format!("Copied: {}", cmd_c));
+                st_c.set_visible(true);
+            });
+        }
+
+        let bind_b = Button::builder()
+            .label("+ Bind")
+            .css_classes(vec!["fav-item-btn".to_string(), "pinned".to_string()])
+            .tooltip_text("Append this bind to your Hyprland keybinds file & reload")
+            .build();
+        {
+            let ke = key_e.clone();
+            let cmd_c = full_cmd.clone();
+            let st_c = bind_status.clone();
+            bind_b.connect_clicked(move |_| {
+                let raw = ke.text().trim().to_string();
+                let parts: Vec<&str> = raw.split('+').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                if parts.is_empty() {
+                    st_c.set_label("Enter a key combo first (e.g. SUPER+V)");
+                    st_c.set_visible(true);
+                    return;
+                }
+                let key = parts.last().copied().unwrap_or("");
+                let mods = if parts.len() > 1 {
+                    parts[..parts.len() - 1].join(" ")
+                } else {
+                    String::new()
+                };
+                match append_keybind_to_file(&mods, key, "exec", &cmd_c) {
+                    Ok(msg) => {
+                        st_c.set_label(&msg);
+                        st_c.set_visible(true);
+                    }
+                    Err(e) => {
+                        st_c.set_label(&e);
+                        st_c.set_visible(true);
+                    }
+                }
+            });
+        }
+
+        row.append(&name_l);
+        row.append(&key_e);
+        row.append(&copy_b);
+        row.append(&bind_b);
+        bind_card.append(&row);
+    }
+
+    let bind_summary = format!(
+        "{} · {}",
+        if cfg.bindings.esc_to_close { "Esc" } else { "No Esc" },
+        match cur_jump {
+            "alt" => "Alt+1..9",
+            "ctrl" => "Ctrl+1..9",
+            _ => "No #jump",
+        }
+    );
+    append_collapsible_section(
+        container,
+        "bindings",
+        "DASHBOARD BINDINGS",
+        &bind_summary,
+        &bind_card,
     );
 
     let save_paths_btn = Button::builder()

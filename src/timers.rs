@@ -32,6 +32,7 @@ struct ProcessJob {
 struct TimerJob {
     title: String,
     end_time: Instant,
+    #[allow(dead_code)]
     original_duration: Duration,
 }
 

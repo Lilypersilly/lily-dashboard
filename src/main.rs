@@ -40,7 +40,14 @@ const BASE_DASH_WIDTH: i32 = 400;
 const EXTENDED_PANE_WIDTH: i32 = 400;
 const TOTAL_DASH_WIDTH: i32 = BASE_DASH_WIDTH + EXTENDED_PANE_WIDTH;
 const TRIGGER_WIDTH: i32 = 56;
-const SLIDE_DURATION_MS: u64 = 350;
+
+#[derive(Clone)]
+struct DashHandle {
+    trigger_btn: Button,
+    is_open: Rc<Cell<bool>>,
+    stack: Stack,
+    reload_theme: Rc<dyn Fn()>,
+}
 
 fn main() {
     // Let Hyprland's native GPU layer_rule blur handle our surfaces instead of
@@ -61,7 +68,10 @@ fn main() {
         std::env::set_var("GDK_WAYLAND_DISABLE", new_val);
     }
 
-    let app = Application::builder().application_id(APP_ID).build();
+    let app = Application::builder()
+        .application_id(APP_ID)
+        .flags(gtk4::gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
     let reload_theme_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
     let reload_theme_startup = reload_theme_slot.clone();
     app.connect_startup(move |_| {
@@ -74,34 +84,175 @@ fn main() {
         passwords::wipe_locker_ram_cache();
     });
 
-    // Store the trigger button so re-running `lily-dashboard` (e.g. via SUPER keybind)
-    // toggles the already-running dashboard open/closed instead of spawning a second window!
-    let existing_trigger: Rc<RefCell<Option<Button>>> = Rc::new(RefCell::new(None));
-    let reload_theme_act = reload_theme_slot.clone();
-    app.connect_activate(move |app| {
-        if let Some(btn) = existing_trigger.borrow().as_ref() {
-            btn.emit_clicked();
-            return;
-        }
+    // Store the dashboard handle so re-running `lily-dashboard` (or `lily-dashboard --tab clipboard`)
+    // controls the already-running instance over D-Bus instead of spawning a second window!
+    let existing_handle: Rc<RefCell<Option<DashHandle>>> = Rc::new(RefCell::new(None));
+    let ensure_initialized: Rc<dyn Fn(&Application) -> DashHandle> = {
+        let handle_slot = existing_handle.clone();
+        let reload_theme_act = reload_theme_slot.clone();
+        Rc::new(move |app: &Application| {
+            if let Some(h) = handle_slot.borrow().as_ref() {
+                return h.clone();
+            }
 
-        // Apply saved Hyprland live overrides on startup if the user opted in
-        let startup_cfg = config::get();
-        if startup_cfg.hyprland.apply_on_startup {
-            config::apply_hyprland_settings(&startup_cfg.hyprland);
-        }
+            // Apply saved Hyprland live overrides on startup if the user opted in
+            let startup_cfg = config::get();
+            if startup_cfg.hyprland.apply_on_startup {
+                config::apply_hyprland_settings(&startup_cfg.hyprland);
+            }
 
-        session::init_session_tracker();
-        clipboard::init_clipboard_watcher();
-        let media_handle = media_popout::init_media_popout(app);
-        let stickies_handle = stickies::init_stickies(app);
+            session::init_session_tracker();
+            clipboard::init_clipboard_watcher();
+            let media_handle = media_popout::init_media_popout(app);
+            let stickies_handle = stickies::init_stickies(app);
 
-        let reload_theme = reload_theme_act
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| Rc::new(|| {}));
-        let btn = build_ui(app, media_handle, stickies_handle, reload_theme);
-        *existing_trigger.borrow_mut() = Some(btn);
-    });
+            let reload_theme = reload_theme_act
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| Rc::new(|| {}));
+            let h = build_ui(app, media_handle, stickies_handle, reload_theme);
+            *handle_slot.borrow_mut() = Some(h.clone());
+            h
+        })
+    };
+
+    {
+        let ensure_a = ensure_initialized.clone();
+        let slot_a = existing_handle.clone();
+        app.connect_activate(move |app| {
+            let was_running = slot_a.borrow().is_some();
+            let h = ensure_a(app);
+            if was_running {
+                h.trigger_btn.emit_clicked();
+            }
+        });
+    }
+
+    {
+        let ensure_c = ensure_initialized.clone();
+        let slot_c = existing_handle.clone();
+        app.connect_command_line(move |app, cmdline| {
+            let args: Vec<String> = cmdline
+                .arguments()
+                .into_iter()
+                .skip(1)
+                .map(|s| s.to_string_lossy().to_string())
+                .collect();
+
+            if args.iter().any(|a| a == "--help" || a == "-h") {
+                println!(
+                    "lily-dashboard — Wayland slide-out sidebar for Hyprland\n\n\
+                     USAGE:\n  lily-dashboard [OPTIONS]\n\n\
+                     OPTIONS:\n\
+                       --toggle             Toggle dashboard open/closed (default when already running)\n\
+                       --open               Open the dashboard drawer\n\
+                       --close              Close the dashboard drawer\n\
+                       --tab <id>           Open directly to a tab (or toggle closed if already on it)\n\
+                                            IDs: run, favs, clipboard, plans, calendar, timers,\n\
+                                                 music, drive, passwords, locker, system\n\
+                       --theme <key>        Apply a theme globally by key or name\n\
+                       --dash-only          With --theme, apply to Lily Dashboard only\n\
+                       -h, --help           Show this help"
+                );
+                return 0.into();
+            }
+
+            let was_running = slot_c.borrow().is_some();
+            let h = ensure_c(app);
+
+            let mut target_tab: Option<String> = None;
+            let mut target_theme: Option<String> = None;
+            let mut dash_only = false;
+            let mut want_open = false;
+            let mut want_close = false;
+            let mut want_toggle = false;
+
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--tab" | "-t" => {
+                        if let Some(v) = args.get(i + 1) {
+                            target_tab = Some(v.to_lowercase());
+                            i += 1;
+                        }
+                    }
+                    "--theme" => {
+                        if let Some(v) = args.get(i + 1) {
+                            target_theme = Some(v.clone());
+                            i += 1;
+                        }
+                    }
+                    "--dash-only" => dash_only = true,
+                    "--open" => want_open = true,
+                    "--close" => want_close = true,
+                    "--toggle" => want_toggle = true,
+                    _ => {}
+                }
+                i += 1;
+            }
+
+            if let Some(t_query) = target_theme {
+                let q = t_query.to_lowercase();
+                if let Some(def) = themes::list_all_themes()
+                    .into_iter()
+                    .find(|t| t.key.to_lowercase() == q || t.name.to_lowercase() == q)
+                {
+                    if dash_only {
+                        themes::apply_dash_only(&def);
+                        (h.reload_theme)();
+                    } else {
+                        let rel = h.reload_theme.clone();
+                        let (tx, rx) = std::sync::mpsc::channel::<()>();
+                        std::thread::spawn(move || {
+                            let _ = themes::apply_global(&def);
+                            let _ = tx.send(());
+                        });
+                        glib::timeout_add_local(Duration::from_millis(80), move || {
+                            if rx.try_recv().is_ok() {
+                                rel();
+                                glib::ControlFlow::Break
+                            } else {
+                                glib::ControlFlow::Continue
+                            }
+                        });
+                    }
+                }
+                return 0.into();
+            }
+
+            if let Some(tab) = target_tab {
+                let norm = match tab.as_str() {
+                    "favorites" => "favs",
+                    other => other,
+                };
+                let already_open = h.is_open.get();
+                let cur_tab = h.stack.visible_child_name().map(|s| s.to_string());
+                if already_open && cur_tab.as_deref() == Some(norm) {
+                    h.trigger_btn.emit_clicked();
+                } else {
+                    h.stack.set_visible_child_name(norm);
+                    if !already_open {
+                        h.trigger_btn.emit_clicked();
+                    }
+                }
+                return 0.into();
+            }
+
+            if want_open {
+                if !h.is_open.get() {
+                    h.trigger_btn.emit_clicked();
+                }
+            } else if want_close {
+                if h.is_open.get() {
+                    h.trigger_btn.emit_clicked();
+                }
+            } else if want_toggle || was_running {
+                h.trigger_btn.emit_clicked();
+            }
+
+            0.into()
+        });
+    }
 
     app.run();
 }
@@ -637,7 +788,7 @@ fn build_ui(
     media_handle: media_popout::MediaPopoutHandle,
     stickies_handle: stickies::StickiesHandle,
     reload_theme: Rc<dyn Fn()>,
-) -> Button {
+) -> DashHandle {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Lily Dashboard")
@@ -1871,10 +2022,48 @@ fn build_ui(
     let key_controller = EventControllerKey::new();
     let btn_esc = trigger_btn.clone();
     let open_esc = is_open.clone();
-    key_controller.connect_key_pressed(move |_, key, _, _| {
-        if key == gdk::Key::Escape && open_esc.get() {
+    let stack_kbd = stack.clone();
+    key_controller.connect_key_pressed(move |_, key, _, mods| {
+        if !open_esc.get() {
+            return glib::Propagation::Proceed;
+        }
+        let bcfg = config::get().bindings;
+        if key == gdk::Key::Escape && bcfg.esc_to_close {
             btn_esc.emit_clicked();
             return glib::Propagation::Stop;
+        }
+        if bcfg.tab_jump_enabled {
+            let want_mod = if bcfg.tab_jump_mod.eq_ignore_ascii_case("alt") {
+                mods.contains(gdk::ModifierType::ALT_MASK)
+            } else {
+                mods.contains(gdk::ModifierType::CONTROL_MASK)
+            };
+            if want_mod {
+                let digit = match key {
+                    gdk::Key::_1 => Some(0usize),
+                    gdk::Key::_2 => Some(1),
+                    gdk::Key::_3 => Some(2),
+                    gdk::Key::_4 => Some(3),
+                    gdk::Key::_5 => Some(4),
+                    gdk::Key::_6 => Some(5),
+                    gdk::Key::_7 => Some(6),
+                    gdk::Key::_8 => Some(7),
+                    gdk::Key::_9 => Some(8),
+                    _ => None,
+                };
+                if let Some(idx) = digit {
+                    let loaded_tabs: Vec<String> = config::get()
+                        .layout
+                        .sidebar_items
+                        .into_iter()
+                        .filter(|it| it != "---")
+                        .collect();
+                    if let Some(tab_id) = loaded_tabs.get(idx) {
+                        stack_kbd.set_visible_child_name(tab_id);
+                        return glib::Propagation::Stop;
+                    }
+                }
+            }
         }
         glib::Propagation::Proceed
     });
@@ -1968,5 +2157,10 @@ fn build_ui(
     
     window.present();
 
-    trigger_btn
+    DashHandle {
+        trigger_btn,
+        is_open,
+        stack,
+        reload_theme,
+    }
 }
