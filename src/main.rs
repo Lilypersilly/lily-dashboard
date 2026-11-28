@@ -502,6 +502,14 @@ fn init_theme() -> Rc<dyn Fn()> {
                 .sidebar-nav-btn label {{ color: #{fg_muted}; font-family: '{ui_font}', sans-serif; font-size: {fs_15}px; font-weight: bold; }}
                 .sidebar-nav-btn.selected label {{ color: #{fg_main}; }}
                 .sidebar-sep {{ background-color: {accent1_35}; min-height: 1px; margin: 4px 10px; }}
+                .sidebar-folder-btn {{ background-color: transparent; border: none; border-radius: {r_md}px; padding: 5px 8px; margin: 2px 4px 1px 4px; box-shadow: none; transition: background-color 0.16s ease; }}
+                .sidebar-folder-btn:hover {{ background-color: {accent1_15}; }}
+                .sidebar-folder-btn label {{ color: #{accent2}; font-family: '{ui_font}', sans-serif; font-size: {fs_13}px; font-weight: bold; letter-spacing: 0.3px; }}
+                .sidebar-folder-btn.has-active {{ background-color: {accent1_15}; }}
+                .sidebar-folder-btn.has-active label {{ color: #{fg_main}; }}
+                .sidebar-folder-children {{ margin-left: 9px; border-left: 1.5px solid {accent1_35}; padding-left: 2px; margin-bottom: 2px; }}
+                .sidebar-folder-children .sidebar-nav-btn {{ padding: 5px 8px; margin: 1px 4px 1px 2px; }}
+                .sidebar-folder-children .sidebar-nav-btn label {{ font-size: {fs_14}px; }}
                 
                 .fav-item-btn, .music-item-album, .music-item-playlist {{ background-color: transparent; border: none; border-radius: {r_lg}px; padding: 6px 8px; transition: background-color 0.15s ease; box-shadow: none; }}
                 .fav-item-btn:hover, .music-item-album:hover, .music-item-playlist:hover {{ background-color: {accent1_15}; }}
@@ -566,6 +574,24 @@ fn init_theme() -> Rc<dyn Fn()> {
                 .top-tool-btn label {{ color: #{accent2}; font-family: '{mono_font}', sans-serif; font-size: {fs_13}px; }}
                 .top-tool-btn:hover {{ background-color: {fg_main_15}; }}
                 .kbd-pill {{ background-color: {fg_main_08}; border-radius: {r_xxs}px; padding: 3px 8px; color: #{accent2}; font-family: '{mono_font}', monospace; font-size: {fs_11}px; font-weight: bold; }}
+                .vim-mode-pill {{ background-color: {accent1_24}; border: 1px solid {accent1_55}; border-radius: {r_sm}px; padding: 2px 7px; color: #{accent2}; font-family: '{mono_font}', monospace; font-size: {fs_11}px; font-weight: bold; }}
+                .vim-mode-pill.insert {{ background-color: #{selection}; border-color: #{accent2}; color: #{fg_main}; }}
+                .vim-enabled button:focus,
+                .vim-enabled .fav-item-btn:focus,
+                .vim-enabled .sidebar-nav-btn:focus,
+                .vim-enabled .sidebar-folder-btn:focus,
+                .vim-enabled .plan-fmt-btn:focus,
+                .vim-enabled .plan-close-btn:focus,
+                .vim-enabled .primary-btn:focus,
+                .vim-enabled .fav-hide-btn:focus,
+                .vim-enabled .plan-delete-menu-btn:focus,
+                .vim-enabled .power-btn:focus,
+                .vim-enabled .session-restore-btn:focus,
+                .vim-enabled .wall-tile-btn:focus {{
+                    outline: 2px solid #{accent2};
+                    outline-offset: -2px;
+                    background-color: {accent1_24};
+                }}
 
                 .wall-tile-btn {{ background-color: {fg_main_08}; border: 1px solid transparent; border-radius: {r_md}px; padding: 4px; box-shadow: none; transition: all 0.15s ease; }}
                 .wall-tile-btn:hover {{ background-color: {fg_main_15}; }}
@@ -999,43 +1025,157 @@ fn build_ui(
         .child(&sidebar_column)
         .build();
 
-    // Dynamic sidebar navigation rebuilt from `config.layout.sidebar_items` (tabs + "---" separators)
+    // Dynamic sidebar navigation rebuilt from `config.layout.sidebar_items`
+    // (supports tabs, "---" separators, and collapsible "folder:<Name>" .. "/folder" groups)
     let sidebar_nav = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(1)
         .margin_top(4)
+        .margin_bottom(4)
+        .build();
+
+    let sidebar_nav_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .overlay_scrolling(true)
+        .propagate_natural_height(false)
+        .has_frame(false)
         .vexpand(true)
+        .child(&sidebar_nav)
         .build();
 
     let nav_buttons_rc: Rc<RefCell<Vec<(String, Button)>>> = Rc::new(RefCell::new(Vec::new()));
+    let nav_folders_rc: Rc<RefCell<Vec<(Button, Box, Vec<String>)>>> =
+        Rc::new(RefCell::new(Vec::new()));
 
     let rebuild_sidebar_nav: Rc<dyn Fn()> = {
         let snav = sidebar_nav.clone();
         let stk = stack.clone();
         let nbtns = nav_buttons_rc.clone();
+        let nfolds = nav_folders_rc.clone();
         Rc::new(move || {
             while let Some(c) = snav.first_child() {
                 snav.remove(&c);
             }
             nbtns.borrow_mut().clear();
+            nfolds.borrow_mut().clear();
 
             let cfg = config::get();
             let active_name = stk.visible_child_name().map(|s| s.to_string());
             let compiled = modules_gen::all_modules();
 
+            let mut cur_folder: Option<(String, Button, Label, Box, Vec<String>)> = None;
+            let flush_folder = |cur: &mut Option<(String, Button, Label, Box, Vec<String>)>,
+                                nfolds_ref: &Rc<RefCell<Vec<(Button, Box, Vec<String>)>>>,
+                                active: Option<&str>| {
+                if let Some((_fname, fbtn, _flbl, fbox, child_ids)) = cur.take() {
+                    let is_collapsed = !fbox.is_visible();
+                    let contains_active = active
+                        .map(|a| child_ids.iter().any(|cid| cid == a))
+                        .unwrap_or(false);
+                    if is_collapsed && contains_active {
+                        fbtn.add_css_class("has-active");
+                    } else {
+                        fbtn.remove_css_class("has-active");
+                    }
+                    nfolds_ref.borrow_mut().push((fbtn, fbox, child_ids));
+                }
+            };
+
             for item in &cfg.layout.sidebar_items {
-                if item == "---" {
+                if let Some(raw_fname) = item.strip_prefix("folder:") {
+                    flush_folder(&mut cur_folder, &nfolds, active_name.as_deref());
+                    let fname = if raw_fname.trim().is_empty() {
+                        "Folder".to_string()
+                    } else {
+                        raw_fname.trim().to_string()
+                    };
+                    let is_collapsed = cfg
+                        .layout
+                        .collapsed_folders
+                        .iter()
+                        .any(|f| f == &fname);
+                    let arrow = if is_collapsed { "▸" } else { "▾" };
+                    let flbl = Label::builder()
+                        .label(&format!("{} {}", arrow, fname))
+                        .halign(gtk4::Align::Start)
+                        .hexpand(true)
+                        .ellipsize(gtk4::pango::EllipsizeMode::End)
+                        .build();
+                    let fbtn = Button::builder()
+                        .child(&flbl)
+                        .css_classes(vec!["sidebar-folder-btn".to_string()])
+                        .tooltip_text(&fname)
+                        .build();
+                    let fbox = Box::builder()
+                        .orientation(Orientation::Vertical)
+                        .spacing(1)
+                        .visible(!is_collapsed)
+                        .css_classes(vec!["sidebar-folder-children".to_string()])
+                        .build();
+
+                    {
+                        let fbox_c = fbox.clone();
+                        let flbl_c = flbl.clone();
+                        let fname_c = fname.clone();
+                        let stk_c = stk.clone();
+                        let nfolds_c = nfolds.clone();
+                        fbtn.connect_clicked(move |btn| {
+                            let next_vis = !fbox_c.is_visible();
+                            fbox_c.set_visible(next_vis);
+                            flbl_c.set_label(&format!(
+                                "{} {}",
+                                if next_vis { "▾" } else { "▸" },
+                                fname_c
+                            ));
+                            config::update(|c| {
+                                c.layout.collapsed_folders.retain(|x| x != &fname_c);
+                                if !next_vis {
+                                    c.layout.collapsed_folders.push(fname_c.clone());
+                                }
+                            });
+                            let cur_act = stk_c.visible_child_name().map(|s| s.to_string());
+                            let has_act = nfolds_c
+                                .borrow()
+                                .iter()
+                                .find(|(b, _, _)| b == btn)
+                                .map(|(_, _, ids)| {
+                                    cur_act
+                                        .as_deref()
+                                        .map(|a| ids.iter().any(|cid| cid == a))
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(false);
+                            if !next_vis && has_act {
+                                btn.add_css_class("has-active");
+                            } else {
+                                btn.remove_css_class("has-active");
+                            }
+                        });
+                    }
+
+                    snav.append(&fbtn);
+                    snav.append(&fbox);
+                    cur_folder = Some((fname, fbtn, flbl, fbox, Vec::new()));
+                } else if item == "/folder" {
+                    flush_folder(&mut cur_folder, &nfolds, active_name.as_deref());
+                } else if item == "---" {
                     let sep = Box::builder()
                         .orientation(Orientation::Horizontal)
                         .height_request(1)
                         .css_classes(vec!["sidebar-sep".to_string()])
                         .build();
-                    snav.append(&sep);
+                    if let Some((_, _, _, ref fbox, _)) = cur_folder {
+                        fbox.append(&sep);
+                    } else {
+                        snav.append(&sep);
+                    }
                 } else if let Some(desc) = compiled.iter().find(|m| m.id == item.as_str()) {
                     let lbl = Label::builder()
                         .label(desc.title)
                         .halign(gtk4::Align::Start)
                         .hexpand(true)
+                        .ellipsize(gtk4::pango::EllipsizeMode::End)
                         .build();
                     let mut classes = vec!["sidebar-nav-btn".to_string()];
                     if active_name.as_deref() == Some(desc.id) {
@@ -1050,10 +1190,16 @@ fn build_ui(
                     btn.connect_clicked(move |_| {
                         stack_click.set_visible_child_name(&id_s);
                     });
-                    snav.append(&btn);
+                    if let Some((_, _, _, ref fbox, ref mut child_ids)) = cur_folder {
+                        fbox.append(&btn);
+                        child_ids.push(desc.id.to_string());
+                    } else {
+                        snav.append(&btn);
+                    }
                     nbtns.borrow_mut().push((desc.id.to_string(), btn));
                 }
             }
+            flush_folder(&mut cur_folder, &nfolds, active_name.as_deref());
         })
     };
 
@@ -1779,8 +1925,8 @@ fn build_ui(
     let tray_widget = tray::build_system_tray();
     let status_strip = tray::build_status_strip();
 
-    // Add everything to the sidebar column in order
-    sidebar_column.append(&sidebar_nav);
+    // Add everything to the sidebar column in order (module list scrolls; bottom chrome stays pinned!)
+    sidebar_column.append(&sidebar_nav_scroll);
     sidebar_column.append(&tray_widget);
     sidebar_column.append(&status_strip);
     sidebar_column.append(&session_row);
@@ -1814,7 +1960,14 @@ fn build_ui(
         })
     };
 
-    // Quick Capture & Color Picker buttons on the right side of the top Workspaces bar
+    // Quick Capture, Color Picker & optional Vim Mode pill on the right side of the top bar
+    let vim_mode_badge = Label::builder()
+        .label("NRM")
+        .css_classes(vec!["vim-mode-pill".to_string()])
+        .valign(gtk4::Align::Center)
+        .tooltip_text("Vim Mode: NRM (Normal) / INS (Insert — Esc to exit)")
+        .visible(false)
+        .build();
     {
         let top_tools = Box::builder()
             .orientation(Orientation::Horizontal)
@@ -1859,6 +2012,7 @@ fn build_ui(
             module_api::launch_color_picker(&close_pick);
         });
 
+        top_tools.append(&vim_mode_badge);
         top_tools.append(&sticky_btn);
         top_tools.append(&cap_btn);
         top_tools.append(&picker_btn);
@@ -1923,21 +2077,43 @@ fn build_ui(
 
     let dash_for_mods = dash_box.clone();
     let nav_buttons_sync = nav_buttons_rc.clone();
+    let nav_folders_sync = nav_folders_rc.clone();
     let slots_sync = module_slots.clone();
     let handles_sync = loaded_handles.clone();
     let ctx_sync = module_ctx.clone();
     let mods_sync = compiled_modules.clone();
+    let win_for_mods = window.clone();
+    let sb_for_mods = sidebar_clamp.clone();
 
     stack.connect_visible_child_name_notify(move |stk| {
         let current = stk.visible_child_name();
         let name = current.as_deref();
 
+        let mut active_btn_widget: Option<gtk4::Widget> = None;
         for (id, btn) in nav_buttons_sync.borrow().iter() {
             if name == Some(id.as_str()) {
                 btn.add_css_class("selected");
+                if btn.is_mapped() {
+                    active_btn_widget = Some(btn.clone().upcast());
+                }
             } else {
                 btn.remove_css_class("selected");
             }
+        }
+        for (fbtn, fbox, child_ids) in nav_folders_sync.borrow().iter() {
+            let is_collapsed = !fbox.is_visible();
+            let contains_active = name
+                .map(|a| child_ids.iter().any(|cid| cid == a))
+                .unwrap_or(false);
+            if is_collapsed && contains_active {
+                fbtn.add_css_class("has-active");
+                active_btn_widget = Some(fbtn.clone().upcast());
+            } else {
+                fbtn.remove_css_class("has-active");
+            }
+        }
+        if let Some(ref w) = active_btn_widget {
+            vim_scroll_into_view(w);
         }
 
         // Hide inactive detail panes, invoke on_hide, and unload stateless modules
@@ -1996,6 +2172,15 @@ fn build_ui(
                     if let Some(ref show_cb) = h.on_show {
                         show_cb();
                     }
+                }
+                let vcfg = config::get().bindings.vim;
+                if vcfg.enabled && vcfg.start_in_normal {
+                    let w_n = win_for_mods.clone();
+                    let s_n = stk.clone();
+                    let sb_n = sb_for_mods.clone();
+                    glib::idle_add_local_once(move || {
+                        vim_exit_insert_to_normal(&w_n, &s_n, sb_n.upcast_ref());
+                    });
                 }
             }
         }
@@ -2067,6 +2252,7 @@ fn build_ui(
         let we_w = weather_sidebar_btn.clone();
         let cl_w = clock_btn.clone();
         let rl_w = reload_btn.clone();
+        let vb_w = vim_mode_badge.clone();
 
         Rc::new(move || {
             let cfg = config::get();
@@ -2125,7 +2311,7 @@ fn build_ui(
             stk_l.set_size_request(stack_w, -1);
             win_l.set_size_request((pw + 456).max(TOTAL_DASH_WIDTH) + TRIGGER_WIDTH, -1);
 
-            // 4. Chrome toggles
+            // 4. Chrome toggles & Vim mode indicator
             ws_w.set_visible(lay.chrome.show_top_bar);
             tr_w.set_visible(lay.chrome.show_tray);
             st_w.set_visible(lay.chrome.show_status_strip);
@@ -2134,6 +2320,7 @@ fn build_ui(
             we_w.set_visible(lay.chrome.show_weather);
             cl_w.set_visible(lay.chrome.show_clock);
             rl_w.set_visible(lay.chrome.show_reload_btn);
+            vim_sync_indicator(&win_l, &vb_w, &db_l);
 
             // 5. Monitor pinning & hitbox refresh
             move_to_monitor(&win_l, None);
@@ -2141,6 +2328,14 @@ fn build_ui(
         })
     };
     *layout_rebuild_slot.borrow_mut() = Some(apply_layout_and_chrome.clone());
+
+    {
+        let vb_f = vim_mode_badge.clone();
+        let db_f = dash_box.clone();
+        window.connect_focus_widget_notify(move |win| {
+            vim_sync_indicator(win, &vb_f, &db_f);
+        });
+    }
 
     let win_motion = EventControllerMotion::new();
     let btn_motion = trigger_btn.clone();
@@ -2203,6 +2398,7 @@ fn build_ui(
     let media_for_toggle = media_handle.clone();
     let stickies_for_toggle = stickies_handle.clone();
     let stack_for_open = stack.clone();
+    let sidebar_for_open = sidebar_clamp.clone();
     let window_clone = window.clone();
     let hovered_click = is_hovered.clone();
     let open_click = is_open.clone();
@@ -2237,10 +2433,22 @@ fn build_ui(
                     }
                 }
             }
+            {
+                let vcfg = config::get().bindings.vim;
+                if vcfg.enabled && vcfg.start_in_normal {
+                    vim_exit_insert_to_normal(
+                        &window_clone,
+                        &stack_for_open,
+                        sidebar_for_open.upcast_ref(),
+                    );
+                }
+            }
 
             let open_kb = open_click.clone();
             let stk_kb = stack_for_open.clone();
             let handles_kb = handles_toggle.clone();
+            let win_kb = window_clone.clone();
+            let sb_kb = sidebar_for_open.clone();
             glib::timeout_add_local_once(Duration::from_millis(80), move || {
                 if open_kb.get() {
                     if let Some(cur) = stk_kb.visible_child_name() {
@@ -2249,6 +2457,10 @@ fn build_ui(
                                 show_cb();
                             }
                         }
+                    }
+                    let vcfg = config::get().bindings.vim;
+                    if vcfg.enabled && vcfg.start_in_normal {
+                        vim_exit_insert_to_normal(&win_kb, &stk_kb, sb_kb.upcast_ref());
                     }
                 }
             });
@@ -2298,15 +2510,19 @@ fn build_ui(
     let btn_esc = trigger_btn.clone();
     let open_esc = is_open.clone();
     let stack_kbd = stack.clone();
+    let win_kbd = window.clone();
+    let sb_kbd = sidebar_clamp.clone();
+    let handles_kbd = loaded_handles.clone();
+    let pending_chord: Rc<RefCell<Option<(char, std::time::Instant)>>> =
+        Rc::new(RefCell::new(None));
+
     key_controller.connect_key_pressed(move |_, key, _, mods| {
         if !open_esc.get() {
             return glib::Propagation::Proceed;
         }
         let bcfg = config::get().bindings;
-        if key == gdk::Key::Escape && bcfg.esc_to_close {
-            btn_esc.emit_clicked();
-            return glib::Propagation::Stop;
-        }
+
+        // 1. Ctrl/Alt + 1..9 Quick Tab Jump (works in both Normal and Insert modes)
         if bcfg.tab_jump_enabled {
             let want_mod = if bcfg.tab_jump_mod.eq_ignore_ascii_case("alt") {
                 mods.contains(gdk::ModifierType::ALT_MASK)
@@ -2327,11 +2543,12 @@ fn build_ui(
                     _ => None,
                 };
                 if let Some(idx) = digit {
+                    *pending_chord.borrow_mut() = None;
                     let loaded_tabs: Vec<String> = config::get()
                         .layout
                         .sidebar_items
                         .into_iter()
-                        .filter(|it| it != "---")
+                        .filter(|it| config::is_sidebar_tab_id(it))
                         .collect();
                     if let Some(tab_id) = loaded_tabs.get(idx) {
                         stack_kbd.set_visible_child_name(tab_id);
@@ -2339,6 +2556,30 @@ fn build_ui(
                     }
                 }
             }
+        }
+
+        // 2. Classic non-Vim behavior when Vim mode is disabled
+        if !bcfg.vim.enabled {
+            if key == gdk::Key::Escape && bcfg.esc_to_close {
+                btn_esc.emit_clicked();
+                return glib::Propagation::Stop;
+            }
+            return glib::Propagation::Proceed;
+        }
+
+        // 3. Modal Vim Navigation Engine
+        if vim_handle_key_press(
+            key,
+            mods,
+            &bcfg,
+            &win_kbd,
+            &stack_kbd,
+            sb_kbd.upcast_ref(),
+            &handles_kbd,
+            &btn_esc,
+            &pending_chord,
+        ) {
+            return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
     });
@@ -2454,5 +2695,799 @@ fn build_ui(
         is_open,
         stack,
         reload_theme,
+    }
+}
+
+// ==========================================
+// MODAL VIM NAVIGATION ENGINE
+// ==========================================
+
+fn vim_is_text_input(w: &gtk4::Widget) -> bool {
+    let mut cur = Some(w.clone());
+    for _ in 0..4 {
+        let Some(node) = cur else { break };
+        if node.is::<gtk4::Text>()
+            || node.is::<gtk4::Entry>()
+            || node.is::<gtk4::SearchEntry>()
+            || node.is::<gtk4::PasswordEntry>()
+            || node.is::<gtk4::SpinButton>()
+            || node.is::<gtk4::TextView>()
+        {
+            return true;
+        }
+        cur = node.parent();
+    }
+    false
+}
+
+fn vim_sync_indicator(win: &ApplicationWindow, badge: &Label, dash_box: &Box) {
+    let vcfg = config::get().bindings.vim;
+    if vcfg.enabled {
+        dash_box.add_css_class("vim-enabled");
+    } else {
+        dash_box.remove_css_class("vim-enabled");
+    }
+    badge.set_visible(vcfg.enabled && vcfg.show_mode_badge);
+    if vcfg.enabled {
+        let is_ins = GtkWindowExt::focus(win)
+            .as_ref()
+            .map(vim_is_text_input)
+            .unwrap_or(false);
+        if is_ins {
+            badge.set_label("INS");
+            badge.add_css_class("insert");
+        } else {
+            badge.set_label("NRM");
+            badge.remove_css_class("insert");
+        }
+    }
+}
+
+fn vim_find_open_popover(root: &gtk4::Widget) -> Option<gtk4::Popover> {
+    if let Some(pop) = root.downcast_ref::<gtk4::Popover>() {
+        if pop.is_visible() {
+            return Some(pop.clone());
+        }
+    }
+    let mut child = root.first_child();
+    while let Some(c) = child {
+        let next = c.next_sibling();
+        if c.is_visible() {
+            if let Some(found) = vim_find_open_popover(&c) {
+                return Some(found);
+            }
+        }
+        child = next;
+    }
+    None
+}
+
+fn vim_collect_buttons(root: &gtk4::Widget, allow_root_popover: bool, out: &mut Vec<gtk4::Widget>) {
+    if !root.is_visible() || !root.is_sensitive() {
+        return;
+    }
+    if !allow_root_popover && root.is::<gtk4::Popover>() {
+        return;
+    }
+    if root.is::<gtk4::SearchEntry>()
+        || root.is::<gtk4::Entry>()
+        || root.is::<gtk4::PasswordEntry>()
+        || root.is::<gtk4::SpinButton>()
+        || root.is::<gtk4::TextView>()
+        || root.is::<gtk4::Text>()
+    {
+        return;
+    }
+    if root.is::<gtk4::Button>()
+        || root.is::<gtk4::ToggleButton>()
+        || root.is::<gtk4::CheckButton>()
+        || root.is::<gtk4::Switch>()
+        || root.is::<gtk4::Scale>()
+        || root.is::<gtk4::DropDown>()
+        || root.is::<gtk4::Calendar>()
+    {
+        if root.can_focus() && root.is_mapped() {
+            out.push(root.clone());
+        }
+        return;
+    }
+    if let Some(stk) = root.downcast_ref::<gtk4::Stack>() {
+        if let Some(vis) = stk.visible_child() {
+            vim_collect_buttons(&vis, false, out);
+        }
+        return;
+    }
+    let mut child = root.first_child();
+    while let Some(c) = child {
+        let next = c.next_sibling();
+        vim_collect_buttons(&c, false, out);
+        child = next;
+    }
+}
+
+fn vim_collect_text_inputs(
+    root: &gtk4::Widget,
+    searches: &mut Vec<gtk4::Widget>,
+    others: &mut Vec<gtk4::Widget>,
+) {
+    if !root.is_visible() || !root.is_sensitive() || root.is::<gtk4::Popover>() {
+        return;
+    }
+    if root.is::<gtk4::SearchEntry>() {
+        if root.is_mapped() {
+            searches.push(root.clone());
+        }
+        return;
+    }
+    if root.is::<gtk4::Entry>()
+        || root.is::<gtk4::PasswordEntry>()
+        || root.is::<gtk4::SpinButton>()
+        || root.is::<gtk4::TextView>()
+    {
+        if root.is_mapped() {
+            others.push(root.clone());
+        }
+        return;
+    }
+    if let Some(stk) = root.downcast_ref::<gtk4::Stack>() {
+        if let Some(vis) = stk.visible_child() {
+            vim_collect_text_inputs(&vis, searches, others);
+        }
+        return;
+    }
+    let mut child = root.first_child();
+    while let Some(c) = child {
+        let next = c.next_sibling();
+        vim_collect_text_inputs(&c, searches, others);
+        child = next;
+    }
+}
+
+fn vim_scroll_into_view(target: &gtk4::Widget) {
+    let mut cur = target.parent();
+    while let Some(p) = cur {
+        if let Some(sw) = p.downcast_ref::<gtk4::ScrolledWindow>() {
+            if sw.vscrollbar_policy() != gtk4::PolicyType::Never {
+                if let Some(content) = sw.child() {
+                    if let Some(bounds) = target.compute_bounds(&content) {
+                        let vadj = sw.vadjustment();
+                        let page = vadj.page_size();
+                        let cur_v = vadj.value();
+                        let top = bounds.y() as f64;
+                        let bot = (bounds.y() + bounds.height()) as f64;
+                        let pad = 12.0;
+                        if top - pad < cur_v {
+                            vadj.set_value((top - pad).max(vadj.lower()));
+                        } else if bot + pad > cur_v + page && page > 0.0 {
+                            let max_v = (vadj.upper() - page).max(vadj.lower());
+                            vadj.set_value((bot + pad - page).min(max_v));
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        cur = p.parent();
+    }
+}
+
+fn vim_focus_widget(target: &gtk4::Widget) {
+    target.grab_focus();
+    vim_scroll_into_view(target);
+}
+
+fn vim_exit_insert_to_normal(win: &ApplicationWindow, stack: &Stack, sidebar: &gtk4::Widget) {
+    if let Some(tab_root) = stack.visible_child() {
+        let mut btns = Vec::new();
+        vim_collect_buttons(&tab_root, false, &mut btns);
+        if let Some(first) = btns.first() {
+            vim_focus_widget(first);
+            return;
+        }
+    }
+    let mut sb_btns = Vec::new();
+    vim_collect_buttons(sidebar, false, &mut sb_btns);
+    for b in &sb_btns {
+        if b.has_css_class("selected") {
+            vim_focus_widget(b);
+            return;
+        }
+    }
+    if let Some(first) = sb_btns.first() {
+        vim_focus_widget(first);
+    } else {
+        GtkWindowExt::set_focus(win, None::<&gtk4::Widget>);
+    }
+}
+
+fn vim_visual_rows(
+    pane: &gtk4::Widget,
+    items: &[gtk4::Widget],
+) -> Vec<Vec<(gtk4::Widget, f64)>> {
+    let mut coords: Vec<(gtk4::Widget, f64, f64)> = items
+        .iter()
+        .map(|w| {
+            if let Some(b) = w.compute_bounds(pane) {
+                (
+                    w.clone(),
+                    (b.x() + b.width() * 0.5) as f64,
+                    (b.y() + b.height() * 0.5) as f64,
+                )
+            } else {
+                (w.clone(), 0.0, 0.0)
+            }
+        })
+        .collect();
+
+    coords.sort_by(|a, b| {
+        a.2.partial_cmp(&b.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let mut rows: Vec<(f64, Vec<(gtk4::Widget, f64)>)> = Vec::new();
+    for (w, cx, cy) in coords {
+        if let Some((row_y, list)) = rows.last_mut() {
+            if (cy - *row_y).abs() <= 14.0 {
+                list.push((w, cx));
+                continue;
+            }
+        }
+        rows.push((cy, vec![(w, cx)]));
+    }
+    for (_, list) in &mut rows {
+        list.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    rows.into_iter().map(|(_, list)| list).collect()
+}
+
+fn vim_locate_in_rows(
+    focused: Option<&gtk4::Widget>,
+    rows: &[Vec<(gtk4::Widget, f64)>],
+) -> Option<(usize, usize, f64)> {
+    let f = focused?;
+    let mut cur = Some(f.clone());
+    for _ in 0..4 {
+        let Some(ref node) = cur else { break };
+        for (ri, row) in rows.iter().enumerate() {
+            for (ci, (w, cx)) in row.iter().enumerate() {
+                if w == node {
+                    return Some((ri, ci, *cx));
+                }
+            }
+        }
+        cur = node.parent();
+    }
+    None
+}
+
+enum VimMove {
+    Down(usize),
+    Up(usize),
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+fn vim_move_in_pane(
+    pane: &gtk4::Widget,
+    allow_root_popover: bool,
+    focused: Option<&gtk4::Widget>,
+    mv: VimMove,
+) -> bool {
+    let mut items = Vec::new();
+    vim_collect_buttons(pane, allow_root_popover, &mut items);
+    if items.is_empty() {
+        return false;
+    }
+    let rows = vim_visual_rows(pane, &items);
+    if rows.is_empty() {
+        return false;
+    }
+
+    let pos = vim_locate_in_rows(focused, &rows);
+    let pick_closest_x = |row: &[(gtk4::Widget, f64)], target_x: f64| -> gtk4::Widget {
+        row.iter()
+            .min_by(|a, b| {
+                (a.1 - target_x)
+                    .abs()
+                    .partial_cmp(&(b.1 - target_x).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(w, _)| w.clone())
+            .unwrap_or_else(|| row[0].0.clone())
+    };
+
+    match mv {
+        VimMove::Top => {
+            vim_focus_widget(&rows[0][0].0);
+            true
+        }
+        VimMove::Bottom => {
+            if let Some(last_row) = rows.last() {
+                vim_focus_widget(&last_row[0].0);
+            }
+            true
+        }
+        VimMove::Down(step) => {
+            if let Some((ri, _, cx)) = pos {
+                let next_ri = (ri + step).min(rows.len() - 1);
+                vim_focus_widget(&pick_closest_x(&rows[next_ri], cx));
+            } else {
+                vim_focus_widget(&rows[0][0].0);
+            }
+            true
+        }
+        VimMove::Up(step) => {
+            if let Some((ri, _, cx)) = pos {
+                let prev_ri = ri.saturating_sub(step);
+                vim_focus_widget(&pick_closest_x(&rows[prev_ri], cx));
+            } else if let Some(last_row) = rows.last() {
+                vim_focus_widget(&last_row[0].0);
+            }
+            true
+        }
+        VimMove::Left => {
+            if let Some((ri, ci, _)) = pos {
+                if ci > 0 {
+                    vim_focus_widget(&rows[ri][ci - 1].0);
+                    return true;
+                }
+            }
+            false
+        }
+        VimMove::Right => {
+            if let Some((ri, ci, _)) = pos {
+                if ci + 1 < rows[ri].len() {
+                    vim_focus_widget(&rows[ri][ci + 1].0);
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+fn vim_trigger_context_menu(focused: &gtk4::Widget, win: &ApplicationWindow) -> bool {
+    let mut candidates = vec![focused.clone()];
+    if let Some(p) = focused.parent() {
+        candidates.push(p);
+    }
+    if let Some(c) = focused.first_child() {
+        candidates.push(c);
+    }
+
+    for cand in candidates {
+        let ctrls = cand.observe_controllers();
+        for i in 0..ctrls.n_items() {
+            let Some(obj) = ctrls.item(i) else { continue };
+            if let Ok(gc) = obj.downcast::<gtk4::GestureClick>() {
+                if GestureSingleExt::button(&gc) == 3 {
+                    gc.emit_by_name::<()>("pressed", &[&1i32, &12.0f64, &12.0f64]);
+                    let win_c = win.clone();
+                    glib::timeout_add_local_once(Duration::from_millis(30), move || {
+                        if let Some(pop) = vim_find_open_popover(win_c.upcast_ref()) {
+                            let mut pop_btns = Vec::new();
+                            vim_collect_buttons(pop.upcast_ref(), true, &mut pop_btns);
+                            if let Some(first) = pop_btns.first() {
+                                first.grab_focus();
+                            }
+                        }
+                    });
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn vim_cycle_tab(stack: &Stack, delta: isize) {
+    let loaded_tabs: Vec<String> = config::get()
+        .layout
+        .sidebar_items
+        .into_iter()
+        .filter(|it| config::is_sidebar_tab_id(it))
+        .collect();
+    if loaded_tabs.is_empty() {
+        return;
+    }
+    let cur = stack.visible_child_name();
+    let cur_idx = cur
+        .as_deref()
+        .and_then(|id| loaded_tabs.iter().position(|t| t == id))
+        .unwrap_or(0);
+    let len = loaded_tabs.len() as isize;
+    let next_idx = ((cur_idx as isize + delta) % len + len) as usize % loaded_tabs.len();
+    stack.set_visible_child_name(&loaded_tabs[next_idx]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vim_handle_key_press(
+    key: gdk::Key,
+    mods: gdk::ModifierType,
+    bcfg: &config::BindingsConfig,
+    win: &ApplicationWindow,
+    stack: &Stack,
+    sidebar: &gtk4::Widget,
+    handles: &Rc<RefCell<std::collections::HashMap<String, module_api::ModuleHandle>>>,
+    close_btn: &Button,
+    pending_chord: &Rc<RefCell<Option<(char, std::time::Instant)>>>,
+) -> bool {
+    // Ignore bare modifier keys so chords aren't cleared when pressing Shift!
+    if matches!(
+        key,
+        gdk::Key::Shift_L
+            | gdk::Key::Shift_R
+            | gdk::Key::Control_L
+            | gdk::Key::Control_R
+            | gdk::Key::Alt_L
+            | gdk::Key::Alt_R
+            | gdk::Key::Super_L
+            | gdk::Key::Super_R
+            | gdk::Key::Caps_Lock
+    ) {
+        return false;
+    }
+
+    let focused = GtkWindowExt::focus(win);
+    let in_insert = focused.as_ref().map(vim_is_text_input).unwrap_or(false);
+    let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+    let alt = mods.contains(gdk::ModifierType::ALT_MASK);
+    let sup = mods.contains(gdk::ModifierType::SUPER_MASK);
+
+    if alt || sup {
+        *pending_chord.borrow_mut() = None;
+        return false;
+    }
+
+    let is_esc = key == gdk::Key::Escape || (ctrl && key == gdk::Key::bracketleft);
+
+    // --- A. OPEN POPOVER CONTEXT MENU NAVIGATION ---
+    if let Some(pop) = vim_find_open_popover(win.upcast_ref()) {
+        *pending_chord.borrow_mut() = None;
+        let pop_w: &gtk4::Widget = pop.upcast_ref();
+        if is_esc {
+            let parent_row = pop.parent();
+            pop.popdown();
+            if let Some(p) = parent_row {
+                let mut btns = Vec::new();
+                vim_collect_buttons(&p, false, &mut btns);
+                if let Some(b) = btns.first() {
+                    b.grab_focus();
+                } else if p.can_focus() {
+                    p.grab_focus();
+                }
+            }
+            return true;
+        }
+        if !in_insert {
+            let ch_s = key.to_unicode().map(|c| c.to_string()).unwrap_or_default();
+            let v = &bcfg.vim;
+            if ch_s == v.close {
+                pop.popdown();
+                return true;
+            }
+            if ch_s == v.down || key == gdk::Key::Down || (ctrl && (key == gdk::Key::j || key == gdk::Key::n)) {
+                return vim_move_in_pane(pop_w, true, focused.as_ref(), VimMove::Down(1));
+            }
+            if ch_s == v.up || key == gdk::Key::Up || (ctrl && (key == gdk::Key::k || key == gdk::Key::p)) {
+                return vim_move_in_pane(pop_w, true, focused.as_ref(), VimMove::Up(1));
+            }
+            if ch_s == v.bottom {
+                return vim_move_in_pane(pop_w, true, focused.as_ref(), VimMove::Bottom);
+            }
+            if ch_s == v.top {
+                return vim_move_in_pane(pop_w, true, focused.as_ref(), VimMove::Top);
+            }
+        }
+        return false;
+    }
+
+    // --- B. INSERT MODE (inside SearchEntry / Entry / TextView) ---
+    if in_insert {
+        *pending_chord.borrow_mut() = None;
+        if is_esc {
+            vim_exit_insert_to_normal(win, stack, sidebar);
+            return true;
+        }
+        // Telescope / fzf shortcut: Ctrl+j / Ctrl+n steps straight out of SearchEntry into results!
+        if ctrl && (key == gdk::Key::j || key == gdk::Key::n) {
+            vim_exit_insert_to_normal(win, stack, sidebar);
+            return true;
+        }
+        if ctrl && (key == gdk::Key::k || key == gdk::Key::p) {
+            vim_exit_insert_to_normal(win, stack, sidebar);
+            return true;
+        }
+        return false;
+    }
+
+    // --- C. DETERMINE ORDERED PANES (Visual Left -> Right) ---
+    let active_tab_id = stack.visible_child_name();
+    let detail_pane: Option<gtk4::Widget> = active_tab_id.as_deref().and_then(|id| {
+        handles
+            .borrow()
+            .get(id)
+            .and_then(|h| h.detail_pane.clone())
+            .filter(|dp| dp.is_visible())
+    });
+    let tab_pane: Option<gtk4::Widget> = stack.visible_child();
+
+    let is_right_layout = config::get().layout.side == "right";
+    let mut panes: Vec<gtk4::Widget> = Vec::with_capacity(3);
+    if is_right_layout {
+        if let Some(ref dp) = detail_pane {
+            panes.push(dp.clone());
+        }
+        if let Some(ref tp) = tab_pane {
+            panes.push(tp.clone());
+        }
+        panes.push(sidebar.clone());
+    } else {
+        panes.push(sidebar.clone());
+        if let Some(ref tp) = tab_pane {
+            panes.push(tp.clone());
+        }
+        if let Some(ref dp) = detail_pane {
+            panes.push(dp.clone());
+        }
+    }
+
+    let cur_pane_idx: usize = focused
+        .as_ref()
+        .and_then(|fw| panes.iter().position(|p| fw.is_ancestor(p) || fw == p))
+        .or_else(|| {
+            tab_pane
+                .as_ref()
+                .and_then(|tp| panes.iter().position(|p| p == tp))
+        })
+        .unwrap_or(0);
+    let active_pane = &panes[cur_pane_idx];
+
+    // --- D. NORMAL MODE: ESC & CTRL SHORTCUTS ---
+    if is_esc {
+        *pending_chord.borrow_mut() = None;
+        if let Some(ref dp) = detail_pane {
+            dp.set_visible(false);
+            if let Some(id) = active_tab_id.as_deref() {
+                if let Some(h) = handles.borrow().get(id) {
+                    if let Some(ref hide_cb) = h.on_hide {
+                        hide_cb();
+                    }
+                }
+            }
+            vim_exit_insert_to_normal(win, stack, sidebar);
+            return true;
+        }
+        if bcfg.esc_to_close {
+            close_btn.emit_clicked();
+            return true;
+        }
+        return false;
+    }
+
+    if ctrl {
+        *pending_chord.borrow_mut() = None;
+        return match key {
+            gdk::Key::d => vim_move_in_pane(active_pane, false, focused.as_ref(), VimMove::Down(6)),
+            gdk::Key::u => vim_move_in_pane(active_pane, false, focused.as_ref(), VimMove::Up(6)),
+            gdk::Key::j | gdk::Key::n => {
+                vim_move_in_pane(active_pane, false, focused.as_ref(), VimMove::Down(1))
+            }
+            gdk::Key::k | gdk::Key::p => {
+                vim_move_in_pane(active_pane, false, focused.as_ref(), VimMove::Up(1))
+            }
+            _ => false,
+        };
+    }
+
+    // Activate focused button on Enter (in case a container widget isn't handling Return)
+    if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
+        *pending_chord.borrow_mut() = None;
+        if let Some(ref fw) = focused {
+            if let Some(btn) = fw.downcast_ref::<gtk4::Button>() {
+                btn.emit_clicked();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // --- E. NORMAL MODE: SINGLE-KEY & 2-KEY CHORD DISPATCH ---
+    let Some(ch) = key.to_unicode().filter(|c| !c.is_control()) else {
+        *pending_chord.borrow_mut() = None;
+        return false;
+    };
+
+    let now = std::time::Instant::now();
+    let prev_char = pending_chord
+        .borrow_mut()
+        .take()
+        .and_then(|(pc, ts)| if now.duration_since(ts).as_millis() <= 500 { Some(pc) } else { None });
+
+    let v = &bcfg.vim;
+    let candidates: [(&str, &str); 14] = [
+        (&v.down, "down"),
+        (&v.up, "up"),
+        (&v.left, "left"),
+        (&v.right, "right"),
+        (&v.pane_left, "pane_left"),
+        (&v.pane_right, "pane_right"),
+        (&v.next_tab, "next_tab"),
+        (&v.prev_tab, "prev_tab"),
+        (&v.top, "top"),
+        (&v.bottom, "bottom"),
+        (&v.search, "search"),
+        (&v.insert, "insert"),
+        (&v.context_menu, "menu"),
+        (&v.close, "close"),
+    ];
+
+    let mut matched_action: Option<&str> = None;
+    if let Some(pc) = prev_char {
+        let two = format!("{}{}", pc, ch);
+        for &(bind, act) in &candidates {
+            if bind == two {
+                matched_action = Some(act);
+                break;
+            }
+        }
+    }
+
+    if matched_action.is_none() {
+        let one = ch.to_string();
+        for &(bind, act) in &candidates {
+            if bind == one {
+                matched_action = Some(act);
+                break;
+            }
+        }
+        // Check if `ch` is the first character of any configured 2-char chord (e.g. "gg")
+        if matched_action.is_none() {
+            let starts_chord = candidates.iter().any(|&(bind, _)| {
+                let mut chars = bind.chars();
+                chars.next() == Some(ch) && chars.next().is_some() && chars.next().is_none()
+            });
+            if starts_chord {
+                *pending_chord.borrow_mut() = Some((ch, now));
+                return true;
+            }
+        }
+    }
+
+    let Some(action) = matched_action else {
+        return false;
+    };
+
+    let jump_pane = |target_idx: usize| -> bool {
+        if let Some(target_pane) = panes.get(target_idx) {
+            let mut btns = Vec::new();
+            vim_collect_buttons(target_pane, false, &mut btns);
+            if target_pane == sidebar {
+                for b in &btns {
+                    if b.has_css_class("selected") {
+                        vim_focus_widget(b);
+                        return true;
+                    }
+                }
+            }
+            if let Some(first) = btns.first() {
+                vim_focus_widget(first);
+                return true;
+            }
+        }
+        false
+    };
+
+    match action {
+        "down" => vim_move_in_pane(active_pane, false, focused.as_ref(), VimMove::Down(1)),
+        "up" => vim_move_in_pane(active_pane, false, focused.as_ref(), VimMove::Up(1)),
+        "left" => {
+            if vim_move_in_pane(active_pane, false, focused.as_ref(), VimMove::Left) {
+                true
+            } else if cur_pane_idx > 0 {
+                jump_pane(cur_pane_idx - 1)
+            } else {
+                true
+            }
+        }
+        "right" => {
+            if vim_move_in_pane(active_pane, false, focused.as_ref(), VimMove::Right) {
+                true
+            } else if cur_pane_idx + 1 < panes.len() {
+                jump_pane(cur_pane_idx + 1)
+            } else {
+                true
+            }
+        }
+        "pane_left" => {
+            if cur_pane_idx > 0 {
+                jump_pane(cur_pane_idx - 1)
+            } else {
+                true
+            }
+        }
+        "pane_right" => {
+            if cur_pane_idx + 1 < panes.len() {
+                jump_pane(cur_pane_idx + 1)
+            } else {
+                true
+            }
+        }
+        "next_tab" => {
+            vim_cycle_tab(stack, 1);
+            true
+        }
+        "prev_tab" => {
+            vim_cycle_tab(stack, -1);
+            true
+        }
+        "top" => vim_move_in_pane(active_pane, false, focused.as_ref(), VimMove::Top),
+        "bottom" => vim_move_in_pane(active_pane, false, focused.as_ref(), VimMove::Bottom),
+        "search" | "insert" => {
+            let search_first = action == "search";
+            // Search active pane first, then active tab pane
+            let mut searches = Vec::new();
+            let mut others = Vec::new();
+            vim_collect_text_inputs(active_pane, &mut searches, &mut others);
+            if searches.is_empty() && others.is_empty() {
+                if let Some(ref tp) = tab_pane {
+                    vim_collect_text_inputs(tp, &mut searches, &mut others);
+                }
+            }
+            let target = if search_first {
+                searches.first().or_else(|| others.first())
+            } else {
+                // If focused row has a sibling Entry (e.g. Settings / Keybinds), prefer that!
+                let sibling_entry = focused.as_ref().and_then(|fw| {
+                    let parent = fw.parent()?;
+                    let mut s = Vec::new();
+                    let mut o = Vec::new();
+                    vim_collect_text_inputs(&parent, &mut s, &mut o);
+                    o.into_iter().next().or_else(|| s.into_iter().next())
+                });
+                sibling_entry
+                    .as_ref()
+                    .or_else(|| searches.first())
+                    .or_else(|| others.first())
+                    .cloned()
+                    .as_ref()
+                    .cloned()
+                    .map(|w| {
+                        vim_focus_widget(&w);
+                    });
+                return true;
+            };
+            if let Some(w) = target {
+                vim_focus_widget(w);
+            }
+            true
+        }
+        "menu" => {
+            if let Some(ref fw) = focused {
+                vim_trigger_context_menu(fw, win)
+            } else {
+                false
+            }
+        }
+        "close" => {
+            if let Some(ref dp) = detail_pane {
+                dp.set_visible(false);
+                if let Some(id) = active_tab_id.as_deref() {
+                    if let Some(h) = handles.borrow().get(id) {
+                        if let Some(ref hide_cb) = h.on_hide {
+                            hide_cb();
+                        }
+                    }
+                }
+                vim_exit_insert_to_normal(win, stack, sidebar);
+            } else {
+                close_btn.emit_clicked();
+            }
+            true
+        }
+        _ => false,
     }
 }

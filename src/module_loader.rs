@@ -45,7 +45,7 @@ pub const OFFICIAL_MODULE_HASHES: &[(&str, &str)] = &[
     ("plans.rs", "bd62245632ee80187a433ad6e430a87ae1d69bae0899d95c279d5d8fb58ce28f"),
     ("scicalc.rs", "19fbcb7574e64ec0909b68e9b6d672415dd02ce83f4589f5ab7abb14c18657b1"),
     ("services.rs", "a206cea689861b7c299dd860673a026f4d907ae26e73585abca34e2d26152ced"),
-    ("system.rs", "c0af8c36188a108332b3c086b9f2c9a405130ad89872da80d0f555a703663974"),
+    ("system.rs", "568d54d386d13e41ec23bb0148f8dc7309468ab815ba686c95816e6e657690a7"),
     ("tasks.rs", "a79e5a241e48a4cd516eadd09397ec4fc7749447c51a7c4147be4dab37cbeb22"),
     ("timers.rs", "05dcbd81c7c3ffa1f9cdd1e0cfa4da30e49a30f3e0291e5f25d6a5f2b578b57b"),
     ("usb_drives.rs", "c25e7f109678498ffbbf3e2f561f40e8c57a2693d0007c66cb0155882cb6d390"),

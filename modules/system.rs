@@ -6747,13 +6747,76 @@ fn render_settings_page(
     );
 
     // ------------------------------------------
-    // 1d2. SIDEBAR TABS & SEPARATORS (2-PANEL DRAG & DROP EDITOR)
+    // 1d2. SIDEBAR TABS, FOLDERS & SEPARATORS (2-PANEL DRAG & DROP EDITOR)
     // ------------------------------------------
     let tabs_ed_card = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(8)
         .css_classes(vec!["plan-check-row".to_string()])
         .build();
+
+    tabs_ed_card.append(
+        &Label::builder()
+            .label("Create collapsible folders, then drag tabs between the folder header and '└─ End Folder' to group them!")
+            .halign(Align::Start)
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build(),
+    );
+
+    let folder_create_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let new_folder_entry = Entry::builder()
+        .placeholder_text("New folder name (e.g. Tools, Storage)...")
+        .hexpand(true)
+        .build();
+    let add_folder_btn = Button::builder()
+        .label("+ Folder")
+        .css_classes(vec!["primary-btn".to_string()])
+        .tooltip_text("Insert a collapsible folder block into Loaded tabs")
+        .build();
+    {
+        let nf_e = new_folder_entry.clone();
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        let add_folder_action: Rc<dyn Fn()> = Rc::new(move || {
+            let raw = nf_e.text().trim().replace('\n', " ");
+            crate::config::update(|c| {
+                let base = if raw.is_empty() {
+                    "Folder".to_string()
+                } else {
+                    raw.clone()
+                };
+                let mut candidate = base.clone();
+                let mut n = 2usize;
+                while c
+                    .layout
+                    .sidebar_items
+                    .iter()
+                    .any(|it| it.strip_prefix("folder:").map(|f| f.trim() == candidate).unwrap_or(false))
+                {
+                    candidate = format!("{} {}", base, n);
+                    n += 1;
+                }
+                c.layout.sidebar_items.push(format!("folder:{}", candidate));
+                c.layout.sidebar_items.push("/folder".to_string());
+                crate::config::sync_visible_tabs_from_sidebar(c);
+            });
+            app_t();
+            render_settings_page(&c_box, &rel_t, &app_t);
+        });
+        let a1 = add_folder_action.clone();
+        add_folder_btn.connect_clicked(move |_| a1());
+        let a2 = add_folder_action.clone();
+        new_folder_entry.connect_activate(move |_| a2());
+    }
+    folder_create_row.append(&new_folder_entry);
+    folder_create_row.append(&add_folder_btn);
+    tabs_ed_card.append(&folder_create_row);
 
     let tabs_ed_top = Box::builder()
         .orientation(Orientation::Horizontal)
@@ -6792,6 +6855,7 @@ fn render_settings_page(
                     .iter()
                     .map(|s| s.to_string())
                     .collect();
+                c.layout.collapsed_folders.clear();
                 crate::config::sync_visible_tabs_from_sidebar(c);
             });
             app_t();
@@ -6897,16 +6961,28 @@ fn render_settings_page(
         .build();
 
     let mut loaded_tab_count = 0usize;
+    let mut in_folder = false;
     for (idx, item) in cfg.layout.sidebar_items.iter().enumerate() {
         let is_sep = item == "---";
-        if !is_sep {
+        let is_folder_end = item == "/folder";
+        let folder_title = item.strip_prefix("folder:");
+
+        if folder_title.is_some() {
+            in_folder = true;
+        } else if is_folder_end {
+            in_folder = false;
+        } else if !is_sep {
             loaded_tab_count += 1;
         }
+
         let row = Box::builder()
             .orientation(Orientation::Horizontal)
             .spacing(4)
             .css_classes(vec!["plan-edit-row".to_string()])
             .build();
+        if in_folder && folder_title.is_none() {
+            row.set_margin_start(10);
+        }
 
         let grip = Label::builder()
             .label("⋮⋮")
@@ -6914,7 +6990,116 @@ fn render_settings_page(
             .build();
         row.append(&grip);
 
-        if is_sep {
+        if let Some(raw_fname) = folder_title {
+            let fname_init = if raw_fname.trim().is_empty() {
+                "Folder".to_string()
+            } else {
+                raw_fname.trim().to_string()
+            };
+            row.append(
+                &Label::builder()
+                    .label("▾")
+                    .css_classes(vec!["fav-score-badge".to_string()])
+                    .build(),
+            );
+            let f_entry = Entry::builder()
+                .text(&fname_init)
+                .hexpand(true)
+                .width_chars(6)
+                .tooltip_text("Folder name (renames on Enter or focus leave)")
+                .build();
+            {
+                let save_folder_name: Rc<dyn Fn(&Entry)> = {
+                    let app_t = apply_tabs.clone();
+                    let old_name = fname_init.clone();
+                    Rc::new(move |e: &Entry| {
+                        let next_name = e.text().trim().to_string();
+                        let clean_name = if next_name.is_empty() {
+                            old_name.clone()
+                        } else {
+                            next_name
+                        };
+                        let mut changed = false;
+                        crate::config::update(|c| {
+                            if let Some(slot) = c.layout.sidebar_items.get_mut(idx) {
+                                if let Some(prev_raw) = slot.strip_prefix("folder:") {
+                                    let prev = prev_raw.trim().to_string();
+                                    if prev != clean_name {
+                                        *slot = format!("folder:{}", clean_name);
+                                        for cf in &mut c.layout.collapsed_folders {
+                                            if *cf == prev {
+                                                *cf = clean_name.clone();
+                                            }
+                                        }
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        });
+                        if changed {
+                            app_t();
+                        }
+                    })
+                };
+                let sf1 = save_folder_name.clone();
+                f_entry.connect_activate(move |e| sf1(e));
+                let focus_ctrl = gtk4::EventControllerFocus::new();
+                let sf2 = save_folder_name.clone();
+                let fe_w = f_entry.downgrade();
+                focus_ctrl.connect_leave(move |_| {
+                    if let Some(fe) = fe_w.upgrade() {
+                        sf2(&fe);
+                    }
+                });
+                f_entry.add_controller(focus_ctrl);
+            }
+            row.append(&f_entry);
+
+            let del_f = Button::builder()
+                .label("×")
+                .css_classes(vec!["plan-line-del-btn".to_string()])
+                .tooltip_text("Delete folder (keeps tabs inside it loaded)")
+                .build();
+            let c_box = container.clone();
+            let rel_t = reload_theme.clone();
+            let app_t = apply_tabs.clone();
+            let del_fname = fname_init.clone();
+            del_f.connect_clicked(move |_| {
+                crate::config::update(|c| {
+                    if idx < c.layout.sidebar_items.len()
+                        && c.layout.sidebar_items[idx].starts_with("folder:")
+                    {
+                        c.layout.sidebar_items.remove(idx);
+                        // Also remove its matching "/folder" boundary (stopping if another folder starts first)
+                        for j in idx..c.layout.sidebar_items.len() {
+                            if c.layout.sidebar_items[j].starts_with("folder:") {
+                                break;
+                            }
+                            if c.layout.sidebar_items[j] == "/folder" {
+                                c.layout.sidebar_items.remove(j);
+                                break;
+                            }
+                        }
+                    }
+                    c.layout.collapsed_folders.retain(|x| x != &del_fname);
+                    crate::config::sync_visible_tabs_from_sidebar(c);
+                });
+                app_t();
+                render_settings_page(&c_box, &rel_t, &app_t);
+            });
+            row.append(&del_f);
+        } else if is_folder_end {
+            row.append(
+                &Label::builder()
+                    .label("└─ End Folder")
+                    .halign(Align::Start)
+                    .hexpand(true)
+                    .ellipsize(gtk4::pango::EllipsizeMode::End)
+                    .tooltip_text("Drag tabs above this line to place them inside the folder")
+                    .css_classes(vec!["plan-subnote".to_string()])
+                    .build(),
+            );
+        } else if is_sep {
             let line = Box::builder()
                 .orientation(Orientation::Horizontal)
                 .height_request(2)
@@ -6947,10 +7132,14 @@ fn render_settings_page(
             let Some(m_desc) = compiled_mods.iter().find(|m| m.id == item.as_str()) else {
                 continue;
             };
-            let title = m_desc.title;
+            let title = if in_folder {
+                format!("├ {}", m_desc.title)
+            } else {
+                m_desc.title.to_string()
+            };
             row.append(
                 &Label::builder()
-                    .label(title)
+                    .label(&title)
                     .halign(Align::Start)
                     .hexpand(true)
                     .ellipsize(gtk4::pango::EllipsizeMode::End)
@@ -8105,6 +8294,314 @@ fn render_settings_page(
         "DASHBOARD BINDINGS",
         &bind_summary,
         &bind_card,
+    );
+
+    // ------------------------------------------
+    // 5c. VIM NAVIGATION & CUSTOM KEYBINDS
+    // ------------------------------------------
+    let vim_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .build();
+
+    let vim_cfg = cfg.bindings.vim.clone();
+
+    let vim_hint = Label::builder()
+        .label("Modal keyboard navigation across all tabs & custom modules. In Search/Entry boxes (INS mode), press Esc or Ctrl+[ to enter NRM mode, or Ctrl+j / Ctrl+k to step directly into results.")
+        .halign(Align::Start)
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .build();
+    vim_card.append(&vim_hint);
+
+    // Master Enable / Disable toggle
+    let vim_en_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    vim_en_row.append(
+        &Label::builder()
+            .label("Vim Navigation Mode")
+            .halign(Align::Start)
+            .hexpand(true)
+            .css_classes(vec!["plan-body".to_string()])
+            .build(),
+    );
+    let vim_en_btn = Button::builder()
+        .label(if vim_cfg.enabled { "ENABLED" } else { "DISABLED" })
+        .css_classes(if vim_cfg.enabled {
+            vec!["primary-btn".to_string()]
+        } else {
+            vec!["plan-fmt-btn".to_string()]
+        })
+        .build();
+    {
+        let cb = container.clone();
+        let rt = reload_theme.clone();
+        let at = apply_tabs.clone();
+        vim_en_btn.connect_clicked(move |_| {
+            crate::config::update(|c| c.bindings.vim.enabled = !c.bindings.vim.enabled);
+            at();
+            render_settings_page(&cb, &rt, &at);
+        });
+    }
+    vim_en_row.append(&vim_en_btn);
+    vim_card.append(&vim_en_row);
+
+    // Start in Normal mode toggle
+    let vim_norm_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    vim_norm_row.append(
+        &Label::builder()
+            .label("Start tabs in Normal mode (don't auto-focus search)")
+            .halign(Align::Start)
+            .hexpand(true)
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(vec!["plan-body".to_string()])
+            .build(),
+    );
+    let vim_norm_btn = Button::builder()
+        .label(if vim_cfg.start_in_normal { "ON" } else { "OFF" })
+        .css_classes(if vim_cfg.start_in_normal {
+            vec!["plan-fmt-btn".to_string(), "active".to_string()]
+        } else {
+            vec!["plan-fmt-btn".to_string()]
+        })
+        .build();
+    {
+        let cb = container.clone();
+        let rt = reload_theme.clone();
+        let at = apply_tabs.clone();
+        vim_norm_btn.connect_clicked(move |_| {
+            crate::config::update(|c| {
+                c.bindings.vim.start_in_normal = !c.bindings.vim.start_in_normal;
+            });
+            render_settings_page(&cb, &rt, &at);
+        });
+    }
+    vim_norm_row.append(&vim_norm_btn);
+    vim_card.append(&vim_norm_row);
+
+    // Show NRM/INS top-bar badge toggle
+    let vim_badge_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    vim_badge_row.append(
+        &Label::builder()
+            .label("Show NRM / INS badge in top bar")
+            .halign(Align::Start)
+            .hexpand(true)
+            .css_classes(vec!["plan-body".to_string()])
+            .build(),
+    );
+    let vim_badge_btn = Button::builder()
+        .label(if vim_cfg.show_mode_badge { "ON" } else { "OFF" })
+        .css_classes(if vim_cfg.show_mode_badge {
+            vec!["plan-fmt-btn".to_string(), "active".to_string()]
+        } else {
+            vec!["plan-fmt-btn".to_string()]
+        })
+        .build();
+    {
+        let cb = container.clone();
+        let rt = reload_theme.clone();
+        let at = apply_tabs.clone();
+        vim_badge_btn.connect_clicked(move |_| {
+            crate::config::update(|c| {
+                c.bindings.vim.show_mode_badge = !c.bindings.vim.show_mode_badge;
+            });
+            at();
+            render_settings_page(&cb, &rt, &at);
+        });
+    }
+    vim_badge_row.append(&vim_badge_btn);
+    vim_card.append(&vim_badge_row);
+
+    // Customizable Normal-mode keybinds grid
+    vim_card.append(
+        &Label::builder()
+            .label("Normal Mode Keybinds (1- or 2-key chords, case-sensitive)")
+            .halign(Align::Start)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .margin_top(4)
+            .build(),
+    );
+
+    let make_vim_pair = |l1: &str, v1: &str, l2: &str, v2: &str| -> (Box, Entry, Entry) {
+        let row = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(6)
+            .homogeneous(true)
+            .build();
+
+        let cell1 = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(4)
+            .build();
+        cell1.append(
+            &Label::builder()
+                .label(l1)
+                .halign(Align::Start)
+                .hexpand(true)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build(),
+        );
+        let e1 = Entry::builder()
+            .text(v1)
+            .width_chars(4)
+            .max_width_chars(5)
+            .build();
+        cell1.append(&e1);
+
+        let cell2 = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(4)
+            .build();
+        cell2.append(
+            &Label::builder()
+                .label(l2)
+                .halign(Align::Start)
+                .hexpand(true)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build(),
+        );
+        let e2 = Entry::builder()
+            .text(v2)
+            .width_chars(4)
+            .max_width_chars(5)
+            .build();
+        cell2.append(&e2);
+
+        row.append(&cell1);
+        row.append(&cell2);
+        (row, e1, e2)
+    };
+
+    let (vr1, ve_down, ve_up) = make_vim_pair("Down", &vim_cfg.down, "Up", &vim_cfg.up);
+    let (vr2, ve_left, ve_right) = make_vim_pair("Left", &vim_cfg.left, "Right", &vim_cfg.right);
+    let (vr3, ve_pleft, ve_pright) =
+        make_vim_pair("Pane ◀", &vim_cfg.pane_left, "Pane ▶", &vim_cfg.pane_right);
+    let (vr4, ve_ntab, ve_ptab) =
+        make_vim_pair("Next Tab", &vim_cfg.next_tab, "Prev Tab", &vim_cfg.prev_tab);
+    let (vr5, ve_top, ve_bot) = make_vim_pair("Top", &vim_cfg.top, "Bottom", &vim_cfg.bottom);
+    let (vr6, ve_srch, ve_ins) =
+        make_vim_pair("Search", &vim_cfg.search, "Insert", &vim_cfg.insert);
+    let (vr7, ve_menu, ve_close) =
+        make_vim_pair("Menu (RClick)", &vim_cfg.context_menu, "Close", &vim_cfg.close);
+
+    vim_card.append(&vr1);
+    vim_card.append(&vr2);
+    vim_card.append(&vr3);
+    vim_card.append(&vr4);
+    vim_card.append(&vr5);
+    vim_card.append(&vr6);
+    vim_card.append(&vr7);
+
+    vim_card.append(
+        &Label::builder()
+            .label("Built-in: Enter/Space = Click · Ctrl+d / Ctrl+u = Half-page scroll · Esc / Ctrl+[ = Exit Insert")
+            .halign(Align::Start)
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build(),
+    );
+
+    let vim_btn_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let save_vim_btn = Button::builder()
+        .label("Save Vim Binds")
+        .css_classes(vec!["primary-btn".to_string()])
+        .hexpand(true)
+        .build();
+    let reset_vim_btn = Button::builder()
+        .label("Reset Defaults")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .build();
+
+    {
+        let (ed, eu, el, er) = (ve_down.clone(), ve_up.clone(), ve_left.clone(), ve_right.clone());
+        let (epl, epr, ent, ept) = (
+            ve_pleft.clone(),
+            ve_pright.clone(),
+            ve_ntab.clone(),
+            ve_ptab.clone(),
+        );
+        let (etop, ebot, esrch, eins, emenu, ecls) = (
+            ve_top.clone(),
+            ve_bot.clone(),
+            ve_srch.clone(),
+            ve_ins.clone(),
+            ve_menu.clone(),
+            ve_close.clone(),
+        );
+        save_vim_btn.connect_clicked(move |b| {
+            let def = crate::config::VimBindsConfig::default();
+            let non_empty = |e: &Entry, fb: &str| -> String {
+                let s = e.text().trim().to_string();
+                if s.is_empty() { fb.to_string() } else { s }
+            };
+            crate::config::update(|c| {
+                let v = &mut c.bindings.vim;
+                v.down = non_empty(&ed, &def.down);
+                v.up = non_empty(&eu, &def.up);
+                v.left = non_empty(&el, &def.left);
+                v.right = non_empty(&er, &def.right);
+                v.pane_left = non_empty(&epl, &def.pane_left);
+                v.pane_right = non_empty(&epr, &def.pane_right);
+                v.next_tab = non_empty(&ent, &def.next_tab);
+                v.prev_tab = non_empty(&ept, &def.prev_tab);
+                v.top = non_empty(&etop, &def.top);
+                v.bottom = non_empty(&ebot, &def.bottom);
+                v.search = non_empty(&esrch, &def.search);
+                v.insert = non_empty(&eins, &def.insert);
+                v.context_menu = non_empty(&emenu, &def.context_menu);
+                v.close = non_empty(&ecls, &def.close);
+            });
+            b.set_label("Saved!");
+            let br = b.clone();
+            glib::timeout_add_local_once(Duration::from_millis(1200), move || {
+                br.set_label("Save Vim Binds");
+            });
+        });
+    }
+    {
+        let cb = container.clone();
+        let rt = reload_theme.clone();
+        let at = apply_tabs.clone();
+        reset_vim_btn.connect_clicked(move |_| {
+            crate::config::update(|c| {
+                let keep_enabled = c.bindings.vim.enabled;
+                c.bindings.vim = crate::config::VimBindsConfig {
+                    enabled: keep_enabled,
+                    ..crate::config::VimBindsConfig::default()
+                };
+            });
+            at();
+            render_settings_page(&cb, &rt, &at);
+        });
+    }
+    vim_btn_row.append(&save_vim_btn);
+    vim_btn_row.append(&reset_vim_btn);
+    vim_card.append(&vim_btn_row);
+
+    let vim_summary = if vim_cfg.enabled { "Enabled" } else { "Off" };
+    append_collapsible_section(
+        container,
+        "vim_binds",
+        "VIM NAVIGATION",
+        vim_summary,
+        &vim_card,
     );
 
     let save_paths_btn = Button::builder()

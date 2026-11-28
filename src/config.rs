@@ -321,9 +321,12 @@ pub struct LayoutConfig {
     pub pinned_monitor: String,
     /// Default tab opened on startup ("run", "favs", "music", etc.)
     pub default_tab: String,
-    /// Ordered sidebar entries: tab IDs ("run", "favs", ...) and "---" for 1px separators.
+    /// Ordered sidebar entries: tab IDs ("run", "favs", ...), "---" for 1px separators,
+    /// and "folder:<Name>" .. "/folder" blocks for collapsible sidebar folders.
     /// Any tab not in this list is unloaded (hidden & background watchers paused).
     pub sidebar_items: Vec<String>,
+    /// Folder names currently collapsed in the sidebar rail.
+    pub collapsed_folders: Vec<String>,
     /// Main dashboard panel width in px (340..=560, default 400)
     pub panel_width: i32,
     /// Slide animation duration in ms (0 = instant snap)
@@ -382,11 +385,18 @@ impl Default for LayoutConfig {
             pinned_monitor: String::new(),
             default_tab: "run".to_string(),
             sidebar_items: DEFAULT_SIDEBAR_ITEMS.iter().map(|s| s.to_string()).collect(),
+            collapsed_folders: Vec::new(),
             panel_width: 400,
             anim_duration_ms: 350,
             chrome: ChromeToggles::default(),
         }
     }
+}
+
+/// Returns true if `item` in `layout.sidebar_items` is an actual module tab ID
+/// (as opposed to `"---"`, `"folder:<Name>"`, or `"/folder"`).
+pub fn is_sidebar_tab_id(item: &str) -> bool {
+    item != "---" && item != "/folder" && !item.starts_with("folder:")
 }
 
 /// Keeps `visible_tabs` booleans in sync with `layout.sidebar_items` so watchers
@@ -410,6 +420,55 @@ pub fn sync_visible_tabs_from_sidebar(cfg: &mut AppConfig) {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
+pub struct VimBindsConfig {
+    /// Master enable/disable toggle for modal Vim keyboard navigation
+    pub enabled: bool,
+    /// Start tabs in Normal mode instead of auto-focusing search bars (`Run`, `Services`, etc.)
+    pub start_in_normal: bool,
+    /// Show live `NRM` / `INS` mode pill in the top bar when Vim mode is enabled
+    pub show_mode_badge: bool,
+    pub down: String,
+    pub up: String,
+    pub left: String,
+    pub right: String,
+    pub pane_left: String,
+    pub pane_right: String,
+    pub next_tab: String,
+    pub prev_tab: String,
+    pub top: String,
+    pub bottom: String,
+    pub search: String,
+    pub insert: String,
+    pub context_menu: String,
+    pub close: String,
+}
+
+impl Default for VimBindsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start_in_normal: false,
+            show_mode_badge: true,
+            down: "j".to_string(),
+            up: "k".to_string(),
+            left: "h".to_string(),
+            right: "l".to_string(),
+            pane_left: "H".to_string(),
+            pane_right: "L".to_string(),
+            next_tab: "J".to_string(),
+            prev_tab: "K".to_string(),
+            top: "gg".to_string(),
+            bottom: "G".to_string(),
+            search: "/".to_string(),
+            insert: "i".to_string(),
+            context_menu: "m".to_string(),
+            close: "q".to_string(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct BindingsConfig {
     /// Press Escape to close the dashboard drawer when open
     pub esc_to_close: bool,
@@ -417,6 +476,8 @@ pub struct BindingsConfig {
     pub tab_jump_enabled: bool,
     /// Modifier for number tab jumping: "ctrl" or "alt"
     pub tab_jump_mod: String,
+    /// Optional modal Vim keyboard navigation & customizable binds
+    pub vim: VimBindsConfig,
 }
 
 impl Default for BindingsConfig {
@@ -425,6 +486,7 @@ impl Default for BindingsConfig {
             esc_to_close: true,
             tab_jump_enabled: true,
             tab_jump_mod: "ctrl".to_string(),
+            vim: VimBindsConfig::default(),
         }
     }
 }
