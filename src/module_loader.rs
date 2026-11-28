@@ -43,6 +43,7 @@ pub const OFFICIAL_MODULE_HASHES: &[(&str, &str)] = &[
     ("music.rs", "e723ecbc40be12112a8536c6b3a6cd0cf900d66fa2a8930c8ccb6c987a890421"),
     ("passwords.rs", "f34cdb09d298730a5476001d67247d6ffefcde5236980b7ba4785469a04d44ac"),
     ("plans.rs", "bd62245632ee80187a433ad6e430a87ae1d69bae0899d95c279d5d8fb58ce28f"),
+    ("scicalc.rs", "19fbcb7574e64ec0909b68e9b6d672415dd02ce83f4589f5ab7abb14c18657b1"),
     ("services.rs", "a206cea689861b7c299dd860673a026f4d907ae26e73585abca34e2d26152ced"),
     ("system.rs", "c0af8c36188a108332b3c086b9f2c9a405130ad89872da80d0f555a703663974"),
     ("tasks.rs", "a79e5a241e48a4cd516eadd09397ec4fc7749447c51a7c4147be4dab37cbeb22"),

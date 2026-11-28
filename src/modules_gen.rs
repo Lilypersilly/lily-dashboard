@@ -21,6 +21,8 @@ pub mod music;
 pub mod passwords;
 #[path = "../modules/plans.rs"]
 pub mod plans;
+#[path = "../modules/scicalc.rs"]
+pub mod scicalc;
 #[path = "../modules/services.rs"]
 pub mod services;
 #[path = "../modules/system.rs"]
@@ -111,6 +113,15 @@ pub fn all_modules() -> Vec<ModuleDescriptor> {
             title: "Plans",
             lifecycle: ModuleLifecycle::Stateful,
             build: plans::build,
+            init: None,
+            shutdown: None,
+            on_visibility: None,
+        },
+        ModuleDescriptor {
+            id: "scicalc",
+            title: "SciCalc",
+            lifecycle: ModuleLifecycle::Stateful,
+            build: scicalc::build,
             init: None,
             shutdown: None,
             on_visibility: None,
