@@ -73,6 +73,29 @@ pub struct ModuleDescriptor {
 }
 
 // ==========================================
+// DECOUPLED SIDEBAR TAB BADGES (e.g. Timers live countdown)
+// ==========================================
+
+thread_local! {
+    static SIDEBAR_BADGE_CB: std::cell::RefCell<Option<Rc<dyn Fn(&str, Option<&str>)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub fn register_sidebar_badge_cb(cb: Rc<dyn Fn(&str, Option<&str>)>) {
+    SIDEBAR_BADGE_CB.with(|slot| {
+        *slot.borrow_mut() = Some(cb);
+    });
+}
+
+pub fn set_sidebar_badge(tab_id: &str, badge: Option<&str>) {
+    SIDEBAR_BADGE_CB.with(|slot| {
+        if let Some(ref cb) = *slot.borrow() {
+            cb(tab_id, badge);
+        }
+    });
+}
+
+// ==========================================
 // DECOUPLED VAULT BRIDGE (Locker <-> Passwords)
 // ==========================================
 

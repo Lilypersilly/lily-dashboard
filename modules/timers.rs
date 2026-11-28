@@ -11,7 +11,7 @@ use gtk4::prelude::*;
 use gtk4::{
     Align, Box, Button, Label, Orientation, PolicyType, ScrolledWindow, SearchEntry, Stack, Entry,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::process::Command;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -337,10 +337,12 @@ pub fn build_timers_ui() -> Box {
     // ==========================================
     let state_ticker = state.clone();
     let tl_list = timers_list.clone();
+    let last_sidebar_badge: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let empty_placeholder_shown = Rc::new(Cell::new(false));
 
     glib::timeout_add_local(Duration::from_millis(1000), move || {
         let mut s = state_ticker.borrow_mut();
-        
+
         // 1. Check Standard Timers
         let mut i = 0;
         let now = Instant::now();
@@ -367,23 +369,21 @@ pub fn build_timers_ui() -> Box {
                     triggered = true;
                     play_alert_sound("Process Closed", &format!("{} has finished running.", s.process_jobs[j].name));
                 } else {
-                    // If we were waiting for it to go idle but it closed instead, that still counts!
                     triggered = true;
                     play_alert_sound("Process Finished", &format!("{} closed.", s.process_jobs[j].name));
                 }
             } else if *condition == WatchCondition::OnIdle {
-                // Read CPU usage using `ps`
                 if let Ok(output) = Command::new("ps").args(["-p", pid, "-o", "pcpu="]).output() {
                     let cpu_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if let Ok(cpu_val) = cpu_str.parse::<f32>() {
-                        if cpu_val < 1.0 { // Less than 1% CPU
+                        if cpu_val < 1.0 {
                             s.process_jobs[j].idle_ticks += 1;
-                            if s.process_jobs[j].idle_ticks >= 3 { // Must be idle for 3 consecutive seconds
+                            if s.process_jobs[j].idle_ticks >= 3 {
                                 triggered = true;
                                 play_alert_sound("Process Idle", &format!("{} has dropped to 0% CPU (Finished installing/downloading).", s.process_jobs[j].name));
                             }
                         } else {
-                            s.process_jobs[j].idle_ticks = 0; // Reset if it spikes again
+                            s.process_jobs[j].idle_ticks = 0;
                         }
                     }
                 }
@@ -391,32 +391,75 @@ pub fn build_timers_ui() -> Box {
 
             if triggered {
                 s.process_jobs.remove(j);
-                // We could emit a signal to refresh the UI here, but it will refresh on next interaction
             } else {
                 j += 1;
             }
         }
 
-        // 3. Update Standard Timers UI (if visible)
+        // 3. Update live sidebar countdown badge (only notifies main.rs when text changes!)
+        let next_badge: Option<String> = if !s.timer_jobs.is_empty() {
+            s.timer_jobs
+                .iter()
+                .map(|job| job.end_time.saturating_duration_since(now))
+                .min()
+                .map(format_duration)
+        } else if !s.process_jobs.is_empty() {
+            Some(format!("👁{}", s.process_jobs.len()))
+        } else {
+            None
+        };
+        if next_badge != *last_sidebar_badge.borrow() {
+            *last_sidebar_badge.borrow_mut() = next_badge.clone();
+            crate::module_api::set_sidebar_badge("timers", next_badge.as_deref());
+        }
+
+        // 4. Update Standard Timers UI (if visible, avoiding redundant idle rebuilds)
         if tl_list.is_visible() {
-            while let Some(child) = tl_list.first_child() {
-                tl_list.remove(&child);
-            }
             if s.timer_jobs.is_empty() {
-                let empty = Label::builder().label("No active timers.").css_classes(vec!["fav-score-badge".to_string()]).build();
-                tl_list.append(&empty);
+                if !empty_placeholder_shown.get() {
+                    while let Some(child) = tl_list.first_child() {
+                        tl_list.remove(&child);
+                    }
+                    let empty = Label::builder()
+                        .label("No active timers.")
+                        .css_classes(vec!["fav-score-badge".to_string()])
+                        .build();
+                    tl_list.append(&empty);
+                    empty_placeholder_shown.set(true);
+                }
             } else {
+                empty_placeholder_shown.set(false);
+                while let Some(child) = tl_list.first_child() {
+                    tl_list.remove(&child);
+                }
                 for (idx, job) in s.timer_jobs.iter().enumerate() {
-                    let row = Box::builder().orientation(Orientation::Horizontal).spacing(6).css_classes(vec!["plan-check-row".to_string()]).build();
-                    let lbl = Label::builder().label(&job.title).hexpand(true).halign(Align::Start).build();
-                    
+                    let row = Box::builder()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(6)
+                        .css_classes(vec!["plan-check-row".to_string()])
+                        .build();
+                    let lbl = Label::builder()
+                        .label(&job.title)
+                        .hexpand(true)
+                        .halign(Align::Start)
+                        .build();
+
                     let remaining = job.end_time.saturating_duration_since(now);
-                    let time_lbl = Label::builder().label(&format_duration(remaining)).css_classes(vec!["plan-h2".to_string()]).build();
-                    
-                    let cancel_btn = Button::builder().label("×").css_classes(vec!["plan-line-del-btn".to_string()]).build();
+                    let time_lbl = Label::builder()
+                        .label(&format_duration(remaining))
+                        .css_classes(vec!["plan-h2".to_string()])
+                        .build();
+
+                    let cancel_btn = Button::builder()
+                        .label("×")
+                        .css_classes(vec!["plan-line-del-btn".to_string()])
+                        .build();
                     let s_del_timer = state_ticker.clone();
                     cancel_btn.connect_clicked(move |_| {
-                        s_del_timer.borrow_mut().timer_jobs.remove(idx);
+                        let mut st = s_del_timer.borrow_mut();
+                        if idx < st.timer_jobs.len() {
+                            st.timer_jobs.remove(idx);
+                        }
                     });
 
                     row.append(&lbl);

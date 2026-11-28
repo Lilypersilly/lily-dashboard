@@ -264,7 +264,7 @@ where
         .build();
 
     let search_entry = SearchEntry::builder()
-        .placeholder_text("Run app or command...")
+        .placeholder_text("Run app, command, or = math...")
         .css_classes(vec!["fav-search".to_string()])
         .build();
 
@@ -308,13 +308,13 @@ where
     let guard_filter = popover_guard.clone();
     let launch_filter = on_launch.clone();
     search_entry.connect_search_changed(move |entry| {
-        let query = entry.text().trim().to_lowercase();
+        let raw_q = entry.text().trim().to_string();
         populate_app_list(
             &list_filter,
             &apps_filter,
             &pinned_filter,
             &preloaded_filter,
-            &query,
+            &raw_q,
             &guard_filter,
             &launch_filter,
         );
@@ -328,28 +328,37 @@ where
         if raw_query.is_empty() {
             return;
         }
+        // Explicit `= expr` always evaluates & copies math first
+        if raw_query.starts_with('=') {
+            if let Some((_, ans)) = eval_quick_math(&raw_query) {
+                copy_math_result(&ans);
+                entry.set_text("");
+                launch_activate();
+                return;
+            }
+        }
+
         let query_lower = raw_query.to_lowercase();
         let pin_set = pinned_activate.borrow();
 
-        let mut candidates: Vec<AppEntry> = apps_activate
+        let mut scored: Vec<(i32, AppEntry)> = apps_activate
             .borrow()
             .iter()
-            .filter(|app| {
-                app.name.to_lowercase().contains(&query_lower)
-                    || app.exec_name.to_lowercase().contains(&query_lower)
-                    || app.description.to_lowercase().contains(&query_lower)
+            .filter_map(|app| {
+                let s = app_match_score(app, &query_lower, pin_set.contains(&app.name))?;
+                Some((s, app.clone()))
             })
-            .cloned()
             .collect();
 
-        candidates.sort_by(|a, b| {
-            let a_pin = pin_set.contains(&a.name);
-            let b_pin = pin_set.contains(&b.name);
-            b_pin.cmp(&a_pin)
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
         });
 
-        if let Some(app) = candidates.first() {
+        if let Some((_, app)) = scored.first() {
             let _ = app.app_info.launch(&[], None::<&gio::AppLaunchContext>);
+        } else if let Some((_, ans)) = eval_quick_math(&raw_query) {
+            copy_math_result(&ans);
         } else {
             let _ = Command::new("sh").arg("-c").arg(&raw_query).spawn();
         }
@@ -369,12 +378,24 @@ fn populate_app_list(
     apps_rc: &Rc<RefCell<Vec<AppEntry>>>,
     pinned_rc: &Rc<RefCell<HashSet<String>>>,
     preloaded_rc: &Rc<RefCell<HashSet<String>>>,
-    query: &str,
+    raw_query: &str,
     popover_guard: &Rc<Cell<usize>>,
     on_launch: &Rc<dyn Fn()>,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
+    }
+
+    let query_trimmed = raw_query.trim();
+    let explicit_math = query_trimmed.starts_with('=');
+    let query_owned = query_trimmed.to_lowercase();
+    let query = query_owned.as_str();
+
+    // 0. Explicit `= expr` quick-math card right at the very top
+    if explicit_math {
+        if let Some((expr_disp, ans)) = eval_quick_math(query_trimmed) {
+            append_math_card(container, &expr_disp, &ans);
+        }
     }
 
     // 1. If search is empty and we have preloaded apps, show the PRELOADED section at the top!
@@ -401,7 +422,7 @@ fn populate_app_list(
                 apps_rc,
                 pinned_rc,
                 preloaded_rc,
-                query,
+                raw_query,
                 popover_guard,
                 on_launch,
                 true,
@@ -410,92 +431,499 @@ fn populate_app_list(
         }
     }
 
-    let header = Label::builder()
-        .label("APPLICATIONS")
-        .halign(Align::Start)
-        .css_classes(vec!["fav-group-header".to_string()])
-        .margin_top(6)
-        .build();
-    container.append(&header);
-
-    let mut filtered: Vec<AppEntry> = apps_rc
-        .borrow()
-        .iter()
-        .filter(|app| {
-            if query.is_empty() {
-                return true;
-            }
-            app.name.to_lowercase().contains(query)
-                || app.exec_name.to_lowercase().contains(query)
-                || app.description.to_lowercase().contains(query)
-        })
-        .cloned()
-        .collect();
-
-    {
-        let pin_set = pinned_rc.borrow();
-        filtered.sort_by(|a, b| {
-            let a_pin = pin_set.contains(&a.name);
-            let b_pin = pin_set.contains(&b.name);
-            b_pin
-                .cmp(&a_pin)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-    }
-
-    let match_count = filtered.len();
-
-    for app in filtered {
-        let row = build_app_row(
-            &app,
-            container,
-            apps_rc,
-            pinned_rc,
-            preloaded_rc,
-            query,
-            popover_guard,
-            on_launch,
-            false,
-        );
-        container.append(&row);
-    }
-
-    if match_count == 0 && !query.is_empty() {
-        let cmd_btn = Button::builder()
-            .css_classes(vec!["fav-item-btn".to_string()])
-            .hexpand(true)
-            .build();
-
-        let row = Box::builder()
-            .orientation(Orientation::Horizontal)
-            .spacing(6)
-            .build();
-
-        let lbl = Label::builder()
-            .label(&format!("Run command: {}", query))
+    if !explicit_math {
+        let header = Label::builder()
+            .label("APPLICATIONS")
             .halign(Align::Start)
-            .hexpand(true)
-            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .css_classes(vec!["fav-group-header".to_string()])
+            .margin_top(6)
             .build();
+        container.append(&header);
 
-        let arrow = Label::builder()
-            .label("->")
-            .css_classes(vec!["fav-score-badge".to_string()])
-            .build();
+        let filtered: Vec<AppEntry> = {
+            let pin_set = pinned_rc.borrow();
+            if query.is_empty() {
+                let mut all: Vec<AppEntry> = apps_rc.borrow().clone();
+                all.sort_by(|a, b| {
+                    let a_pin = pin_set.contains(&a.name);
+                    let b_pin = pin_set.contains(&b.name);
+                    b_pin
+                        .cmp(&a_pin)
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                });
+                all
+            } else {
+                let mut scored: Vec<(i32, AppEntry)> = apps_rc
+                    .borrow()
+                    .iter()
+                    .filter_map(|app| {
+                        let s = app_match_score(app, query, pin_set.contains(&app.name))?;
+                        Some((s, app.clone()))
+                    })
+                    .collect();
+                scored.sort_by(|a, b| {
+                    b.0.cmp(&a.0)
+                        .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+                });
+                scored.into_iter().map(|(_, a)| a).collect()
+            }
+        };
 
-        row.append(&lbl);
-        row.append(&arrow);
-        cmd_btn.set_child(Some(&row));
+        let match_count = filtered.len();
 
-        let cmd_str = query.to_string();
-        let launch_cb = on_launch.clone();
-        cmd_btn.connect_clicked(move |_| {
-            let _ = Command::new("sh").arg("-c").arg(&cmd_str).spawn();
-            launch_cb();
-        });
+        for app in filtered {
+            let row = build_app_row(
+                &app,
+                container,
+                apps_rc,
+                pinned_rc,
+                preloaded_rc,
+                raw_query,
+                popover_guard,
+                on_launch,
+                false,
+            );
+            container.append(&row);
+        }
 
-        container.append(&cmd_btn);
+        if match_count == 0 && !query.is_empty() {
+            if let Some((expr_disp, ans)) = eval_quick_math(query_trimmed) {
+                append_math_card(container, &expr_disp, &ans);
+            }
+
+            let cmd_btn = Button::builder()
+                .css_classes(vec!["fav-item-btn".to_string()])
+                .hexpand(true)
+                .build();
+
+            let row = Box::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(6)
+                .build();
+
+            let lbl = Label::builder()
+                .label(&format!("Run command: {}", query_trimmed))
+                .halign(Align::Start)
+                .hexpand(true)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .build();
+
+            let arrow = Label::builder()
+                .label("->")
+                .css_classes(vec!["fav-score-badge".to_string()])
+                .build();
+
+            row.append(&lbl);
+            row.append(&arrow);
+            cmd_btn.set_child(Some(&row));
+
+            let cmd_str = query_trimmed.to_string();
+            let launch_cb = on_launch.clone();
+            cmd_btn.connect_clicked(move |_| {
+                let _ = Command::new("sh").arg("-c").arg(&cmd_str).spawn();
+                launch_cb();
+            });
+
+            container.append(&cmd_btn);
+        }
     }
+}
+
+/// Scores an app against a non-empty lowercase query so exact/prefix/word-start name & binary
+/// matches always rank above mid-word or description-only matches (e.g. `"tor"` puts `Tor Browser`
+/// at #1 instead of `"text ediTOR"` / `"moniTOR"`).
+fn app_match_score(app: &AppEntry, q: &str, is_pinned: bool) -> Option<i32> {
+    let name = app.name.to_lowercase();
+    let exec = app.exec_name.to_lowercase();
+    let desc = app.description.to_lowercase();
+
+    let word_starts = |s: &str| {
+        s.split(|c: char| !c.is_alphanumeric())
+            .any(|w| !w.is_empty() && w.starts_with(q))
+    };
+
+    let mut score = if name == q || exec == q {
+        1000
+    } else if name.starts_with(q) {
+        900 - (name.len().min(60) as i32)
+    } else if exec.starts_with(q) {
+        830 - (exec.len().min(40) as i32)
+    } else if word_starts(&name) {
+        760 - (name.len().min(50) as i32)
+    } else if let Some(pos) = name.find(q) {
+        560 - (pos.min(40) as i32)
+    } else if let Some(pos) = exec.find(q) {
+        460 - (pos.min(40) as i32)
+    } else if word_starts(&desc) {
+        240
+    } else if desc.contains(q) {
+        100
+    } else {
+        return None;
+    };
+
+    if is_pinned {
+        score += 35;
+    }
+    Some(score)
+}
+
+fn copy_math_result(ans: &str) {
+    if let Some(display) = gtk4::gdk::Display::default() {
+        display.clipboard().set_text(ans);
+    }
+    let _ = Command::new("wl-copy").args(["--", ans]).spawn();
+}
+
+fn append_math_card(container: &Box, expr_disp: &str, ans: &str) {
+    container.append(
+        &Label::builder()
+            .label("QUICK MATH")
+            .halign(Align::Start)
+            .css_classes(vec!["fav-group-header".to_string()])
+            .margin_top(2)
+            .build(),
+    );
+
+    let btn = Button::builder()
+        .css_classes(vec!["fav-item-btn".to_string(), "pinned".to_string()])
+        .hexpand(true)
+        .tooltip_text("Click or press Enter to copy result")
+        .build();
+    let col = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(2)
+        .build();
+    let top = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let ans_lbl = Label::builder()
+        .label(&format!("= {}", ans))
+        .halign(Align::Start)
+        .hexpand(true)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .css_classes(vec!["plan-h2".to_string()])
+        .build();
+    let hint_lbl = Label::builder()
+        .label("Copy")
+        .halign(Align::End)
+        .css_classes(vec!["fav-score-badge".to_string()])
+        .build();
+    top.append(&ans_lbl);
+    top.append(&hint_lbl);
+
+    let expr_lbl = Label::builder()
+        .label(expr_disp)
+        .halign(Align::Start)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .build();
+    col.append(&top);
+    col.append(&expr_lbl);
+    btn.set_child(Some(&col));
+
+    let ans_owned = ans.to_string();
+    let hint_c = hint_lbl.clone();
+    btn.connect_clicked(move |_| {
+        copy_math_result(&ans_owned);
+        hint_c.set_label("Copied!");
+        let h_reset = hint_c.clone();
+        glib::timeout_add_local_once(Duration::from_millis(1000), move || {
+            h_reset.set_label("Copy");
+        });
+    });
+    container.append(&btn);
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum MathTok {
+    Num(f64),
+    Ident(String),
+    Op(char),
+    LParen,
+    RParen,
+    Bang,
+}
+
+fn eval_quick_math(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    let explicit = trimmed.starts_with('=');
+    let expr_str = trimmed.strip_prefix('=').unwrap_or(trimmed).trim();
+    if expr_str.is_empty() || expr_str.starts_with('/') {
+        return None;
+    }
+
+    let cleaned = expr_str
+        .replace('×', "*")
+        .replace('÷', "/")
+        .replace('−', "-")
+        .replace('π', "pi")
+        .replace('τ', "tau")
+        .replace('√', "sqrt");
+
+    let chars: Vec<char> = cleaned.chars().collect();
+    let mut toks: Vec<MathTok> = Vec::new();
+    let mut i = 0usize;
+    let mut has_op_or_fn = explicit;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '0' && i + 2 < chars.len() && (chars[i + 1] == 'x' || chars[i + 1] == 'X') {
+            i += 2;
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            let hex_s: String = chars[start..i].iter().collect();
+            let v = u64::from_str_radix(&hex_s, 16).ok()? as f64;
+            has_op_or_fn = true;
+            toks.push(MathTok::Num(v));
+            continue;
+        }
+        if c == '0' && i + 2 < chars.len() && (chars[i + 1] == 'b' || chars[i + 1] == 'B') {
+            i += 2;
+            let start = i;
+            while i < chars.len() && (chars[i] == '0' || chars[i] == '1') {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            let bin_s: String = chars[start..i].iter().collect();
+            let v = u64::from_str_radix(&bin_s, 2).ok()? as f64;
+            has_op_or_fn = true;
+            toks.push(MathTok::Num(v));
+            continue;
+        }
+        if c.is_ascii_digit() || (c == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) {
+            let start = i;
+            let mut dot = false;
+            while i < chars.len() {
+                if chars[i].is_ascii_digit() {
+                    i += 1;
+                } else if chars[i] == '.' && !dot {
+                    dot = true;
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
+                let mut j = i + 1;
+                if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j].is_ascii_digit() {
+                    i = j;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+            }
+            let num_s: String = chars[start..i].iter().collect();
+            toks.push(MathTok::Num(num_s.parse::<f64>().ok()?));
+            continue;
+        }
+        if c.is_ascii_alphabetic() {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let id: String = chars[start..i].iter().collect::<String>().to_lowercase();
+            has_op_or_fn = true;
+            toks.push(MathTok::Ident(id));
+            continue;
+        }
+        match c {
+            '+' | '-' | '*' | '/' | '%' | '^' => {
+                has_op_or_fn = true;
+                toks.push(MathTok::Op(c));
+            }
+            '(' => {
+                has_op_or_fn = true;
+                toks.push(MathTok::LParen);
+            }
+            ')' => toks.push(MathTok::RParen),
+            '!' => {
+                has_op_or_fn = true;
+                toks.push(MathTok::Bang);
+            }
+            _ => return None,
+        }
+        i += 1;
+    }
+
+    if !has_op_or_fn || toks.is_empty() {
+        return None;
+    }
+
+    // Insert implicit multiplication (e.g. `2pi`, `3(4+5)`, `(2)(3)`)
+    let mut full: Vec<MathTok> = Vec::with_capacity(toks.len() + 4);
+    let is_fn = |s: &str| {
+        matches!(
+            s,
+            "sqrt" | "cbrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "ln" | "log" | "log2" | "abs" | "round" | "floor" | "ceil"
+        )
+    };
+    for tok in toks {
+        if let Some(prev) = full.last() {
+            let ins = match (prev, &tok) {
+                (MathTok::Num(_), MathTok::Ident(_) | MathTok::LParen) => true,
+                (MathTok::RParen | MathTok::Bang, MathTok::Num(_) | MathTok::Ident(_) | MathTok::LParen) => true,
+                (MathTok::Ident(id), MathTok::LParen) => !is_fn(id),
+                _ => false,
+            };
+            if ins {
+                full.push(MathTok::Op('*'));
+            }
+        }
+        full.push(tok);
+    }
+
+    fn p_add(t: &[MathTok], p: &mut usize) -> Option<f64> {
+        let mut v = p_mul(t, p)?;
+        while let Some(MathTok::Op(op @ ('+' | '-'))) = t.get(*p) {
+            let o = *op;
+            *p += 1;
+            let r = p_mul(t, p)?;
+            v = if o == '+' { v + r } else { v - r };
+        }
+        Some(v)
+    }
+    fn p_mul(t: &[MathTok], p: &mut usize) -> Option<f64> {
+        let mut v = p_un(t, p)?;
+        while let Some(MathTok::Op(op @ ('*' | '/' | '%'))) = t.get(*p) {
+            let o = *op;
+            *p += 1;
+            let r = p_un(t, p)?;
+            if (o == '/' || o == '%') && r == 0.0 {
+                return None;
+            }
+            v = match o {
+                '*' => v * r,
+                '/' => v / r,
+                _ => v % r,
+            };
+        }
+        Some(v)
+    }
+    fn p_un(t: &[MathTok], p: &mut usize) -> Option<f64> {
+        match t.get(*p) {
+            Some(MathTok::Op('-')) => {
+                *p += 1;
+                Some(-p_un(t, p)?)
+            }
+            Some(MathTok::Op('+')) => {
+                *p += 1;
+                p_un(t, p)
+            }
+            _ => p_pow(t, p),
+        }
+    }
+    fn p_pow(t: &[MathTok], p: &mut usize) -> Option<f64> {
+        let lhs = p_post(t, p)?;
+        if matches!(t.get(*p), Some(MathTok::Op('^'))) {
+            *p += 1;
+            let rhs = p_un(t, p)?;
+            Some(lhs.powf(rhs))
+        } else {
+            Some(lhs)
+        }
+    }
+    fn p_post(t: &[MathTok], p: &mut usize) -> Option<f64> {
+        let mut v = p_prim(t, p)?;
+        while matches!(t.get(*p), Some(MathTok::Bang)) {
+            *p += 1;
+            if v < 0.0 || v > 170.0 || (v - v.round()).abs() > 1e-9 {
+                return None;
+            }
+            let n = v.round() as u64;
+            let mut acc = 1.0f64;
+            for k in 2..=n {
+                acc *= k as f64;
+            }
+            v = acc;
+        }
+        Some(v)
+    }
+    fn p_prim(t: &[MathTok], p: &mut usize) -> Option<f64> {
+        match t.get(*p)?.clone() {
+            MathTok::Num(n) => {
+                *p += 1;
+                Some(n)
+            }
+            MathTok::LParen => {
+                *p += 1;
+                let v = p_add(t, p)?;
+                if !matches!(t.get(*p), Some(MathTok::RParen)) {
+                    return None;
+                }
+                *p += 1;
+                Some(v)
+            }
+            MathTok::Ident(name) => {
+                *p += 1;
+                if matches!(t.get(*p), Some(MathTok::LParen)) {
+                    *p += 1;
+                    let arg = p_add(t, p)?;
+                    if !matches!(t.get(*p), Some(MathTok::RParen)) {
+                        return None;
+                    }
+                    *p += 1;
+                    Some(match name.as_str() {
+                        "sqrt" => arg.sqrt(),
+                        "cbrt" => arg.cbrt(),
+                        "sin" => arg.sin(),
+                        "cos" => arg.cos(),
+                        "tan" => arg.tan(),
+                        "asin" => arg.asin(),
+                        "acos" => arg.acos(),
+                        "atan" => arg.atan(),
+                        "ln" => arg.ln(),
+                        "log" => arg.log10(),
+                        "log2" => arg.log2(),
+                        "abs" => arg.abs(),
+                        "round" => arg.round(),
+                        "floor" => arg.floor(),
+                        "ceil" => arg.ceil(),
+                        _ => return None,
+                    })
+                } else {
+                    match name.as_str() {
+                        "pi" => Some(std::f64::consts::PI),
+                        "e" => Some(std::f64::consts::E),
+                        "tau" => Some(std::f64::consts::TAU),
+                        _ => None,
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    let mut pos = 0usize;
+    let val = p_add(&full, &mut pos)?;
+    if pos != full.len() || !val.is_finite() {
+        return None;
+    }
+    let clean = if val.abs() < 1e-13 { 0.0 } else { val };
+    let formatted = if (clean - clean.round()).abs() < 1e-10 && clean.abs() < 1e15 {
+        format!("{}", clean.round() as i64)
+    } else if clean.abs() >= 1e12 || (clean != 0.0 && clean.abs() < 1e-6) {
+        format!("{:.6e}", clean)
+    } else {
+        let s = format!("{:.8}", clean);
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    };
+    Some((expr_str.to_string(), formatted))
 }
 
 #[allow(clippy::too_many_arguments)]

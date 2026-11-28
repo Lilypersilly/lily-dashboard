@@ -1191,7 +1191,68 @@ fn apply_wallpaper_native(path: &str) -> Result<String, String> {
         .and_then(|s| s.to_str())
         .unwrap_or("wallpaper")
         .to_string();
+
+    let cfg_now = crate::config::get();
+    if cfg_now.wallpaper_theme_sync == "global" || cfg_now.wallpaper_theme_sync == "dash" {
+        if let Ok(theme_msg) = extract_and_apply_tied_wallpaper_theme(
+            path,
+            &cfg_now.wallpaper_theme_sync,
+            &cfg_now.wallpaper_theme_mode,
+        ) {
+            return Ok(format!("Applied {} • {}", label, theme_msg));
+        }
+    }
+
     Ok(format!("Applied {}", label))
+}
+
+fn resolve_active_wallpaper_path() -> Option<String> {
+    let st = wallpaper_state_file();
+    if let Ok(raw) = fs::read_to_string(&st) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() && std::path::Path::new(trimmed).is_file() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let walls = fetch_wallpapers_snapshot();
+    walls
+        .iter()
+        .find(|w| w.is_active)
+        .or_else(|| walls.first())
+        .map(|w| w.path.clone())
+}
+
+fn extract_and_apply_tied_wallpaper_theme(
+    path: &str,
+    scope: &str,
+    mode: &str,
+) -> Result<String, String> {
+    use gtk4::gdk_pixbuf::Pixbuf;
+    let pix = Pixbuf::from_file_at_scale(path, 160, 160, true)
+        .map_err(|_| "Could not decode wallpaper pixels.".to_string())?;
+    let bytes = pix.read_pixel_bytes();
+    let is_light = mode.eq_ignore_ascii_case("light");
+    let title = if is_light {
+        "Wallpaper Dynamic (Light)"
+    } else {
+        "Wallpaper Dynamic (Dark)"
+    };
+    let def = crate::themes::extract_theme_from_pixels(
+        title,
+        if is_light { "light" } else { "dark" },
+        bytes.as_ref(),
+        pix.width(),
+        pix.height(),
+        pix.rowstride() as usize,
+        pix.n_channels() as usize,
+    );
+    let _ = crate::themes::save_user_theme(&def);
+    if scope == "global" {
+        Ok(crate::themes::apply_global(&def))
+    } else {
+        crate::themes::apply_dash_only(&def);
+        Ok(format!("Dash synced to {} wallpaper", if is_light { "Light" } else { "Dark" }))
+    }
 }
 
 // ==========================================
@@ -2225,9 +2286,99 @@ pub fn build_system_ui(
         .margin_bottom(8)
         .build();
     kbd_scroll.set_child(Some(&kbd_list_box));
-    kbd_page.append(&kbd_top_row);
-    kbd_page.append(&kbd_add_card);
-    kbd_page.append(&kbd_scroll);
+
+    // Unified 3-Category Bar inside Keybinds: Hyprland | Dashboard | Vim
+    let kbd_cat_bar = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .homogeneous(true)
+        .build();
+    let kbd_tab_hypr = Button::builder()
+        .label("Hyprland")
+        .css_classes(vec!["plan-fmt-btn".to_string(), "active".to_string()])
+        .tooltip_text("System-wide Hyprland keybinds (.lua / .conf)")
+        .build();
+    let kbd_tab_dash = Button::builder()
+        .label("Dashboard")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .tooltip_text("Esc, Ctrl/Alt+1..9 tab jump, and direct --tab CLI binds")
+        .build();
+    let kbd_tab_vim = Button::builder()
+        .label("Vim")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .tooltip_text("Modal Vim navigation toggle & custom Normal-mode binds")
+        .build();
+    kbd_cat_bar.append(&kbd_tab_hypr);
+    kbd_cat_bar.append(&kbd_tab_dash);
+    kbd_cat_bar.append(&kbd_tab_vim);
+
+    let kbd_sub_stack = Stack::new();
+    kbd_sub_stack.set_hhomogeneous(false);
+    kbd_sub_stack.set_hexpand(true);
+    kbd_sub_stack.set_vexpand(true);
+
+    let kbd_hypr_page = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    kbd_hypr_page.append(&kbd_top_row);
+    kbd_hypr_page.append(&kbd_add_card);
+    kbd_hypr_page.append(&kbd_scroll);
+
+    let kbd_dash_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    let kbd_dash_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .margin_bottom(8)
+        .build();
+    kbd_dash_scroll.set_child(Some(&kbd_dash_box));
+
+    let kbd_vim_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    let kbd_vim_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .margin_bottom(8)
+        .build();
+    kbd_vim_scroll.set_child(Some(&kbd_vim_box));
+
+    kbd_sub_stack.add_named(&kbd_hypr_page, Some("hypr"));
+    kbd_sub_stack.add_named(&kbd_dash_scroll, Some("dash"));
+    kbd_sub_stack.add_named(&kbd_vim_scroll, Some("vim"));
+
+    for (name, btn) in [
+        ("hypr", kbd_tab_hypr.clone()),
+        ("dash", kbd_tab_dash.clone()),
+        ("vim", kbd_tab_vim.clone()),
+    ] {
+        let stk = kbd_sub_stack.clone();
+        let all_t = [
+            kbd_tab_hypr.clone(),
+            kbd_tab_dash.clone(),
+            kbd_tab_vim.clone(),
+        ];
+        btn.connect_clicked(move |clicked| {
+            for b in &all_t {
+                b.remove_css_class("active");
+            }
+            clicked.add_css_class("active");
+            stk.set_visible_child_name(name);
+        });
+    }
+
+    kbd_page.append(&kbd_cat_bar);
+    kbd_page.append(&kbd_sub_stack);
     detail_stack.add_named(&kbd_page, Some("keybinds"));
 
     // PAGE 7: OVERVIEW
@@ -2265,6 +2416,8 @@ pub fn build_system_ui(
         let tx_ref = tx.clone();
         let cpu_ref = cpu_state.clone();
         let sett_box_ref = sett_box.clone();
+        let kbd_dash_ref = kbd_dash_box.clone();
+        let kbd_vim_ref = kbd_vim_box.clone();
         let reload_theme_ref = reload_theme.clone();
         let apply_tabs_ref = apply_tabs.clone();
         Rc::new(move |section: &str, rescan_wifi: bool| {
@@ -2304,6 +2457,8 @@ pub fn build_system_ui(
                     });
                 }
                 "keybinds" => {
+                    render_dashboard_binds_tab(&kbd_dash_ref, &apply_tabs_ref, &tx_ref);
+                    render_vim_binds_tab(&kbd_vim_ref, &apply_tabs_ref);
                     std::thread::spawn(move || {
                         let _ = tx_bg.send(SystemMsg::Keybinds(fetch_keybinds_snapshot()));
                     });
@@ -2360,6 +2515,12 @@ pub fn build_system_ui(
         })
     };
 
+    {
+        let open_s = open_section.clone();
+        SYSTEM_OPEN_SECTION_CB.with(|slot| {
+            *slot.borrow_mut() = Some(open_s);
+        });
+    }
     {
         let open_s = open_section.clone();
         sound_cat_btn.connect_clicked(move |_| open_s("sound"));
@@ -2602,6 +2763,9 @@ pub fn build_system_ui(
                 SystemMsg::WallpaperApplied(status) => {
                     wall_status_r.set_label(&status);
                     wall_status_r.set_visible(true);
+                    if crate::config::get().wallpaper_theme_sync != "off" {
+                        reload_theme_ui();
+                    }
                     refresh_for_ui("wallpapers", false);
                 }
                 SystemMsg::Displays(monitors) => {
@@ -4697,6 +4861,147 @@ fn render_themes_page(
     }
 
     // ==========================================
+    // 1b. TIE THEME TO SELECTED WALLPAPER (Off / Dash / Global)
+    // ==========================================
+    let tie_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(6)
+        .margin_top(4)
+        .css_classes(vec!["sys-card".to_string()])
+        .build();
+
+    let tie_hdr_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    tie_hdr_row.append(
+        &Label::builder()
+            .label("TIE TO SELECTED WALLPAPER")
+            .halign(Align::Start)
+            .hexpand(true)
+            .css_classes(vec!["fav-group-header".to_string()])
+            .build(),
+    );
+
+    let cur_tie_mode = if cur_cfg.wallpaper_theme_mode.eq_ignore_ascii_case("light") {
+        "light"
+    } else {
+        "dark"
+    };
+    let tie_mode_btn = Button::builder()
+        .label(if cur_tie_mode == "light" {
+            "Mode: Light"
+        } else {
+            "Mode: Dark"
+        })
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .tooltip_text("Toggle whether auto-extracted wallpaper palettes use Dark or Light surfaces")
+        .build();
+    tie_hdr_row.append(&tie_mode_btn);
+    tie_card.append(&tie_hdr_row);
+
+    let tie_btn_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .homogeneous(true)
+        .build();
+
+    let cur_sync = cur_cfg.wallpaper_theme_sync.as_str();
+    let trigger_tie_sync = {
+        let tx_t = tx.clone();
+        let st_t = status_lbl.clone();
+        Rc::new(move |scope: String, mode: String| {
+            if scope == "off" {
+                let _ = tx_t.send(SystemMsg::ThemeApplied(
+                    "Wallpaper theme auto-sync disabled.".to_string(),
+                ));
+                return;
+            }
+            let Some(wall_path) = resolve_active_wallpaper_path() else {
+                let _ = tx_t.send(SystemMsg::ThemeApplied(
+                    "Wallpaper auto-sync enabled — select a wallpaper in Wallpapers!".to_string(),
+                ));
+                return;
+            };
+            st_t.set_label(&format!(
+                "Syncing {} theme to current wallpaper...",
+                if scope == "global" { "Global" } else { "Dashboard" }
+            ));
+            st_t.set_visible(true);
+            let tx_bg = tx_t.clone();
+            std::thread::spawn(move || {
+                let msg = match extract_and_apply_tied_wallpaper_theme(&wall_path, &scope, &mode) {
+                    Ok(m) => m,
+                    Err(e) => e,
+                };
+                let _ = tx_bg.send(SystemMsg::ThemeApplied(msg));
+            });
+        })
+    };
+
+    {
+        let run_sync = trigger_tie_sync.clone();
+        tie_mode_btn.connect_clicked(move |_| {
+            let mut next_mode = "dark".to_string();
+            let mut cur_scope = "off".to_string();
+            crate::config::update(|c| {
+                c.wallpaper_theme_mode = if c.wallpaper_theme_mode.eq_ignore_ascii_case("light") {
+                    "dark".to_string()
+                } else {
+                    "light".to_string()
+                };
+                next_mode = c.wallpaper_theme_mode.clone();
+                cur_scope = c.wallpaper_theme_sync.clone();
+            });
+            if cur_scope == "dash" || cur_scope == "global" {
+                run_sync(cur_scope, next_mode);
+            } else {
+                // Re-render page to reflect button label
+                let _ = run_sync("off".to_string(), next_mode);
+            }
+        });
+    }
+
+    for &(scope_val, btn_lbl, tip) in &[
+        ("off", "Off", "Use manually selected theme"),
+        (
+            "dash",
+            "Tie: Dash",
+            "Automatically theme Lily Dashboard whenever you change wallpapers",
+        ),
+        (
+            "global",
+            "Tie: Global",
+            "Automatically theme your whole desktop whenever you change wallpapers",
+        ),
+    ] {
+        let active = cur_sync == scope_val
+            || (scope_val == "off" && cur_sync != "dash" && cur_sync != "global");
+        let b = Button::builder()
+            .label(btn_lbl)
+            .tooltip_text(tip)
+            .css_classes(if active {
+                vec!["plan-fmt-btn".to_string(), "active".to_string()]
+            } else {
+                vec!["plan-fmt-btn".to_string()]
+            })
+            .build();
+        let sv = scope_val.to_string();
+        let run_sync = trigger_tie_sync.clone();
+        b.connect_clicked(move |_| {
+            let mut mode_now = "dark".to_string();
+            crate::config::update(|c| {
+                c.wallpaper_theme_sync = sv.clone();
+                mode_now = c.wallpaper_theme_mode.clone();
+            });
+            run_sync(sv.clone(), mode_now);
+        });
+        tie_btn_row.append(&b);
+    }
+    tie_card.append(&tie_btn_row);
+    container.append(&tie_card);
+
+    // ==========================================
     // 2. UNIFIED THEME LIST (Global + Dash per theme)
     // ==========================================
     let hdr = Label::builder()
@@ -4814,6 +5119,7 @@ fn render_themes_page(
             let tx_c = tx.clone();
             let st_c = status_lbl.clone();
             global_btn.connect_clicked(move |_| {
+                crate::config::update(|c| c.wallpaper_theme_sync = "off".to_string());
                 st_c.set_label(&format!("Applying {} globally (including Dolphin & folders)...", t_clone.name));
                 st_c.set_visible(true);
                 let td = t_clone.clone();
@@ -4836,6 +5142,7 @@ fn render_themes_page(
             let tx_c = tx.clone();
             let rel_c = reload_theme.clone();
             dash_btn.connect_clicked(move |_| {
+                crate::config::update(|c| c.wallpaper_theme_sync = "off".to_string());
                 crate::themes::apply_dash_only(&t_clone);
                 rel_c();
                 let _ = tx_c.send(SystemMsg::ThemeApplied(format!(
@@ -5004,9 +5311,12 @@ fn render_wallpapers_page(
         let btn = Button::builder()
             .css_classes(classes)
             .tooltip_text(&if wall.has_vertical_pair {
-                format!("{} (paired vertical crop available)", wall.name)
+                format!(
+                    "{} (paired vertical crop available)\nRight-click to extract 6-color theme",
+                    wall.name
+                )
             } else {
-                wall.name.clone()
+                format!("{}\nRight-click to extract 6-color theme", wall.name)
             })
             .build();
 
@@ -5087,6 +5397,106 @@ fn render_wallpapers_page(
                 let _ = tx_bg.send(SystemMsg::WallpaperApplied(msg));
             });
         });
+
+        // Right-click (or Vim `m`): Pure-Rust 6-Color Theme Extractor from Wallpaper
+        let rc_wall = gtk4::GestureClick::builder().button(3).build();
+        let btn_weak = btn.downgrade();
+        let w_path_rc = wall.path.clone();
+        let w_name_rc = wall.name.clone();
+        let st_rc = status_lbl.clone();
+        let tx_rc = tx.clone();
+        rc_wall.connect_pressed(move |_, _, _, _| {
+            let Some(parent_btn) = btn_weak.upgrade() else {
+                return;
+            };
+            let pop = gtk4::Popover::builder()
+                .css_classes(vec!["fav-popover".to_string()])
+                .autohide(true)
+                .build();
+            pop.set_parent(&parent_btn);
+            pop.connect_closed(|p| {
+                let pw = p.downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(pop) = pw.upgrade() {
+                        pop.unparent();
+                    }
+                });
+            });
+
+            let menu = Box::builder()
+                .orientation(Orientation::Vertical)
+                .spacing(4)
+                .build();
+
+            let stem = std::path::Path::new(&w_name_rc)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| w_name_rc.clone());
+
+            for (lbl, mode, global) in [
+                ("Extract Dark Theme (Dash)", "dark", false),
+                ("Extract Dark Theme (Global)", "dark", true),
+                ("Extract Light Theme (Dash)", "light", false),
+                ("Extract Light Theme (Global)", "light", true),
+            ] {
+                let b = Button::builder()
+                    .label(lbl)
+                    .css_classes(vec!["fav-hide-btn".to_string()])
+                    .build();
+                let pop_w = pop.downgrade();
+                let p_run = w_path_rc.clone();
+                let stem_run = stem.clone();
+                let st_run = st_rc.clone();
+                let tx_run = tx_rc.clone();
+                b.connect_clicked(move |_| {
+                    if let Some(p) = pop_w.upgrade() {
+                        p.popdown();
+                    }
+                    let theme_title = format!(
+                        "Wall {} ({})",
+                        stem_run,
+                        if mode == "light" { "Light" } else { "Dark" }
+                    );
+                    st_run.set_label(&format!("Extracting {} palette...", theme_title));
+                    st_run.set_visible(true);
+                    let p_bg = p_run.clone();
+                    let tx_bg = tx_run.clone();
+                    std::thread::spawn(move || {
+                        use gtk4::gdk_pixbuf::Pixbuf;
+                        let Some(pix) = Pixbuf::from_file_at_scale(&p_bg, 160, 160, true).ok() else {
+                            let _ = tx_bg.send(SystemMsg::WallpaperApplied(
+                                "Could not decode wallpaper pixels.".to_string(),
+                            ));
+                            return;
+                        };
+                        let bytes = pix.read_pixel_bytes();
+                        let def = crate::themes::extract_theme_from_pixels(
+                            &theme_title,
+                            mode,
+                            bytes.as_ref(),
+                            pix.width(),
+                            pix.height(),
+                            pix.rowstride() as usize,
+                            pix.n_channels() as usize,
+                        );
+                        let _ = crate::themes::save_user_theme(&def);
+                        let msg = if global {
+                            crate::themes::apply_global(&def)
+                        } else {
+                            crate::themes::apply_dash_only(&def);
+                            format!("Applied '{}' to Dashboard (saved .json)!", def.name)
+                        };
+                        let _ = tx_bg.send(SystemMsg::ThemeApplied(msg.clone()));
+                        let _ = tx_bg.send(SystemMsg::WallpaperApplied(msg));
+                    });
+                });
+                menu.append(&b);
+            }
+
+            pop.set_child(Some(&menu));
+            pop.popup();
+        });
+        btn.add_controller(rc_wall);
 
         grid.insert(&btn, -1);
     }
@@ -5719,6 +6129,134 @@ fn render_overview_page(
     row2.append(&suspend_btn);
     row2.append(&hypr_reload_btn);
     container.append(&row2);
+
+    // 4. COLLAPSIBLE OPTIONAL TOOLS HEALTH CHECK
+    let check_bin = crate::config::bin_exists;
+    let tool_checks: [(&str, bool, &str); 9] = [
+        (
+            "Clipboard",
+            check_bin("wl-paste") && check_bin("wl-copy"),
+            "wl-clipboard",
+        ),
+        (
+            "Wallpaper",
+            check_bin("swww") || check_bin("awww") || check_bin("hyprpaper"),
+            "swww / awww / hyprpaper",
+        ),
+        (
+            "Screenshots",
+            check_bin("lumine-capture")
+                || check_bin("hyprshot")
+                || check_bin("grimblast")
+                || (check_bin("grim") && check_bin("slurp")),
+            "lumine-capture / grim+slurp",
+        ),
+        ("Audio", check_bin("pactl"), "pipewire-pulse / libpulse"),
+        ("Network", check_bin("nmcli"), "networkmanager"),
+        ("Bluetooth", check_bin("bluetoothctl"), "bluez-utils"),
+        (
+            "USB Automount",
+            check_bin("udisksctl") && check_bin("lsblk"),
+            "udisks2",
+        ),
+        (
+            "YouTube Music",
+            check_bin("mpv") && check_bin("yt-dlp"),
+            "mpv + yt-dlp",
+        ),
+        ("Cloud Drive", check_bin("rclone"), "rclone"),
+    ];
+    let ready_cnt = tool_checks.iter().filter(|t| t.1).count();
+    let tools_open = OVERVIEW_TOOLS_OPEN.with(|c| c.get());
+
+    let tools_hdr_btn = Button::builder()
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .hexpand(true)
+        .margin_top(6)
+        .build();
+    let tools_hdr_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let tools_chev = Label::builder()
+        .label(if tools_open { "▾" } else { "▸" })
+        .css_classes(vec!["fav-score-badge".to_string()])
+        .width_request(12)
+        .build();
+    tools_hdr_row.append(&tools_chev);
+    tools_hdr_row.append(
+        &Label::builder()
+            .label("OPTIONAL TOOLS CHECK")
+            .halign(Align::Start)
+            .hexpand(true)
+            .css_classes(vec!["fav-group-header".to_string()])
+            .build(),
+    );
+    tools_hdr_row.append(
+        &Label::builder()
+            .label(&format!("{}/{} ready", ready_cnt, tool_checks.len()))
+            .halign(Align::End)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build(),
+    );
+    tools_hdr_btn.set_child(Some(&tools_hdr_row));
+
+    let tools_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(4)
+        .visible(tools_open)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .build();
+
+    for (feature, ok, pkg_hint) in tool_checks {
+        let tr = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(6)
+            .tooltip_text(&format!("Package / binary: {}", pkg_hint))
+            .build();
+        tr.append(
+            &Label::builder()
+                .label(if ok { "✓" } else { "○" })
+                .css_classes(vec![if ok {
+                    "fav-score-badge".to_string()
+                } else {
+                    "plan-subnote".to_string()
+                }])
+                .width_request(14)
+                .build(),
+        );
+        tr.append(
+            &Label::builder()
+                .label(feature)
+                .halign(Align::Start)
+                .hexpand(true)
+                .css_classes(vec!["plan-body".to_string()])
+                .build(),
+        );
+        tr.append(
+            &Label::builder()
+                .label(if ok { "Ready" } else { pkg_hint })
+                .halign(Align::End)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build(),
+        );
+        tools_card.append(&tr);
+    }
+
+    {
+        let tc = tools_card.clone();
+        let ch = tools_chev.clone();
+        tools_hdr_btn.connect_clicked(move |_| {
+            let next = !tc.is_visible();
+            OVERVIEW_TOOLS_OPEN.with(|c| c.set(next));
+            tc.set_visible(next);
+            ch.set_label(if next { "▾" } else { "▸" });
+        });
+    }
+
+    container.append(&tools_hdr_btn);
+    container.append(&tools_card);
 }
 
 // ==========================================
@@ -5731,6 +6269,54 @@ thread_local! {
         s.insert("buttons".to_string());
         s.insert("power".to_string());
         s
+    });
+    static SETTINGS_FILTER_QUERY: RefCell<String> = const { RefCell::new(String::new()) };
+    static SETTINGS_SECTIONS_REG: RefCell<Vec<(Button, Box, Label, &'static str, String)>> =
+        const { RefCell::new(Vec::new()) };
+    static OVERVIEW_TOOLS_OPEN: Cell<bool> = const { Cell::new(false) };
+    static SYSTEM_OPEN_SECTION_CB: RefCell<Option<Rc<dyn Fn(&str)>>> =
+        const { RefCell::new(None) };
+}
+
+fn collect_widget_keywords(w: &gtk4::Widget, out: &mut String) {
+    if let Some(lbl) = w.downcast_ref::<Label>() {
+        out.push(' ');
+        out.push_str(&lbl.text().to_lowercase());
+    } else if let Some(btn) = w.downcast_ref::<Button>() {
+        if let Some(lbl) = btn.label() {
+            out.push(' ');
+            out.push_str(&lbl.to_lowercase());
+        }
+    } else if let Some(ent) = w.downcast_ref::<Entry>() {
+        if let Some(ph) = ent.placeholder_text() {
+            out.push(' ');
+            out.push_str(&ph.to_lowercase());
+        }
+    }
+    let mut c = w.first_child();
+    while let Some(child) = c {
+        let next = child.next_sibling();
+        collect_widget_keywords(&child, out);
+        c = next;
+    }
+}
+
+fn apply_settings_filter_query(raw_q: &str) {
+    let q = raw_q.trim().to_lowercase();
+    SETTINGS_SECTIONS_REG.with(|reg| {
+        for (hdr_btn, body, chev_lbl, key, keywords) in reg.borrow().iter() {
+            if q.is_empty() {
+                let open = is_settings_section_open(key);
+                hdr_btn.set_visible(true);
+                body.set_visible(open);
+                chev_lbl.set_label(if open { "▾" } else { "▸" });
+            } else {
+                let matched = keywords.contains(&q);
+                hdr_btn.set_visible(matched);
+                body.set_visible(matched);
+                chev_lbl.set_label(if matched { "▾" } else { "▸" });
+            }
+        }
     });
 }
 
@@ -5801,6 +6387,13 @@ fn append_collapsible_section(
 
     container.append(&hdr_btn);
     container.append(body);
+
+    let mut kw = format!("{} {} {}", key, title.to_lowercase(), summary.to_lowercase());
+    collect_widget_keywords(body.upcast_ref(), &mut kw);
+    SETTINGS_SECTIONS_REG.with(|reg| {
+        reg.borrow_mut()
+            .push((hdr_btn, body.clone(), chev_lbl, key, kw));
+    });
 }
 
 /// Attaches a bulletproof apply-on-release trigger to a `gtk4::Scale`.
@@ -5867,7 +6460,22 @@ fn render_settings_page(
         });
 
     clear_box(container);
+    SETTINGS_SECTIONS_REG.with(|reg| reg.borrow_mut().clear());
     let cfg = crate::config::get();
+
+    // Live Settings Filter Bar (filters & auto-expands matching sections in-place)
+    let saved_q = SETTINGS_FILTER_QUERY.with(|q| q.borrow().clone());
+    let filter_entry = gtk4::SearchEntry::builder()
+        .placeholder_text("Filter settings (blur, font, folder, power, paths)...")
+        .text(&saved_q)
+        .css_classes(vec!["fav-search".to_string()])
+        .build();
+    filter_entry.connect_search_changed(|entry| {
+        let txt = entry.text().to_string();
+        SETTINGS_FILTER_QUERY.with(|q| *q.borrow_mut() = txt.clone());
+        apply_settings_filter_query(&txt);
+    });
+    container.append(&filter_entry);
 
     // Debounced disk flush so dragging sliders NEVER spams SSD writes
     let flush_gen = Rc::new(Cell::new(0u64));
@@ -8068,13 +8676,104 @@ fn render_settings_page(
     );
 
     // ------------------------------------------
-    // 5b. DASHBOARD BINDINGS & CLI TAB SHORTCUTS
+    // 5b. UNIFIED KEYBINDS SHORTCUT (moved to System -> Keybinds)
     // ------------------------------------------
-    let bind_card = Box::builder()
+    let kbd_jump_card = Box::builder()
         .orientation(Orientation::Vertical)
-        .spacing(8)
+        .spacing(6)
         .css_classes(vec!["plan-check-row".to_string()])
         .build();
+    kbd_jump_card.append(
+        &Label::builder()
+            .label("Hyprland hotkeys, Esc / Ctrl+1..9 dashboard binds, --tab CLI shortcuts, and Vim Navigation all live under System → Keybinds.")
+            .halign(Align::Start)
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build(),
+    );
+    let open_kbd_btn = Button::builder()
+        .label("Open Unified Keybinds →")
+        .css_classes(vec!["primary-btn".to_string()])
+        .build();
+    open_kbd_btn.connect_clicked(|_| {
+        SYSTEM_OPEN_SECTION_CB.with(|slot| {
+            if let Some(ref cb) = *slot.borrow() {
+                cb("keybinds");
+            }
+        });
+    });
+    kbd_jump_card.append(&open_kbd_btn);
+    let kbd_sum = if cfg.bindings.vim.enabled {
+        "Vim ON"
+    } else {
+        "Hypr · Dash · Vim"
+    };
+    append_collapsible_section(
+        container,
+        "keybinds_link",
+        "KEYBINDS & VIM",
+        kbd_sum,
+        &kbd_jump_card,
+    );
+
+    let save_paths_btn = Button::builder()
+        .label("Save Paths")
+        .css_classes(vec!["primary-btn".to_string()])
+        .margin_top(4)
+        .build();
+    {
+        let (w_e, p_e, k_e, t_e, rc_e, rp_e) = (
+            wp_dir_e.clone(),
+            plans_dir_e.clone(),
+            kbd_file_e.clone(),
+            theme_file_e.clone(),
+            rclone_e.clone(),
+            repo_e.clone(),
+        );
+        let rel_t = reload_theme.clone();
+        save_paths_btn.connect_clicked(move |b| {
+            crate::config::update(|c| {
+                c.paths.wallpapers_dir = w_e.text().trim().to_string();
+                c.paths.plans_dir = p_e.text().trim().to_string();
+                c.paths.keybinds_file = k_e.text().trim().to_string();
+                c.paths.theme_conf_file = t_e.text().trim().to_string();
+                c.paths.rclone_default_remote = rc_e.text().trim().to_string();
+                c.paths.source_repo_dir = rp_e.text().trim().to_string();
+            });
+            rel_t();
+            b.set_label("Saved!");
+            let b_r = b.clone();
+            glib::timeout_add_local_once(Duration::from_millis(1200), move || {
+                b_r.set_label("Save Paths");
+            });
+        });
+    }
+    paths_card.append(&save_paths_btn);
+    append_collapsible_section(container, "paths", "PATHS & DEFAULTS", "6 paths", &paths_card);
+
+    if !saved_q.trim().is_empty() {
+        apply_settings_filter_query(&saved_q);
+    }
+
+    // Restore exact scroll offset after GTK lays out the rebuilt children
+    if let Some((sw, v)) = saved_scroll {
+        if v > 0.0 {
+            glib::idle_add_local_once(move || {
+                let adj = sw.vadjustment();
+                adj.set_value(v.min((adj.upper() - adj.page_size()).max(0.0)));
+            });
+        }
+    }
+}
+
+fn render_dashboard_binds_tab(
+    container: &Box,
+    apply_tabs: &Rc<dyn Fn()>,
+    tx: &mpsc::Sender<SystemMsg>,
+) {
+    clear_box(container);
+    let cfg = crate::config::get();
 
     let bind_status = Label::builder()
         .label("")
@@ -8084,7 +8783,13 @@ fn render_settings_page(
         .css_classes(vec!["plan-subnote".to_string()])
         .visible(false)
         .build();
-    bind_card.append(&bind_status);
+    container.append(&bind_status);
+
+    let card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .build();
 
     // Esc to close toggle
     let esc_row = Box::builder()
@@ -8109,18 +8814,18 @@ fn render_settings_page(
         .build();
     {
         let cb = container.clone();
-        let rt = reload_theme.clone();
         let at = apply_tabs.clone();
+        let tx_c = tx.clone();
         esc_btn.connect_clicked(move |_| {
             crate::config::update(|c| c.bindings.esc_to_close = !c.bindings.esc_to_close);
-            render_settings_page(&cb, &rt, &at);
+            render_dashboard_binds_tab(&cb, &at, &tx_c);
         });
     }
     esc_row.append(&esc_btn);
-    bind_card.append(&esc_row);
+    card.append(&esc_row);
 
     // Number tab-jump selector (Off / Ctrl+1..9 / Alt+1..9)
-    bind_card.append(
+    card.append(
         &Label::builder()
             .label("Quick Tab Jump (while open)")
             .halign(Align::Start)
@@ -8151,8 +8856,8 @@ fn render_settings_page(
             .build();
         let v = val.to_string();
         let cb = container.clone();
-        let rt = reload_theme.clone();
         let at = apply_tabs.clone();
+        let tx_c = tx.clone();
         b.connect_clicked(move |_| {
             crate::config::update(|c| {
                 if v == "off" {
@@ -8162,23 +8867,27 @@ fn render_settings_page(
                     c.bindings.tab_jump_mod = v.clone();
                 }
             });
-            render_settings_page(&cb, &rt, &at);
+            render_dashboard_binds_tab(&cb, &at, &tx_c);
         });
         jump_row.append(&b);
     }
-    bind_card.append(&jump_row);
+    card.append(&jump_row);
+    container.append(&card);
 
-    // Hyprland Direct Tab CLI Binds
-    bind_card.append(
+    // Direct Hyprland CLI Tab Binds
+    container.append(
         &Label::builder()
-            .label("Hyprland Direct Tab Binds (adds to your keybinds file)")
+            .label("DIRECT HYPRLAND --TAB BINDS")
             .halign(Align::Start)
-            .wrap(true)
-            .xalign(0.0)
-            .css_classes(vec!["plan-subnote".to_string()])
-            .margin_top(6)
+            .css_classes(vec!["fav-group-header".to_string()])
+            .margin_top(4)
             .build(),
     );
+    let cli_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(6)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .build();
 
     let exe_bin = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
@@ -8204,7 +8913,7 @@ fn render_settings_page(
         let name_l = Label::builder()
             .label(title)
             .halign(Align::Start)
-            .width_chars(12)
+            .width_chars(11)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
             .css_classes(vec!["plan-body".to_string()])
             .build();
@@ -8224,7 +8933,10 @@ fn render_settings_page(
             let cmd_c = full_cmd.clone();
             let st_c = bind_status.clone();
             copy_b.connect_clicked(move |_| {
-                if let Ok(mut child) = Command::new("wl-copy").stdin(std::process::Stdio::piped()).spawn() {
+                if let Ok(mut child) = Command::new("wl-copy")
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                {
                     if let Some(mut stdin) = child.stdin.take() {
                         use std::io::Write;
                         let _ = stdin.write_all(cmd_c.as_bytes());
@@ -8245,9 +8957,14 @@ fn render_settings_page(
             let ke = key_e.clone();
             let cmd_c = full_cmd.clone();
             let st_c = bind_status.clone();
+            let tx_b = tx.clone();
             bind_b.connect_clicked(move |_| {
                 let raw = ke.text().trim().to_string();
-                let parts: Vec<&str> = raw.split('+').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                let parts: Vec<&str> = raw
+                    .split('+')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 if parts.is_empty() {
                     st_c.set_label("Enter a key combo first (e.g. SUPER+V)");
                     st_c.set_visible(true);
@@ -8263,6 +8980,10 @@ fn render_settings_page(
                     Ok(msg) => {
                         st_c.set_label(&msg);
                         st_c.set_visible(true);
+                        let tx_bg = tx_b.clone();
+                        std::thread::spawn(move || {
+                            let _ = tx_bg.send(SystemMsg::Keybinds(fetch_keybinds_snapshot()));
+                        });
                     }
                     Err(e) => {
                         st_c.set_label(&e);
@@ -8276,47 +8997,31 @@ fn render_settings_page(
         row.append(&key_e);
         row.append(&copy_b);
         row.append(&bind_b);
-        bind_card.append(&row);
+        cli_card.append(&row);
     }
+    container.append(&cli_card);
+}
 
-    let bind_summary = format!(
-        "{} · {}",
-        if cfg.bindings.esc_to_close { "Esc" } else { "No Esc" },
-        match cur_jump {
-            "alt" => "Alt+1..9",
-            "ctrl" => "Ctrl+1..9",
-            _ => "No #jump",
-        }
-    );
-    append_collapsible_section(
-        container,
-        "bindings",
-        "DASHBOARD BINDINGS",
-        &bind_summary,
-        &bind_card,
-    );
+fn render_vim_binds_tab(container: &Box, apply_tabs: &Rc<dyn Fn()>) {
+    clear_box(container);
+    let vim_cfg = crate::config::get().bindings.vim;
 
-    // ------------------------------------------
-    // 5c. VIM NAVIGATION & CUSTOM KEYBINDS
-    // ------------------------------------------
     let vim_card = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(8)
         .css_classes(vec!["plan-check-row".to_string()])
         .build();
 
-    let vim_cfg = cfg.bindings.vim.clone();
+    vim_card.append(
+        &Label::builder()
+            .label("Modal keyboard navigation across all tabs & custom modules. In Search/Entry boxes (INS mode), press Esc or Ctrl+[ to enter NRM mode, Ctrl+j / Ctrl+k to step into results, or ? in NRM mode for a live cheat-sheet.")
+            .halign(Align::Start)
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build(),
+    );
 
-    let vim_hint = Label::builder()
-        .label("Modal keyboard navigation across all tabs & custom modules. In Search/Entry boxes (INS mode), press Esc or Ctrl+[ to enter NRM mode, or Ctrl+j / Ctrl+k to step directly into results.")
-        .halign(Align::Start)
-        .wrap(true)
-        .xalign(0.0)
-        .css_classes(vec!["plan-subnote".to_string()])
-        .build();
-    vim_card.append(&vim_hint);
-
-    // Master Enable / Disable toggle
     let vim_en_row = Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(8)
@@ -8339,18 +9044,16 @@ fn render_settings_page(
         .build();
     {
         let cb = container.clone();
-        let rt = reload_theme.clone();
         let at = apply_tabs.clone();
         vim_en_btn.connect_clicked(move |_| {
             crate::config::update(|c| c.bindings.vim.enabled = !c.bindings.vim.enabled);
             at();
-            render_settings_page(&cb, &rt, &at);
+            render_vim_binds_tab(&cb, &at);
         });
     }
     vim_en_row.append(&vim_en_btn);
     vim_card.append(&vim_en_row);
 
-    // Start in Normal mode toggle
     let vim_norm_row = Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(8)
@@ -8375,19 +9078,17 @@ fn render_settings_page(
         .build();
     {
         let cb = container.clone();
-        let rt = reload_theme.clone();
         let at = apply_tabs.clone();
         vim_norm_btn.connect_clicked(move |_| {
             crate::config::update(|c| {
                 c.bindings.vim.start_in_normal = !c.bindings.vim.start_in_normal;
             });
-            render_settings_page(&cb, &rt, &at);
+            render_vim_binds_tab(&cb, &at);
         });
     }
     vim_norm_row.append(&vim_norm_btn);
     vim_card.append(&vim_norm_row);
 
-    // Show NRM/INS top-bar badge toggle
     let vim_badge_row = Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(8)
@@ -8410,20 +9111,18 @@ fn render_settings_page(
         .build();
     {
         let cb = container.clone();
-        let rt = reload_theme.clone();
         let at = apply_tabs.clone();
         vim_badge_btn.connect_clicked(move |_| {
             crate::config::update(|c| {
                 c.bindings.vim.show_mode_badge = !c.bindings.vim.show_mode_badge;
             });
             at();
-            render_settings_page(&cb, &rt, &at);
+            render_vim_binds_tab(&cb, &at);
         });
     }
     vim_badge_row.append(&vim_badge_btn);
     vim_card.append(&vim_badge_row);
 
-    // Customizable Normal-mode keybinds grid
     vim_card.append(
         &Label::builder()
             .label("Normal Mode Keybinds (1- or 2-key chords, case-sensitive)")
@@ -8439,7 +9138,6 @@ fn render_settings_page(
             .spacing(6)
             .homogeneous(true)
             .build();
-
         let cell1 = Box::builder()
             .orientation(Orientation::Horizontal)
             .spacing(4)
@@ -8507,7 +9205,7 @@ fn render_settings_page(
 
     vim_card.append(
         &Label::builder()
-            .label("Built-in: Enter/Space = Click · Ctrl+d / Ctrl+u = Half-page scroll · Esc / Ctrl+[ = Exit Insert")
+            .label("Built-in: ? = Help Popover · Enter/Space = Click · Ctrl+d/u = Half-page · Esc/Ctrl+[ = Exit INS")
             .halign(Align::Start)
             .wrap(true)
             .xalign(0.0)
@@ -8577,7 +9275,6 @@ fn render_settings_page(
     }
     {
         let cb = container.clone();
-        let rt = reload_theme.clone();
         let at = apply_tabs.clone();
         reset_vim_btn.connect_clicked(move |_| {
             crate::config::update(|c| {
@@ -8588,66 +9285,13 @@ fn render_settings_page(
                 };
             });
             at();
-            render_settings_page(&cb, &rt, &at);
+            render_vim_binds_tab(&cb, &at);
         });
     }
     vim_btn_row.append(&save_vim_btn);
     vim_btn_row.append(&reset_vim_btn);
     vim_card.append(&vim_btn_row);
-
-    let vim_summary = if vim_cfg.enabled { "Enabled" } else { "Off" };
-    append_collapsible_section(
-        container,
-        "vim_binds",
-        "VIM NAVIGATION",
-        vim_summary,
-        &vim_card,
-    );
-
-    let save_paths_btn = Button::builder()
-        .label("Save Paths")
-        .css_classes(vec!["primary-btn".to_string()])
-        .margin_top(4)
-        .build();
-    {
-        let (w_e, p_e, k_e, t_e, rc_e, rp_e) = (
-            wp_dir_e.clone(),
-            plans_dir_e.clone(),
-            kbd_file_e.clone(),
-            theme_file_e.clone(),
-            rclone_e.clone(),
-            repo_e.clone(),
-        );
-        let rel_t = reload_theme.clone();
-        save_paths_btn.connect_clicked(move |b| {
-            crate::config::update(|c| {
-                c.paths.wallpapers_dir = w_e.text().trim().to_string();
-                c.paths.plans_dir = p_e.text().trim().to_string();
-                c.paths.keybinds_file = k_e.text().trim().to_string();
-                c.paths.theme_conf_file = t_e.text().trim().to_string();
-                c.paths.rclone_default_remote = rc_e.text().trim().to_string();
-                c.paths.source_repo_dir = rp_e.text().trim().to_string();
-            });
-            rel_t();
-            b.set_label("Saved!");
-            let b_r = b.clone();
-            glib::timeout_add_local_once(Duration::from_millis(1200), move || {
-                b_r.set_label("Save Paths");
-            });
-        });
-    }
-    paths_card.append(&save_paths_btn);
-    append_collapsible_section(container, "paths", "PATHS & DEFAULTS", "6 paths", &paths_card);
-
-    // Restore exact scroll offset after GTK lays out the rebuilt children
-    if let Some((sw, v)) = saved_scroll {
-        if v > 0.0 {
-            glib::idle_add_local_once(move || {
-                let adj = sw.vadjustment();
-                adj.set_value(v.min((adj.upper() - adj.page_size()).max(0.0)));
-            });
-        }
-    }
+    container.append(&vim_card);
 }
 
 pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::ModuleHandle {

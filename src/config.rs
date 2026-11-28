@@ -556,6 +556,10 @@ pub struct AppConfig {
     pub hyprland: HyprlandConfig,
     pub bindings: BindingsConfig,
     pub theme_targets: ThemeTargetsConfig,
+    /// Automatically extract & apply theme from selected wallpaper: "off", "dash", or "global"
+    pub wallpaper_theme_sync: String,
+    /// Mode used when auto-extracting theme from wallpaper: "dark" or "light"
+    pub wallpaper_theme_mode: String,
 }
 
 impl Default for AppConfig {
@@ -575,6 +579,8 @@ impl Default for AppConfig {
             hyprland: HyprlandConfig::default(),
             bindings: BindingsConfig::default(),
             theme_targets: ThemeTargetsConfig::default(),
+            wallpaper_theme_sync: "off".to_string(),
+            wallpaper_theme_mode: "dark".to_string(),
         }
     }
 }

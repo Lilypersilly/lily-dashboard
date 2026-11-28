@@ -1599,3 +1599,194 @@ nav[class*="guilds_"] {{
         format!("Applied '{}' globally!", d.name)
     }
 }
+
+/// Pure-Rust wallpaper palette extractor (zero `pywal`/`matugen` dependency).
+/// Samples pixels across `rgb_bytes`, builds a saturation-weighted 24-bin hue histogram,
+/// picks primary & secondary harmonious accents, and derives a full 6-color `ThemeDefinition`.
+pub fn extract_theme_from_pixels(
+    display_name: &str,
+    mode: &str,
+    rgb_bytes: &[u8],
+    width: i32,
+    height: i32,
+    rowstride: usize,
+    channels: usize,
+) -> ThemeDefinition {
+    let is_light = mode.eq_ignore_ascii_case("light");
+    let key = sanitize_key(display_name);
+    if width <= 0 || height <= 0 || channels < 3 || rgb_bytes.is_empty() {
+        return ThemeDefinition::from_six_colors(
+            &key,
+            display_name,
+            mode,
+            "auto",
+            if is_light { "f5eef8" } else { "1c161e" },
+            if is_light { "eadcf0" } else { "2a202d" },
+            if is_light { "2a2030" } else { "fee4ff" },
+            "e975ca",
+            "bf40a1",
+            "ffc2ff",
+        );
+    }
+
+    let rgb_to_hsv = |r: u8, g: u8, b: u8| -> (f64, f64, f64) {
+        let rf = r as f64 / 255.0;
+        let gf = g as f64 / 255.0;
+        let bf = b as f64 / 255.0;
+        let max = rf.max(gf).max(bf);
+        let min = rf.min(gf).min(bf);
+        let d = max - min;
+        let h = if d < 1e-6 {
+            0.0
+        } else if (max - rf).abs() < 1e-6 {
+            60.0 * (((gf - bf) / d).rem_euclid(6.0))
+        } else if (max - gf).abs() < 1e-6 {
+            60.0 * (((bf - rf) / d) + 2.0)
+        } else {
+            60.0 * (((rf - gf) / d) + 4.0)
+        };
+        let s = if max < 1e-6 { 0.0 } else { d / max };
+        (h, s, max)
+    };
+
+    let hsv_to_hex = |h_deg: f64, s: f64, v: f64| -> String {
+        let h = h_deg.rem_euclid(360.0);
+        let s = s.clamp(0.0, 1.0);
+        let v = v.clamp(0.0, 1.0);
+        let c = v * s;
+        let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+        let m = v - c;
+        let (r1, g1, b1) = if h < 60.0 {
+            (c, x, 0.0)
+        } else if h < 120.0 {
+            (x, c, 0.0)
+        } else if h < 180.0 {
+            (0.0, c, x)
+        } else if h < 240.0 {
+            (0.0, x, c)
+        } else if h < 300.0 {
+            (x, 0.0, c)
+        } else {
+            (c, 0.0, x)
+        };
+        rgb_to_hex(
+            ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+            ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+            ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        )
+    };
+
+    const BINS: usize = 24;
+    let mut bin_weight = [0.0f64; BINS];
+    let mut bin_hue_sum = [0.0f64; BINS];
+    let mut bin_sat_sum = [0.0f64; BINS];
+    let mut total_sat = 0.0f64;
+    let mut sample_count = 0usize;
+
+    let step_x = (width / 44).max(1);
+    let step_y = (height / 44).max(1);
+    let mut y = 0;
+    while y < height {
+        let mut x = 0;
+        while x < width {
+            let off = (y as usize) * rowstride + (x as usize) * channels;
+            if off + 2 < rgb_bytes.len() {
+                let (h, s, v) = rgb_to_hsv(rgb_bytes[off], rgb_bytes[off + 1], rgb_bytes[off + 2]);
+                total_sat += s;
+                sample_count += 1;
+                if s > 0.08 && v > 0.08 && v < 0.98 {
+                    let b_idx = ((h / 360.0) * BINS as f64).floor() as usize % BINS;
+                    let w = s.powf(1.35) * (0.35 + 0.65 * v);
+                    bin_weight[b_idx] += w;
+                    bin_hue_sum[b_idx] += h * w;
+                    bin_sat_sum[b_idx] += s * w;
+                }
+            }
+            x += step_x;
+        }
+        y += step_y;
+    }
+
+    let avg_sat = if sample_count > 0 {
+        total_sat / sample_count as f64
+    } else {
+        0.0
+    };
+
+    // Find primary hue peak
+    let mut best_bin = 0usize;
+    let mut best_w = 0.0f64;
+    for i in 0..BINS {
+        if bin_weight[i] > best_w {
+            best_w = bin_weight[i];
+            best_bin = i;
+        }
+    }
+
+    let is_monochrome = best_w < 0.25 || avg_sat < 0.06;
+    let primary_hue = if best_w > 0.0 {
+        bin_hue_sum[best_bin] / best_w
+    } else {
+        265.0
+    };
+    let primary_sat = if is_monochrome {
+        0.14
+    } else {
+        (bin_sat_sum[best_bin] / best_w).clamp(0.45, 0.82)
+    };
+
+    // Find secondary hue peak at least 35 degrees away (or +32 deg analogous harmonic shift)
+    let mut sec_bin = None;
+    let mut sec_w = 0.0f64;
+    for i in 0..BINS {
+        let h_i = if bin_weight[i] > 0.0 {
+            bin_hue_sum[i] / bin_weight[i]
+        } else {
+            (i as f64 + 0.5) * (360.0 / BINS as f64)
+        };
+        let diff = (h_i - primary_hue).abs();
+        let ang_dist = diff.min(360.0 - diff);
+        if ang_dist >= 35.0 && bin_weight[i] > sec_w {
+            sec_w = bin_weight[i];
+            sec_bin = Some((h_i, (bin_sat_sum[i] / bin_weight[i]).clamp(0.40, 0.80)));
+        }
+    }
+    let (sec_hue, sec_sat) = match sec_bin {
+        Some((sh, ss)) if sec_w >= best_w * 0.18 && !is_monochrome => (sh, ss),
+        _ => (
+            (primary_hue + 32.0).rem_euclid(360.0),
+            if is_monochrome { 0.12 } else { (primary_sat * 0.88).clamp(0.38, 0.78) },
+        ),
+    };
+
+    let (bg_main, bg_pill, fg_main, accent, selection, magenta) = if is_light {
+        let bg = hsv_to_hex(primary_hue, if is_monochrome { 0.03 } else { 0.09 }, 0.96);
+        let pill = hsv_to_hex(primary_hue, if is_monochrome { 0.05 } else { 0.15 }, 0.90);
+        let fg = hsv_to_hex(primary_hue, if is_monochrome { 0.08 } else { 0.32 }, 0.18);
+        let acc = hsv_to_hex(primary_hue, primary_sat.clamp(0.55, 0.85), 0.72);
+        let sel = hsv_to_hex(primary_hue, primary_sat.clamp(0.50, 0.80), 0.82);
+        let mag = hsv_to_hex(sec_hue, sec_sat.clamp(0.50, 0.82), 0.68);
+        (bg, pill, fg, acc, sel, mag)
+    } else {
+        let bg = hsv_to_hex(primary_hue, if is_monochrome { 0.05 } else { 0.28 }, 0.12);
+        let pill = hsv_to_hex(primary_hue, if is_monochrome { 0.07 } else { 0.26 }, 0.18);
+        let fg = hsv_to_hex(primary_hue, if is_monochrome { 0.03 } else { 0.10 }, 0.95);
+        let acc = hsv_to_hex(primary_hue, primary_sat, 0.88);
+        let sel = hsv_to_hex(primary_hue, (primary_sat * 1.05).clamp(0.20, 0.82), 0.66);
+        let mag = hsv_to_hex(sec_hue, sec_sat, 0.92);
+        (bg, pill, fg, acc, sel, mag)
+    };
+
+    ThemeDefinition::from_six_colors(
+        &key,
+        display_name,
+        mode,
+        "auto",
+        &bg_main,
+        &bg_pill,
+        &fg_main,
+        &accent,
+        &selection,
+        &magenta,
+    )
+}

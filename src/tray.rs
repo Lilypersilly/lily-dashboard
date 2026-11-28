@@ -877,24 +877,85 @@ pub fn build_status_strip() -> GtkBox {
             _ => {}
         }
     });
+    let (tx_n, rx_n) = mpsc::channel::<NotifState>();
+    let refresh_non_swaync = {
+        let tx_poll = tx_n.clone();
+        move || {
+            let daemon = crate::config::get().tools.notification_daemon;
+            match daemon.as_str() {
+                "dunst" => {
+                    std::thread::spawn({
+                        let tx_bg = tx_poll.clone();
+                        move || {
+                            let dnd = Command::new("dunstctl")
+                                .arg("is-paused")
+                                .output()
+                                .ok()
+                                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+                                .unwrap_or(false);
+                            let unread = Command::new("dunstctl")
+                                .args(["count", "waiting"])
+                                .output()
+                                .ok()
+                                .and_then(|o| {
+                                    String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok()
+                                })
+                                .unwrap_or(0);
+                            let _ = tx_bg.send(NotifState { unread, dnd });
+                        }
+                    });
+                }
+                "mako" => {
+                    std::thread::spawn({
+                        let tx_bg = tx_poll.clone();
+                        move || {
+                            let dnd = Command::new("makoctl")
+                                .arg("mode")
+                                .output()
+                                .ok()
+                                .map(|o| {
+                                    String::from_utf8_lossy(&o.stdout)
+                                        .lines()
+                                        .any(|l| l.trim() == "do-not-disturb")
+                                })
+                                .unwrap_or(false);
+                            let _ = tx_bg.send(NotifState { unread: 0, dnd });
+                        }
+                    });
+                }
+                _ => {}
+            }
+        }
+    };
+
     let right_click = GestureClick::builder().button(3).build();
+    let ref_rc = refresh_non_swaync.clone();
     right_click.connect_pressed(move |_, _, _, _| {
         match crate::config::get().tools.notification_daemon.as_str() {
             "swaync" => {
                 let _ = Command::new("swaync-client").args(["-d", "-sw"]).spawn();
             }
             "dunst" => {
-                let _ = Command::new("dunstctl").args(["set-paused", "toggle"]).spawn();
+                let _ = Command::new("dunstctl").args(["set-paused", "toggle"]).status();
+                ref_rc();
             }
             "mako" => {
-                let _ = Command::new("makoctl").args(["mode", "-t", "do-not-disturb"]).spawn();
+                let _ = Command::new("makoctl")
+                    .args(["mode", "-t", "do-not-disturb"])
+                    .status();
+                ref_rc();
             }
             _ => {}
         }
     });
     notif_btn.add_controller(right_click);
 
-    let (tx_n, rx_n) = mpsc::channel::<NotifState>();
+    refresh_non_swaync();
+    glib::timeout_add_seconds_local(15, move || {
+        refresh_non_swaync();
+        glib::ControlFlow::Continue
+    });
+
     let notif_daemon_bg = notif_daemon.clone();
     std::thread::spawn(move || {
         if notif_daemon_bg != "swaync" {

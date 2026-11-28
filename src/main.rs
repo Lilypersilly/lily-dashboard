@@ -501,6 +501,7 @@ fn init_theme() -> Rc<dyn Fn()> {
                 .sidebar-nav-btn.selected {{ background-color: {fg_main_06}; }}
                 .sidebar-nav-btn label {{ color: #{fg_muted}; font-family: '{ui_font}', sans-serif; font-size: {fs_15}px; font-weight: bold; }}
                 .sidebar-nav-btn.selected label {{ color: #{fg_main}; }}
+                .sidebar-nav-btn label.sidebar-tab-badge {{ color: #{accent2}; font-family: '{mono_font}', monospace; font-size: {fs_11}px; font-weight: bold; }}
                 .sidebar-sep {{ background-color: {accent1_35}; min-height: 1px; margin: 4px 10px; }}
                 .sidebar-folder-btn {{ background-color: transparent; border: none; border-radius: {r_md}px; padding: 5px 8px; margin: 2px 4px 1px 4px; box-shadow: none; transition: background-color 0.16s ease; }}
                 .sidebar-folder-btn:hover {{ background-color: {accent1_15}; }}
@@ -1047,18 +1048,48 @@ fn build_ui(
     let nav_buttons_rc: Rc<RefCell<Vec<(String, Button)>>> = Rc::new(RefCell::new(Vec::new()));
     let nav_folders_rc: Rc<RefCell<Vec<(Button, Box, Vec<String>)>>> =
         Rc::new(RefCell::new(Vec::new()));
+    let nav_badges_state: Rc<RefCell<std::collections::HashMap<String, String>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
+    let nav_badge_lbls_rc: Rc<RefCell<std::collections::HashMap<String, Label>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
+
+    {
+        let st_b = nav_badges_state.clone();
+        let lbls_b = nav_badge_lbls_rc.clone();
+        module_api::register_sidebar_badge_cb(Rc::new(move |tab_id: &str, badge: Option<&str>| {
+            match badge.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                Some(txt) => {
+                    st_b.borrow_mut().insert(tab_id.to_string(), txt.to_string());
+                    if let Some(lbl) = lbls_b.borrow().get(tab_id) {
+                        lbl.set_label(txt);
+                        lbl.set_visible(true);
+                    }
+                }
+                None => {
+                    st_b.borrow_mut().remove(tab_id);
+                    if let Some(lbl) = lbls_b.borrow().get(tab_id) {
+                        lbl.set_label("");
+                        lbl.set_visible(false);
+                    }
+                }
+            }
+        }));
+    }
 
     let rebuild_sidebar_nav: Rc<dyn Fn()> = {
         let snav = sidebar_nav.clone();
         let stk = stack.clone();
         let nbtns = nav_buttons_rc.clone();
         let nfolds = nav_folders_rc.clone();
+        let nbadges = nav_badges_state.clone();
+        let nblbls = nav_badge_lbls_rc.clone();
         Rc::new(move || {
             while let Some(c) = snav.first_child() {
                 snav.remove(&c);
             }
             nbtns.borrow_mut().clear();
             nfolds.borrow_mut().clear();
+            nblbls.borrow_mut().clear();
 
             let cfg = config::get();
             let active_name = stk.visible_child_name().map(|s| s.to_string());
@@ -1171,18 +1202,34 @@ fn build_ui(
                         snav.append(&sep);
                     }
                 } else if let Some(desc) = compiled.iter().find(|m| m.id == item.as_str()) {
+                    let btn_row = Box::builder()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(4)
+                        .build();
                     let lbl = Label::builder()
                         .label(desc.title)
                         .halign(gtk4::Align::Start)
                         .hexpand(true)
                         .ellipsize(gtk4::pango::EllipsizeMode::End)
                         .build();
+                    let cur_badge = nbadges.borrow().get(desc.id).cloned();
+                    let badge_lbl = Label::builder()
+                        .label(cur_badge.as_deref().unwrap_or(""))
+                        .halign(gtk4::Align::End)
+                        .valign(gtk4::Align::Center)
+                        .visible(cur_badge.is_some())
+                        .css_classes(vec!["sidebar-tab-badge".to_string()])
+                        .build();
+                    btn_row.append(&lbl);
+                    btn_row.append(&badge_lbl);
+                    nblbls.borrow_mut().insert(desc.id.to_string(), badge_lbl);
+
                     let mut classes = vec!["sidebar-nav-btn".to_string()];
                     if active_name.as_deref() == Some(desc.id) {
                         classes.push("selected".to_string());
                     }
                     let btn = Button::builder()
-                        .child(&lbl)
+                        .child(&btn_row)
                         .css_classes(classes)
                         .build();
                     let stack_click = stk.clone();
@@ -3083,6 +3130,78 @@ fn vim_trigger_context_menu(focused: &gtk4::Widget, win: &ApplicationWindow) -> 
     false
 }
 
+fn vim_show_help_popover(anchor: &gtk4::Widget, v: &config::VimBindsConfig) {
+    let pop = gtk4::Popover::builder()
+        .css_classes(vec!["fav-popover".to_string()])
+        .autohide(true)
+        .build();
+    pop.set_parent(anchor);
+    pop.connect_closed(|p| {
+        let pw = p.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(pop) = pw.upgrade() {
+                pop.unparent();
+            }
+        });
+    });
+
+    let card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(5)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(8)
+        .margin_end(8)
+        .build();
+    card.append(
+        &Label::builder()
+            .label("VIM NAVIGATION CHEAT-SHEET")
+            .halign(gtk4::Align::Start)
+            .css_classes(vec!["fav-group-header".to_string()])
+            .build(),
+    );
+
+    let pairs: [(String, &str); 11] = [
+        (format!("{} / {}", v.down, v.up), "Move Down / Up"),
+        (format!("{} / {}", v.left, v.right), "Step Left / Right"),
+        (format!("{} / {}", v.pane_left, v.pane_right), "Jump Pane ◀ / ▶"),
+        (format!("{} / {}", v.next_tab, v.prev_tab), "Next / Prev Tab"),
+        (format!("{} / {}", v.top, v.bottom), "Jump Top / Bottom"),
+        ("Ctrl+d / Ctrl+u".to_string(), "Half-Page Scroll"),
+        (format!("{} / {}", v.search, v.insert), "Search / Insert (INS)"),
+        ("Ctrl+j / Ctrl+k".to_string(), "Step Search → Results"),
+        ("Esc / Ctrl+[".to_string(), "Exit INS → NRM"),
+        (v.context_menu.clone(), "Right-Click Menu"),
+        (format!("{} / ?", v.close), "Close Pane / Help"),
+    ];
+
+    for (keys_str, desc) in pairs {
+        let row = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(10)
+            .build();
+        row.append(
+            &Label::builder()
+                .label(&keys_str)
+                .halign(gtk4::Align::Start)
+                .css_classes(vec!["kbd-pill".to_string()])
+                .build(),
+        );
+        row.append(
+            &Label::builder()
+                .label(desc)
+                .halign(gtk4::Align::End)
+                .hexpand(true)
+                .css_classes(vec!["plan-body".to_string()])
+                .build(),
+        );
+        card.append(&row);
+    }
+
+    pop.set_child(Some(&card));
+    pop.popup();
+}
+
 fn vim_cycle_tab(stack: &Stack, delta: isize) {
     let loaded_tabs: Vec<String> = config::get()
         .layout
@@ -3165,7 +3284,7 @@ fn vim_handle_key_press(
         if !in_insert {
             let ch_s = key.to_unicode().map(|c| c.to_string()).unwrap_or_default();
             let v = &bcfg.vim;
-            if ch_s == v.close {
+            if ch_s == v.close || ch_s == "?" {
                 pop.popdown();
                 return true;
             }
@@ -3358,6 +3477,10 @@ fn vim_handle_key_press(
     }
 
     let Some(action) = matched_action else {
+        if ch == '?' {
+            vim_show_help_popover(sidebar, &bcfg.vim);
+            return true;
+        }
         return false;
     };
 
