@@ -248,8 +248,23 @@ safety before loading it:
 
 
 --------------------------------------------------------------------------------
-8. CUSTOM GTK4 CSS THEME PERFORMANCE TIPS (`~/.config/lily-dashboard/themes/css/`)
+8. CUSTOM STYLE PACKAGES & GTK4 CSS PERFORMANCE TIPS
+   (`~/.config/lily-dashboard/styles/<stylename>/`)
 --------------------------------------------------------------------------------
+
+Each style lives in its own folder under `~/.config/lily-dashboard/styles/`:
+  styles/<stylename>/
+    assets/
+      sounds/         Audio clips (.wav, .ogg, .flac, .mp3, .opus)
+      images/         Local images usable via url("assets/images/file.png")
+    <stylename>.css   GTK4 CSS rules (supports 17 palette @define-color vars)
+    <stylename>.sounds Event sound map (dash_open, dash_close, button_hover,
+                      button_click, tab_switch, pane_open, pane_close,
+                      destructive_click, vim_mode)
+
+The entire `styles/` tree is watched recursively so CSS, images, and `.sounds`
+edits hot-reload live. Users can mix CSS and sound packs via Link / Unlink
+and adjust Dashboard Sounds Volume in `System -> Styling`.
 
 Lily Dashboard automatically culls offscreen gradients, shadows, and animations
 outside scroll viewports (`±320px`) and slides the drawer using GTK4's retained

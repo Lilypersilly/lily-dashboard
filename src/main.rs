@@ -10,6 +10,7 @@ mod module_api;
 mod module_loader;
 mod modules_gen;
 mod session;
+mod sounds;
 mod weather;
 mod themes;
 mod media_popout;
@@ -68,7 +69,9 @@ fn main() {
     let reload_theme_startup = reload_theme_slot.clone();
     app.connect_startup(move |_| {
         config::ensure_bundled_fonts();
-        config::ensure_builtin_css_themes();
+        config::ensure_builtin_styles();
+        sounds::reload_active_pack();
+        module_api::register_sound_player(sounds::play_by_name);
         let reload_cb = init_theme();
         *reload_theme_startup.borrow_mut() = Some(reload_cb);
     });
@@ -870,6 +873,7 @@ fn init_theme() -> Rc<dyn Fn()> {
                 "#
             );
             scrollbar_provider.load_from_data(&scrollbar_css);
+            sounds::reload_active_pack();
         })
     };
 
@@ -889,24 +893,52 @@ fn init_theme() -> Rc<dyn Fn()> {
         std::boxed::Box::leak(std::boxed::Box::new(monitor));
     }
 
-    // Watch `~/.config/lily-dashboard/themes/css/` for live hot-reload when editing custom .css styles
-    let css_dir_file = gtk4::gio::File::for_path(config::css_themes_dir());
-    if let Ok(css_mon) = css_dir_file.monitor_directory(gtk4::gio::FileMonitorFlags::NONE, gtk4::gio::Cancellable::NONE) {
-        let cb = update_css.clone();
-        css_mon.connect_changed(move |_, _, _, event| {
-            if matches!(
-                event,
-                gtk4::gio::FileMonitorEvent::Changed
-                    | gtk4::gio::FileMonitorEvent::ChangesDoneHint
-                    | gtk4::gio::FileMonitorEvent::Created
-                    | gtk4::gio::FileMonitorEvent::Deleted
-                    | gtk4::gio::FileMonitorEvent::MovedIn
-                    | gtk4::gio::FileMonitorEvent::Renamed
+    // Watch `~/.config/lily-dashboard/styles/` recursively (CSS, .sounds, assets/) for live hot-reload
+    {
+        use notify::{EventKind, RecursiveMode, Watcher};
+        let styles_root = config::styles_dir();
+        let (tx_st, rx_st) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let mut watcher = match notify::recommended_watcher(
+                move |res: notify::Result<notify::Event>| {
+                    if let Ok(ev) = res {
+                        if matches!(
+                            ev.kind,
+                            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                        ) {
+                            let _ = tx_st.send(());
+                        }
+                    }
+                },
             ) {
-                cb();
+                Ok(w) => w,
+                Err(_) => return,
+            };
+            if watcher.watch(&styles_root, RecursiveMode::Recursive).is_ok() {
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
             }
         });
-        std::boxed::Box::leak(std::boxed::Box::new(css_mon));
+
+        let cb_st = update_css.clone();
+        let mut pending_deadline: Option<std::time::Instant> = None;
+        glib::timeout_add_local(Duration::from_millis(120), move || {
+            let mut got_event = false;
+            while rx_st.try_recv().is_ok() {
+                got_event = true;
+            }
+            if got_event {
+                pending_deadline = Some(std::time::Instant::now() + Duration::from_millis(120));
+            }
+            if let Some(dl) = pending_deadline {
+                if std::time::Instant::now() >= dl {
+                    pending_deadline = None;
+                    cb_st();
+                }
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     update_css
@@ -2291,10 +2323,19 @@ fn build_ui(
     let win_for_mods = window.clone();
     let sb_for_mods = sidebar_clamp.clone();
     let geom_for_mods = schedule_geometry_sync.clone();
+    let open_for_mods = is_open.clone();
+    let prev_tab_snd: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
     stack.connect_visible_child_name_notify(move |stk| {
         let current = stk.visible_child_name();
         let name = current.as_deref();
+        if let Some(n) = name {
+            let mut prev = prev_tab_snd.borrow_mut();
+            if open_for_mods.get() && prev.as_deref() != Some(n) {
+                sounds::play(sounds::SoundEvent::TabSwitch);
+            }
+            *prev = Some(n.to_string());
+        }
 
         let mut active_btn_widget: Option<gtk4::Widget> = None;
         for (id, btn) in nav_buttons_sync.borrow().iter() {
@@ -2368,7 +2409,20 @@ fn build_ui(
                     }
                     if let Some(ref dp) = handle.detail_pane {
                         let g_dp = geom_for_mods.clone();
-                        dp.connect_visible_notify(move |_| {
+                        let open_dp_snd = open_for_mods.clone();
+                        let prev_dp_vis = Cell::new(dp.is_visible());
+                        dp.connect_visible_notify(move |pane| {
+                            let vis = pane.is_visible();
+                            if vis != prev_dp_vis.get() {
+                                prev_dp_vis.set(vis);
+                                if open_dp_snd.get() {
+                                    sounds::play(if vis {
+                                        sounds::SoundEvent::PaneOpen
+                                    } else {
+                                        sounds::SoundEvent::PaneClose
+                                    });
+                                }
+                            }
                             g_dp();
                         });
                         if config::get().layout.side == "right" {
@@ -2632,6 +2686,7 @@ fn build_ui(
             move_to_monitor(&window_clone, None);
             open_click.set(true);
             closing_click.set(false);
+            sounds::play(sounds::SoundEvent::DashOpen);
             media_for_toggle.set_dashboard_open(true);
             stickies_for_toggle.set_dashboard_open(true);
 
@@ -2697,6 +2752,7 @@ fn build_ui(
             open_click.set(false);
             closing_click.set(true);
             hovered_click.set(false);
+            sounds::play(sounds::SoundEvent::DashClose);
             media_for_toggle.set_dashboard_open(false);
             stickies_for_toggle.set_dashboard_open(false);
 
@@ -2821,6 +2877,92 @@ fn build_ui(
         glib::Propagation::Proceed
     });
     window.add_controller(key_controller);
+
+    // Passive global UI sound triggers across all modules (hover + click + destructive click)
+    {
+        fn find_interactive_widget(root: &gtk4::Widget, x: f64, y: f64) -> Option<gtk4::Widget> {
+            let mut cur = root.pick(x, y, gtk4::PickFlags::DEFAULT);
+            while let Some(w) = cur {
+                if w == *root {
+                    break;
+                }
+                if w.is::<Button>() || w.is::<gtk4::CheckButton>() || w.is::<gtk4::Switch>() {
+                    if w.is_sensitive() && w.is_visible() {
+                        return Some(w);
+                    }
+                    return None;
+                }
+                cur = w.parent();
+            }
+            None
+        }
+
+        let last_hovered: Rc<RefCell<Option<glib::WeakRef<gtk4::Widget>>>> =
+            Rc::new(RefCell::new(None));
+        let hover_motion = EventControllerMotion::new();
+        {
+            let db_m = dash_box.clone();
+            let open_m = is_open.clone();
+            let lh_m = last_hovered.clone();
+            hover_motion.connect_motion(move |_, x, y| {
+                if !open_m.get() || db_m.has_css_class("dash-hibernated") {
+                    return;
+                }
+                let hit = find_interactive_widget(db_m.upcast_ref(), x, y);
+                let mut slot = lh_m.borrow_mut();
+                match hit {
+                    Some(w) => {
+                        let same = slot
+                            .as_ref()
+                            .and_then(|wr| wr.upgrade())
+                            .map(|prev| prev == w)
+                            .unwrap_or(false);
+                        if !same {
+                            *slot = Some(w.downgrade());
+                            sounds::play(sounds::SoundEvent::ButtonHover);
+                        }
+                    }
+                    None => {
+                        *slot = None;
+                    }
+                }
+            });
+        }
+        {
+            let lh_l = last_hovered;
+            hover_motion.connect_leave(move |_| {
+                *lh_l.borrow_mut() = None;
+            });
+        }
+        dash_box.add_controller(hover_motion);
+
+        let click_snd = GestureClick::builder()
+            .button(1)
+            .propagation_phase(gtk4::PropagationPhase::Capture)
+            .build();
+        let db_c = dash_box.clone();
+        let open_c = is_open.clone();
+        click_snd.connect_pressed(move |_, _, x, y| {
+            if !open_c.get() {
+                return;
+            }
+            let Some(w) = find_interactive_widget(db_c.upcast_ref(), x, y) else {
+                return;
+            };
+            if w.has_css_class("sidebar-nav-btn") {
+                return;
+            }
+            if w.has_css_class("plan-delete-menu-btn")
+                || w.has_css_class("plan-line-del-btn")
+                || w.has_css_class("power-btn") && w.has_css_class("armed")
+            {
+                sounds::play(sounds::SoundEvent::DestructiveClick);
+            } else {
+                sounds::play(sounds::SoundEvent::ButtonClick);
+            }
+        });
+        dash_box.add_controller(click_snd);
+    }
 
     drawer_container.append(&dash_box);
     drawer_container.append(&trigger_wrapper);
@@ -2951,6 +3093,10 @@ fn vim_is_text_input(w: &gtk4::Widget) -> bool {
     false
 }
 
+thread_local! {
+    static VIM_PREV_INSERT_MODE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
 fn vim_sync_indicator(win: &ApplicationWindow, badge: &Label, dash_box: &Box) {
     let vcfg = config::get().bindings.vim;
     if vcfg.enabled {
@@ -2971,6 +3117,18 @@ fn vim_sync_indicator(win: &ApplicationWindow, badge: &Label, dash_box: &Box) {
             badge.set_label("NRM");
             badge.remove_css_class("insert");
         }
+        let drawer_open = dash_box
+            .parent()
+            .map(|p| p.has_css_class("open"))
+            .unwrap_or(false);
+        VIM_PREV_INSERT_MODE.with(|slot| {
+            if let Some(prev) = slot.get() {
+                if prev != is_ins && drawer_open {
+                    sounds::play(sounds::SoundEvent::VimMode);
+                }
+            }
+            slot.set(Some(is_ins));
+        });
     }
 }
 
@@ -3315,11 +3473,23 @@ fn vim_trigger_context_menu(focused: &gtk4::Widget, win: &ApplicationWindow) -> 
 }
 
 fn vim_show_help_popover(anchor: &gtk4::Widget, v: &config::VimBindsConfig) {
+    // Open beside the sidebar (vertically centered over the content area) instead of GTK's
+    // default `Top` placement, which pushed the cheat-sheet off the top edge of the screen.
+    let is_right = config::get().layout.side == "right";
     let pop = gtk4::Popover::builder()
         .css_classes(vec!["fav-popover".to_string()])
         .autohide(true)
+        .has_arrow(false)
+        .position(if is_right {
+            gtk4::PositionType::Left
+        } else {
+            gtk4::PositionType::Right
+        })
         .build();
     pop.set_parent(anchor);
+    let (aw, ah) = (anchor.width().max(1), anchor.height().max(1));
+    pop.set_pointing_to(Some(&gdk::Rectangle::new(0, 0, aw, ah)));
+    pop.set_offset(if is_right { -6 } else { 6 }, 0);
     pop.connect_closed(|p| {
         let pw = p.downgrade();
         glib::idle_add_local_once(move || {

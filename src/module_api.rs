@@ -269,6 +269,23 @@ struct VaultBridge {
 
 static VAULT_BRIDGE: OnceLock<Mutex<Option<VaultBridge>>> = OnceLock::new();
 static RAM_WIPE_HOOKS: OnceLock<Mutex<Vec<fn()>>> = OnceLock::new();
+static SOUND_PLAYER_HOOK: OnceLock<Mutex<Option<fn(&str)>>> = OnceLock::new();
+
+pub fn register_sound_player(cb: fn(&str)) {
+    let lock = SOUND_PLAYER_HOOK.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = lock.lock() {
+        *guard = Some(cb);
+    }
+}
+
+#[allow(dead_code)]
+pub fn play_sound(event: &str) {
+    let lock = SOUND_PLAYER_HOOK.get_or_init(|| Mutex::new(None));
+    let func = lock.lock().ok().and_then(|g| *g);
+    if let Some(f) = func {
+        f(event);
+    }
+}
 
 pub fn register_vault_bridge(
     load_or_create: fn() -> Result<String, String>,

@@ -560,6 +560,14 @@ pub struct AppConfig {
     pub wallpaper_theme_sync: String,
     /// Mode used when auto-extracting theme from wallpaper: "dark" or "light"
     pub wallpaper_theme_mode: String,
+    /// When false, active UI sound pack follows `button_style`; when true, uses `sound_style`
+    pub sound_unlinked: bool,
+    /// Sound pack key used when `sound_unlinked == true` ("" or "none" for Silent)
+    pub sound_style: String,
+    /// Dashboard UI sound effects volume in [0.0, 1.0]
+    pub sound_volume: f64,
+    /// Master toggle for dashboard UI sound effects
+    pub sounds_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -581,6 +589,10 @@ impl Default for AppConfig {
             theme_targets: ThemeTargetsConfig::default(),
             wallpaper_theme_sync: "off".to_string(),
             wallpaper_theme_mode: "dark".to_string(),
+            sound_unlinked: false,
+            sound_style: String::new(),
+            sound_volume: 0.70,
+            sounds_enabled: true,
         }
     }
 }
@@ -1405,7 +1417,7 @@ pub fn import_theme_json(raw: &str) -> Result<(), String> {
 }
 
 // ==========================================
-// CUSTOM CSS STYLE THEMES (`~/.config/lily-dashboard/themes/css/`)
+// FOLDER-BASED STYLE PACKAGES (`~/.config/lily-dashboard/styles/<stylename>/`)
 // ==========================================
 
 const BUILTIN_CSS_THEMES: &[(&str, &str)] = &[
@@ -1417,33 +1429,288 @@ const BUILTIN_CSS_THEMES: &[(&str, &str)] = &[
     ("ghost.css", include_str!("../assets/css/ghost.css")),
 ];
 
-pub fn css_themes_dir() -> PathBuf {
+pub const STARTER_SOUNDS_TEMPLATE: &str = "\
+# Lily Dashboard UI Sound Pack\n\
+# Drop audio files (.wav, .ogg, .flac, .mp3, .opus) into assets/sounds/\n\
+# Syntax: event = assets/sounds/file.wav [@ 0.7]\n\
+# Comma-separate multiple paths for random variations.\n\
+#\n\
+# dash_open = assets/sounds/open.wav\n\
+# dash_close = assets/sounds/close.wav\n\
+# button_hover = assets/sounds/hover.wav @ 0.45\n\
+# button_click = assets/sounds/click.wav\n\
+# tab_switch = assets/sounds/tab.wav\n\
+# pane_open = assets/sounds/pane_open.wav\n\
+# pane_close = assets/sounds/pane_close.wav\n\
+# destructive_click = assets/sounds/warning.wav\n\
+# vim_mode = assets/sounds/mode.wav\n";
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct StylePackageInfo {
+    pub key: String,
+    pub name: String,
+    pub dir: PathBuf,
+    pub css_path: PathBuf,
+    pub sounds_path: PathBuf,
+    pub is_stock: bool,
+    pub sound_count: usize,
+}
+
+pub fn styles_dir() -> PathBuf {
     let dir = glib::user_config_dir()
         .join("lily-dashboard")
-        .join("themes")
-        .join("css");
+        .join("styles");
     let _ = fs::create_dir_all(&dir);
     dir
 }
 
-/// Installs the 6 stock `.css` style themes into `~/.config/lily-dashboard/themes/css/`
-/// if they don't already exist (never overwrites user edits).
-pub fn ensure_builtin_css_themes() {
-    let dir = css_themes_dir();
-    for &(fname, content) in BUILTIN_CSS_THEMES {
-        let dest = dir.join(fname);
-        if !dest.exists() {
-            let _ = fs::write(&dest, content);
-        }
+#[allow(dead_code)]
+pub fn css_themes_dir() -> PathBuf {
+    styles_dir()
+}
+
+pub fn sanitize_style_key(raw: &str) -> String {
+    let clean: String = raw
+        .trim()
+        .trim_end_matches(".css")
+        .trim_end_matches(".sounds")
+        .chars()
+        .filter(|c| !matches!(c, '/' | '\\' | '\0'))
+        .collect();
+    let trimmed = clean.trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "tonal".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
-/// Returns `(key, display_name)` for every `.css` style file in `~/.config/lily-dashboard/themes/css/`.
-pub fn list_css_themes() -> Vec<(String, String)> {
-    ensure_builtin_css_themes();
-    let dir = css_themes_dir();
-    let mut out = Vec::new();
+pub fn style_dir(key: &str) -> PathBuf {
+    styles_dir().join(sanitize_style_key(key))
+}
+
+/// Resolves `rel` against `base`, checking exact path first and falling back to
+/// component-by-component case-insensitive matching (supports `Assets/Sounds/...` and
+/// `assets/sounds/...` transparently on Linux).
+pub fn resolve_case_insensitive(base: &Path, rel: &str) -> Option<PathBuf> {
+    let clean_rel = rel.trim().trim_start_matches("./");
+    if clean_rel.is_empty() {
+        return None;
+    }
+    let exact = base.join(clean_rel);
+    if exact.exists() {
+        return Some(exact);
+    }
+    let mut cur = base.to_path_buf();
+    for comp in Path::new(clean_rel).components() {
+        match comp {
+            std::path::Component::Normal(seg) => {
+                let target = seg.to_string_lossy();
+                let next_exact = cur.join(seg);
+                if next_exact.exists() {
+                    cur = next_exact;
+                    continue;
+                }
+                let Ok(rd) = fs::read_dir(&cur) else {
+                    return None;
+                };
+                let mut found = None;
+                for entry in rd.flatten() {
+                    let name = entry.file_name();
+                    if name.to_string_lossy().eq_ignore_ascii_case(&target) {
+                        found = Some(entry.path());
+                        break;
+                    }
+                }
+                cur = found?;
+            }
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if cur.exists() {
+        Some(cur)
+    } else {
+        None
+    }
+}
+
+pub fn style_css_path(key: &str) -> PathBuf {
+    let clean = sanitize_style_key(key);
+    let dir = style_dir(&clean);
+    let named = dir.join(format!("{}.css", clean));
+    if named.is_file() {
+        return named;
+    }
+    let generic = dir.join("style.css");
+    if generic.is_file() {
+        return generic;
+    }
     if let Ok(rd) = fs::read_dir(&dir) {
+        let mut candidates: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("css"))
+            .collect();
+        candidates.sort();
+        if let Some(first) = candidates.into_iter().next() {
+            return first;
+        }
+    }
+    named
+}
+
+pub fn style_sounds_path(key: &str) -> PathBuf {
+    let clean = sanitize_style_key(key);
+    let dir = style_dir(&clean);
+    let named = dir.join(format!("{}.sounds", clean));
+    if named.is_file() {
+        return named;
+    }
+    let generic = dir.join("style.sounds");
+    if generic.is_file() {
+        return generic;
+    }
+    if let Ok(rd) = fs::read_dir(&dir) {
+        let mut candidates: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("sounds"))
+            .collect();
+        candidates.sort();
+        if let Some(first) = candidates.into_iter().next() {
+            return first;
+        }
+    }
+    named
+}
+
+pub fn style_sounds_dir(key: &str) -> PathBuf {
+    let dir = style_dir(key);
+    if let Some(found) = resolve_case_insensitive(&dir, "assets/sounds") {
+        if found.is_dir() {
+            return found;
+        }
+    }
+    let sub = dir.join("assets").join("sounds");
+    let _ = fs::create_dir_all(&sub);
+    sub
+}
+
+#[allow(dead_code)]
+pub fn style_images_dir(key: &str) -> PathBuf {
+    let dir = style_dir(key);
+    if let Some(found) = resolve_case_insensitive(&dir, "assets/images") {
+        if found.is_dir() {
+            return found;
+        }
+    }
+    let sub = dir.join("assets").join("images");
+    let _ = fs::create_dir_all(&sub);
+    sub
+}
+
+pub fn is_supported_audio_file(p: &Path) -> bool {
+    matches!(
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("wav" | "ogg" | "oga" | "flac" | "mp3" | "opus" | "aiff" | "m4a")
+    )
+}
+
+fn format_style_display_name(key: &str, css_path: &Path) -> String {
+    let mut display = key
+        .split(|c| c == '-' || c == '_')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut ch = w.chars();
+            match ch.next() {
+                Some(f) => format!("{}{}", f.to_uppercase(), ch.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Ok(raw) = fs::read_to_string(css_path) {
+        for line in raw.lines().take(5) {
+            if let Some(rest) = line.trim().strip_prefix("/*") {
+                let inner = rest.trim_end_matches("*/").trim();
+                if let Some(n) = inner.strip_prefix("@name") {
+                    let n = n.trim();
+                    if !n.is_empty() {
+                        display = n.to_string();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if display.is_empty() {
+        key.to_string()
+    } else {
+        display
+    }
+}
+
+fn count_active_sound_bindings(sounds_path: &Path) -> usize {
+    let Ok(raw) = fs::read_to_string(sounds_path) else {
+        return 0;
+    };
+    raw.lines()
+        .filter(|line| {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') || t.starts_with(';') {
+                return false;
+            }
+            if let Some((_, v)) = t.split_once('=') {
+                let val = v.split(" #").next().unwrap_or(v).trim();
+                !val.is_empty() && !val.eq_ignore_ascii_case("none")
+            } else {
+                false
+            }
+        })
+        .count()
+}
+
+fn ensure_style_skeleton(dir: &Path, stem: &str, css_content: Option<&str>) {
+    let _ = fs::create_dir_all(dir);
+    if resolve_case_insensitive(dir, "assets/sounds").is_none() {
+        let _ = fs::create_dir_all(dir.join("assets").join("sounds"));
+    }
+    if resolve_case_insensitive(dir, "assets/images").is_none() {
+        let _ = fs::create_dir_all(dir.join("assets").join("images"));
+    }
+    if let Some(css) = css_content {
+        let css_dest = dir.join(format!("{}.css", stem));
+        if !css_dest.exists() {
+            let _ = fs::write(&css_dest, css);
+        }
+    }
+    let sounds_dest = dir.join(format!("{}.sounds", stem));
+    if !sounds_dest.exists() {
+        let _ = fs::write(&sounds_dest, STARTER_SOUNDS_TEMPLATE);
+    }
+}
+
+/// Ensures the 6 stock styles exist in `~/.config/lily-dashboard/styles/<name>/` and
+/// non-destructively migrates any custom legacy `~/.config/lily-dashboard/themes/css/*.css`
+/// files into their own style folders with `assets/sounds/`, `assets/images/`, and `.sounds`.
+pub fn ensure_builtin_styles() {
+    let sdir = styles_dir();
+    for &(fname, content) in BUILTIN_CSS_THEMES {
+        let stem = fname.strip_suffix(".css").unwrap_or(fname);
+        let dir = sdir.join(stem);
+        ensure_style_skeleton(&dir, stem, Some(content));
+    }
+
+    let legacy_dir = glib::user_config_dir()
+        .join("lily-dashboard")
+        .join("themes")
+        .join("css");
+    if let Ok(rd) = fs::read_dir(&legacy_dir) {
         for entry in rd.flatten() {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) != Some("css") {
@@ -1452,55 +1719,202 @@ pub fn list_css_themes() -> Vec<(String, String)> {
             let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let mut display = stem
-                .split(|c| c == '-' || c == '_')
-                .filter(|w| !w.is_empty())
-                .map(|w| {
-                    let mut ch = w.chars();
-                    match ch.next() {
-                        Some(f) => format!("{}{}", f.to_uppercase(), ch.as_str()),
-                        None => String::new(),
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            if let Ok(raw) = fs::read_to_string(&p) {
-                for line in raw.lines().take(5) {
-                    if let Some(rest) = line.trim().strip_prefix("/*") {
-                        let inner = rest.trim_end_matches("*/").trim();
-                        if let Some(n) = inner.strip_prefix("@name") {
-                            let n = n.trim();
-                            if !n.is_empty() {
-                                display = n.to_string();
-                                break;
+            let target_dir = sdir.join(stem);
+            if !target_dir.exists() {
+                if let Ok(raw) = fs::read_to_string(&p) {
+                    ensure_style_skeleton(&target_dir, stem, Some(&raw));
+                }
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn ensure_builtin_css_themes() {
+    ensure_builtin_styles();
+}
+
+pub fn list_styles() -> Vec<StylePackageInfo> {
+    ensure_builtin_styles();
+    let dir = styles_dir();
+    let mut out = Vec::new();
+    let stock_order = ["tonal", "outlined", "pill", "solid", "neon", "ghost"];
+
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let Some(key) = p.file_name().and_then(|s| s.to_str()).map(|s| s.to_string()) else {
+                continue;
+            };
+            if key.starts_with('.') {
+                continue;
+            }
+            let css_path = style_css_path(&key);
+            if !css_path.is_file() {
+                continue;
+            }
+            let sounds_path = style_sounds_path(&key);
+            let name = format_style_display_name(&key, &css_path);
+            let is_stock = stock_order.contains(&key.as_str());
+            let sound_count = count_active_sound_bindings(&sounds_path);
+            out.push(StylePackageInfo {
+                key,
+                name,
+                dir: p,
+                css_path,
+                sounds_path,
+                is_stock,
+                sound_count,
+            });
+        }
+    }
+
+    out.sort_by(|a, b| {
+        let ia = stock_order.iter().position(|&s| s == a.key).unwrap_or(99);
+        let ib = stock_order.iter().position(|&s| s == b.key).unwrap_or(99);
+        ia.cmp(&ib)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    out
+}
+
+pub fn list_css_themes() -> Vec<(String, String)> {
+    list_styles()
+        .into_iter()
+        .map(|s| (s.key, s.name))
+        .collect()
+}
+
+pub fn create_new_style(raw_name: &str) -> Result<String, String> {
+    let trimmed = raw_name.trim();
+    if trimmed.is_empty() {
+        return Err("Enter a style name first.".to_string());
+    }
+    let mut key = String::new();
+    let mut prev_dash = false;
+    for c in trimmed.chars() {
+        if c.is_ascii_alphanumeric() {
+            key.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if (c == ' ' || c == '-' || c == '_') && !prev_dash && !key.is_empty() {
+            key.push('-');
+            prev_dash = true;
+        }
+    }
+    let key = key.trim_matches('-').to_string();
+    if key.is_empty() {
+        return Err("Style name must contain letters or numbers.".to_string());
+    }
+
+    let dir = style_dir(&key);
+    if dir.exists() {
+        return Err(format!("Style '{}' already exists.", key));
+    }
+
+    let starter_css = format!(
+        "/* @name {} */\n\n\
+         /* Customize colors using @bg_main, @bg_recessed, @fg_main, @accent, @accent2, @selection */\n\
+         /* Reference local images with: url(\"assets/images/banner.png\") */\n\n\
+         .plan-fmt-btn, .power-btn, .fav-item-btn, .sidebar-nav-btn {{\n    \
+             background-color: @fg_08;\n    \
+             border: 1px solid @accent_38;\n    \
+             border-radius: 8px;\n\
+         }}\n\n\
+         .plan-fmt-btn.active, .sidebar-nav-btn.selected, .fav-item-btn.pinned {{\n    \
+             background-color: @accent_24;\n    \
+             border-color: @accent2;\n\
+         }}\n",
+        trimmed
+    );
+    ensure_style_skeleton(&dir, &key, Some(&starter_css));
+    Ok(key)
+}
+
+/// Lists supported audio files in a style's `assets/sounds/` folder (up to 1 subdirectory deep)
+/// as relative paths usable in `<stylename>.sounds` (e.g. `assets/sounds/click.wav`).
+pub fn list_style_sound_files(key: &str) -> Vec<String> {
+    let base_dir = style_dir(key);
+    let sounds_dir = style_sounds_dir(key);
+    let mut files = Vec::new();
+
+    if let Ok(rd) = fs::read_dir(&sounds_dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_file() && is_supported_audio_file(&p) {
+                if let Ok(rel) = p.strip_prefix(&base_dir) {
+                    files.push(rel.to_string_lossy().to_string());
+                }
+            } else if p.is_dir() {
+                if let Ok(sub_rd) = fs::read_dir(&p) {
+                    for sub_e in sub_rd.flatten() {
+                        let sp = sub_e.path();
+                        if sp.is_file() && is_supported_audio_file(&sp) {
+                            if let Ok(rel) = sp.strip_prefix(&base_dir) {
+                                files.push(rel.to_string_lossy().to_string());
                             }
                         }
                     }
                 }
             }
-            out.push((stem.to_string(), display));
         }
     }
-    // Keep stock order first, then custom user themes alphabetically
-    let stock_order = ["tonal", "outlined", "pill", "solid", "neon", "ghost"];
-    out.sort_by(|a, b| {
-        let ia = stock_order.iter().position(|&s| s == a.0).unwrap_or(99);
-        let ib = stock_order.iter().position(|&s| s == b.0).unwrap_or(99);
-        ia.cmp(&ib)
-            .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
-    });
+    files.sort_by_key(|s| s.to_lowercase());
+    files
+}
+
+/// Rewrites relative CSS `url("assets/images/...")` paths against the style's directory so
+/// `CssProvider::load_from_data` resolves local image assets properly.
+pub fn rewrite_style_css_urls(raw_css: &str, style_base_dir: &Path) -> String {
+    let mut out = String::with_capacity(raw_css.len());
+    let mut rest = raw_css;
+
+    while let Some(pos) = rest.find("url(") {
+        out.push_str(&rest[..pos]);
+        let after_open = &rest[pos + 4..];
+        let Some(close_idx) = after_open.find(')') else {
+            out.push_str("url(");
+            out.push_str(after_open);
+            return out;
+        };
+        let inner = after_open[..close_idx].trim();
+        let clean = inner.trim_matches('"').trim_matches('\'').trim();
+
+        let lower = clean.to_ascii_lowercase();
+        if clean.is_empty()
+            || clean.starts_with('/')
+            || clean.starts_with('#')
+            || lower.starts_with("file://")
+            || lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("data:")
+            || lower.starts_with("resource:")
+        {
+            out.push_str(&rest[pos..pos + 4 + close_idx + 1]);
+        } else {
+            let resolved = resolve_case_insensitive(style_base_dir, clean)
+                .unwrap_or_else(|| style_base_dir.join(clean));
+            let abs_str = resolved.to_string_lossy().replace(' ', "%20");
+            out.push_str(&format!("url(\"file://{}\")", abs_str));
+        }
+
+        rest = &after_open[close_idx + 1..];
+    }
+    out.push_str(rest);
     out
 }
 
 pub fn load_css_theme_source(key: &str) -> String {
-    let clean = key.trim().trim_end_matches(".css");
-    let path = css_themes_dir().join(format!("{}.css", clean));
+    let clean = sanitize_style_key(key);
+    let path = style_css_path(&clean);
     if let Ok(raw) = fs::read_to_string(&path) {
-        return raw;
+        return rewrite_style_css_urls(&raw, &style_dir(&clean));
     }
     for &(fname, content) in BUILTIN_CSS_THEMES {
-        if fname.strip_suffix(".css") == Some(clean) {
-            return content.to_string();
+        if fname.strip_suffix(".css") == Some(clean.as_str()) {
+            return rewrite_style_css_urls(content, &style_dir(&clean));
         }
     }
     String::new()

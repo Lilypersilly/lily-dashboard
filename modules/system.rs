@@ -1880,6 +1880,7 @@ pub fn build_system_ui(
     let net_cat_btn = make_cat_btn("󰤨", "Network", "Connections, Wi-Fi & VPNs");
     let bt_cat_btn = make_cat_btn("󰂯", "Bluetooth", "Devices, pairing & battery");
     let theme_cat_btn = make_cat_btn("󰏘", "Themes", "Live desktop color palettes");
+    let style_cat_btn = make_cat_btn("󰉼", "Styling", "CSS styles, assets & UI sounds");
     let wall_cat_btn = make_cat_btn("󰸉", "Wallpapers", "Multi-monitor wallpaper picker");
     let disp_cat_btn = make_cat_btn("󰍹", "Displays", "Monitors, refresh & focus");
     let kbd_cat_btn = make_cat_btn("󰌌", "Keybinds", "Live Hyprland cheat sheet");
@@ -1890,6 +1891,7 @@ pub fn build_system_ui(
     list_view.append(&net_cat_btn);
     list_view.append(&bt_cat_btn);
     list_view.append(&theme_cat_btn);
+    list_view.append(&style_cat_btn);
     list_view.append(&wall_cat_btn);
     list_view.append(&disp_cat_btn);
     list_view.append(&kbd_cat_btn);
@@ -2049,6 +2051,10 @@ pub fn build_system_ui(
     theme_box.append(&theme_status_lbl);
     theme_box.append(&theme_content_box);
     detail_stack.add_named(&theme_scroll, Some("themes"));
+
+    // PAGE 3b: STYLING (CSS style packages, image/sound assets, UI event bindings & volume)
+    let (style_scroll, style_box) = make_scroll_page();
+    detail_stack.add_named(&style_scroll, Some("styling"));
 
     // PAGE 4: WALLPAPERS
     let (wall_scroll, wall_box) = make_scroll_page();
@@ -2409,6 +2415,7 @@ pub fn build_system_ui(
         ("network", net_cat_btn.clone()),
         ("bluetooth", bt_cat_btn.clone()),
         ("themes", theme_cat_btn.clone()),
+        ("styling", style_cat_btn.clone()),
         ("wallpapers", wall_cat_btn.clone()),
         ("displays", disp_cat_btn.clone()),
         ("keybinds", kbd_cat_btn.clone()),
@@ -2420,6 +2427,7 @@ pub fn build_system_ui(
         let tx_ref = tx.clone();
         let cpu_ref = cpu_state.clone();
         let sett_box_ref = sett_box.clone();
+        let style_box_ref = style_box.clone();
         let kbd_dash_ref = kbd_dash_box.clone();
         let kbd_vim_ref = kbd_vim_box.clone();
         let reload_theme_ref = reload_theme.clone();
@@ -2429,6 +2437,9 @@ pub fn build_system_ui(
             match section {
                 "settings" => {
                     render_settings_page(&sett_box_ref, &reload_theme_ref, &apply_tabs_ref);
+                }
+                "styling" => {
+                    render_styling_page(&style_box_ref, &reload_theme_ref);
                 }
                 "sound" => {
                     std::thread::spawn(move || {
@@ -2500,6 +2511,7 @@ pub fn build_system_ui(
                 "network" => "NETWORK",
                 "bluetooth" => "BLUETOOTH",
                 "themes" => "THEME SWITCH",
+                "styling" => "STYLING",
                 "wallpapers" => "WALLPAPERS",
                 "displays" => "DISPLAYS",
                 "keybinds" => "KEYBINDS",
@@ -2540,6 +2552,10 @@ pub fn build_system_ui(
     {
         let open_s = open_section.clone();
         theme_cat_btn.connect_clicked(move |_| open_s("themes"));
+    }
+    {
+        let open_s = open_section.clone();
+        style_cat_btn.connect_clicked(move |_| open_s("styling"));
     }
     {
         let open_s = open_section.clone();
@@ -6632,125 +6648,59 @@ fn render_settings_page(
     container.append(&cfg_card);
 
     // ------------------------------------------
-    // 1b. CSS STYLE THEMES (COLLAPSIBLE, LIVE HOT-RELOAD)
+    // 1b. STYLING SHORTCUT (Moved to System -> Styling)
     // ------------------------------------------
-    let css_themes = crate::config::list_css_themes();
-    let btn_card = Box::builder()
+    let css_themes = crate::config::list_styles();
+    let cur_style_name = css_themes
+        .iter()
+        .find(|s| s.key == cfg.button_style)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| cfg.button_style.clone());
+    let sound_sum = if !cfg.sounds_enabled {
+        "Sounds OFF".to_string()
+    } else if let Some(sk) = crate::sounds::active_sound_style_key(&cfg) {
+        let link_tag = if cfg.sound_unlinked { "Unlinked" } else { "Linked" };
+        format!("{} ({}) · {}%", sk, link_tag, (cfg.sound_volume * 100.0).round() as i32)
+    } else {
+        "Silent".to_string()
+    };
+
+    let styling_jump_card = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(8)
         .css_classes(vec!["plan-check-row".to_string()])
         .build();
-    btn_card.append(
+    styling_jump_card.append(
         &Label::builder()
-            .label("Drop custom .css files in ~/.config/lily-dashboard/themes/css/ — edits hot-reload live")
+            .label(&format!(
+                "CSS style packages, image assets, sound volume, and event-bound UI sounds live under System → Styling.\nActive style: {}  ·  Audio: {}",
+                cur_style_name, sound_sum
+            ))
             .halign(Align::Start)
             .wrap(true)
             .xalign(0.0)
             .css_classes(vec!["plan-subnote".to_string()])
             .build(),
     );
-    {
-        let style_flow = FlowBox::builder()
-            .selection_mode(SelectionMode::None)
-            .homogeneous(true)
-            .min_children_per_line(2)
-            .max_children_per_line(3)
-            .column_spacing(6)
-            .row_spacing(6)
-            .build();
-
-        for (val, title) in &css_themes {
-            let active = cfg.button_style == *val;
-            let text = if active {
-                format!("✓ {}", title)
-            } else {
-                title.clone()
-            };
-            let is_stock = matches!(
-                val.as_str(),
-                "tonal" | "outlined" | "pill" | "solid" | "neon" | "ghost"
-            );
-            let preview_cls = match val.as_str() {
-                "tonal" => "btn-preview-tonal",
-                "outlined" => "btn-preview-outlined",
-                "pill" => "btn-preview-pill",
-                "solid" => "btn-preview-solid",
-                "neon" => "btn-preview-neon",
-                "ghost" => "btn-preview-ghost",
-                _ => "plan-fmt-btn",
-            };
-            let mut classes = vec![preview_cls.to_string()];
-            if active || !is_stock {
-                classes.push("active".to_string());
+    let open_styling_btn = Button::builder()
+        .label("Open Styling (CSS & Sounds) →")
+        .css_classes(vec!["primary-btn".to_string()])
+        .build();
+    open_styling_btn.connect_clicked(|_| {
+        SYSTEM_OPEN_SECTION_CB.with(|slot| {
+            if let Some(ref cb) = *slot.borrow() {
+                cb("styling");
             }
-            let b = Button::builder()
-                .label(&text)
-                .css_classes(classes)
-                .hexpand(true)
-                .tooltip_text(&format!("{}.css", val))
-                .build();
-            let v_str = val.clone();
-            let c_box = container.clone();
-            let rel_t = reload_theme.clone();
-            let app_t = apply_tabs.clone();
-            b.connect_clicked(move |_| {
-                crate::config::update(|c| c.button_style = v_str.clone());
-                rel_t();
-                render_settings_page(&c_box, &rel_t, &app_t);
-            });
-            if is_stock {
-                style_flow.insert(&b, -1);
-            } else {
-                let scope_cls: String = val
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
-                    .collect();
-                let wrap = Box::builder()
-                    .orientation(Orientation::Horizontal)
-                    .css_classes(vec![format!("css-scope-{}", scope_cls)])
-                    .build();
-                wrap.append(&b);
-                style_flow.insert(&wrap, -1);
-            }
-        }
-        btn_card.append(&style_flow);
-    }
-
-    let css_btn_row = Box::builder()
-        .orientation(Orientation::Horizontal)
-        .spacing(6)
-        .build();
-    let open_css_dir_btn = Button::builder()
-        .label("Open CSS Folder")
-        .css_classes(vec!["fav-item-btn".to_string()])
-        .hexpand(true)
-        .build();
-    open_css_dir_btn.connect_clicked(|_| {
-        let dir = crate::config::css_themes_dir();
-        let _ = Command::new("xdg-open").arg(&dir).spawn();
-    });
-    let edit_css_btn = Button::builder()
-        .label("Edit Active .css")
-        .css_classes(vec!["fav-item-btn".to_string()])
-        .hexpand(true)
-        .build();
-    {
-        let cur_key = cfg.button_style.clone();
-        edit_css_btn.connect_clicked(move |_| {
-            let p = crate::config::css_themes_dir().join(format!("{}.css", cur_key));
-            let _ = Command::new("xdg-open").arg(&p).spawn();
         });
-    }
-    css_btn_row.append(&open_css_dir_btn);
-    css_btn_row.append(&edit_css_btn);
-    btn_card.append(&css_btn_row);
-
-    let css_style_label = css_themes
-        .iter()
-        .find(|(k, _)| k == &cfg.button_style)
-        .map(|(_, t)| t.clone())
-        .unwrap_or_else(|| cfg.button_style.clone());
-    append_collapsible_section(container, "buttons", "CSS STYLE", &css_style_label, &btn_card);
+    });
+    styling_jump_card.append(&open_styling_btn);
+    append_collapsible_section(
+        container,
+        "buttons",
+        "STYLING & SOUNDS",
+        &cur_style_name,
+        &styling_jump_card,
+    );
 
     // ------------------------------------------
     // 1b2. FONT SELECTOR (COLLAPSIBLE, LIVE)
@@ -9311,5 +9261,835 @@ pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::Modul
         detail_pane: Some(ui.detail_view.clone().upcast()),
         on_show: Some(std::rc::Rc::new(move || ui_show.open_panel())),
         on_hide: None,
+    }
+}
+
+// ==========================================
+// STYLING PAGE (CSS PACKAGES + UI SOUND PACKS)
+// ==========================================
+
+fn render_styling_page(container: &Box, reload_theme: &Rc<dyn Fn()>) {
+    let saved_scroll = container
+        .ancestor(ScrolledWindow::static_type())
+        .and_then(|w| w.downcast::<ScrolledWindow>().ok())
+        .map(|sw| {
+            let v = sw.vadjustment().value();
+            (sw, v)
+        });
+
+    clear_box(container);
+    let cfg = crate::config::get();
+    let styles = crate::config::list_styles();
+    let active_sound_key = crate::sounds::active_sound_style_key(&cfg);
+
+    // Debounced disk flush so dragging the sound volume slider never spams SSD writes
+    let flush_gen = Rc::new(Cell::new(0u64));
+    let schedule_flush: Rc<dyn Fn()> = {
+        let fg = flush_gen.clone();
+        Rc::new(move || {
+            let next = fg.get().wrapping_add(1);
+            fg.set(next);
+            let fg_chk = fg.clone();
+            glib::timeout_add_local_once(Duration::from_millis(450), move || {
+                if fg_chk.get() == next {
+                    crate::config::flush_to_disk();
+                }
+            });
+        })
+    };
+
+    // ------------------------------------------
+    // CARD 1: STYLE PACKS (CSS + ASSETS)
+    // ------------------------------------------
+    container.append(
+        &Label::builder()
+            .label("STYLE PACKS (CSS + ASSETS)")
+            .halign(Align::Start)
+            .css_classes(vec!["fav-group-header".to_string()])
+            .build(),
+    );
+
+    let pack_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .build();
+
+    pack_card.append(
+        &Label::builder()
+            .label(&format!(
+                "Folder: ~/.config/lily-dashboard/styles/{}/  (assets/sounds/, assets/images/, .css, .sounds)",
+                cfg.button_style
+            ))
+            .halign(Align::Start)
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build(),
+    );
+
+    {
+        let style_flow = FlowBox::builder()
+            .selection_mode(SelectionMode::None)
+            .homogeneous(true)
+            .min_children_per_line(2)
+            .max_children_per_line(3)
+            .column_spacing(6)
+            .row_spacing(6)
+            .build();
+
+        for style in &styles {
+            let active = cfg.button_style == style.key;
+            let base_lbl = if style.sound_count > 0 {
+                format!("{} ♪", style.name)
+            } else {
+                style.name.clone()
+            };
+            let text = if active {
+                format!("✓ {}", base_lbl)
+            } else {
+                base_lbl
+            };
+            let preview_cls = match style.key.as_str() {
+                "tonal" => "btn-preview-tonal",
+                "outlined" => "btn-preview-outlined",
+                "pill" => "btn-preview-pill",
+                "solid" => "btn-preview-solid",
+                "neon" => "btn-preview-neon",
+                "ghost" => "btn-preview-ghost",
+                _ => "plan-fmt-btn",
+            };
+            let mut classes = vec![preview_cls.to_string()];
+            if active || !style.is_stock {
+                classes.push("active".to_string());
+            }
+            let b = Button::builder()
+                .label(&text)
+                .css_classes(classes)
+                .hexpand(true)
+                .tooltip_text(&format!(
+                    "{}/  ({} bound sound(s))",
+                    style.key, style.sound_count
+                ))
+                .build();
+            let v_str = style.key.clone();
+            let c_box = container.clone();
+            let rel_t = reload_theme.clone();
+            b.connect_clicked(move |_| {
+                crate::config::update(|c| c.button_style = v_str.clone());
+                rel_t();
+                render_styling_page(&c_box, &rel_t);
+            });
+            if style.is_stock {
+                style_flow.insert(&b, -1);
+            } else {
+                let scope_cls: String = style
+                    .key
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect();
+                let wrap = Box::builder()
+                    .orientation(Orientation::Horizontal)
+                    .css_classes(vec![format!("css-scope-{}", scope_cls)])
+                    .build();
+                wrap.append(&b);
+                style_flow.insert(&wrap, -1);
+            }
+        }
+        pack_card.append(&style_flow);
+    }
+
+    let dir_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .homogeneous(true)
+        .build();
+    let open_styles_btn = Button::builder()
+        .label("Open Styles Dir")
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .build();
+    open_styles_btn.connect_clicked(|_| {
+        let dir = crate::config::styles_dir();
+        let _ = Command::new("xdg-open").arg(&dir).spawn();
+    });
+    let open_active_dir_btn = Button::builder()
+        .label("Open Style Folder")
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .build();
+    {
+        let cur_key = cfg.button_style.clone();
+        open_active_dir_btn.connect_clicked(move |_| {
+            let dir = crate::config::style_dir(&cur_key);
+            let _ = Command::new("xdg-open").arg(&dir).spawn();
+        });
+    }
+    dir_row.append(&open_styles_btn);
+    dir_row.append(&open_active_dir_btn);
+    pack_card.append(&dir_row);
+
+    let edit_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .homogeneous(true)
+        .build();
+    let edit_css_btn = Button::builder()
+        .label("Edit .css")
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .build();
+    {
+        let cur_key = cfg.button_style.clone();
+        edit_css_btn.connect_clicked(move |_| {
+            let p = crate::config::style_css_path(&cur_key);
+            let _ = Command::new("xdg-open").arg(&p).spawn();
+        });
+    }
+    let edit_sounds_btn = Button::builder()
+        .label("Edit .sounds")
+        .css_classes(vec!["fav-item-btn".to_string()])
+        .build();
+    {
+        let cur_key = cfg.button_style.clone();
+        edit_sounds_btn.connect_clicked(move |_| {
+            let p = crate::config::style_sounds_path(&cur_key);
+            let _ = Command::new("xdg-open").arg(&p).spawn();
+        });
+    }
+    edit_row.append(&edit_css_btn);
+    edit_row.append(&edit_sounds_btn);
+    pack_card.append(&edit_row);
+
+    let new_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let new_entry = Entry::builder()
+        .placeholder_text("New style name (e.g. Retro CRT)...")
+        .css_classes(vec!["fav-search".to_string()])
+        .hexpand(true)
+        .build();
+    let new_btn = Button::builder()
+        .label("+ New Style")
+        .css_classes(vec!["plan-fmt-btn".to_string()])
+        .build();
+    let new_status = Label::builder()
+        .label("")
+        .halign(Align::Start)
+        .wrap(true)
+        .css_classes(vec!["plan-subnote".to_string()])
+        .visible(false)
+        .build();
+    {
+        let ne = new_entry.clone();
+        let ns = new_status.clone();
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let do_create = Rc::new(move || {
+            let raw = ne.text().to_string();
+            match crate::config::create_new_style(&raw) {
+                Ok(key) => {
+                    crate::config::update(|c| c.button_style = key.clone());
+                    rel_t();
+                    render_styling_page(&c_box, &rel_t);
+                }
+                Err(err) => {
+                    ns.set_label(&err);
+                    ns.set_visible(true);
+                }
+            }
+        });
+        let dc1 = do_create.clone();
+        new_btn.connect_clicked(move |_| dc1());
+        new_entry.connect_activate(move |_| do_create());
+    }
+    new_row.append(&new_entry);
+    new_row.append(&new_btn);
+    pack_card.append(&new_row);
+    pack_card.append(&new_status);
+    container.append(&pack_card);
+
+    // ------------------------------------------
+    // CARD 2: DASHBOARD SOUNDS & LINKING
+    // ------------------------------------------
+    container.append(
+        &Label::builder()
+            .label("DASHBOARD SOUNDS & LINKING")
+            .halign(Align::Start)
+            .css_classes(vec!["fav-group-header".to_string()])
+            .margin_top(6)
+            .build(),
+    );
+
+    let audio_card = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .css_classes(vec!["plan-check-row".to_string()])
+        .build();
+
+    // Master Enable switch + Link/Unlink button
+    let top_ctrl_row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    let snd_enable_lbl = Label::builder()
+        .label("UI Sounds")
+        .halign(Align::Start)
+        .hexpand(true)
+        .css_classes(vec!["plan-body".to_string()])
+        .build();
+    let snd_switch = gtk4::Switch::builder()
+        .active(cfg.sounds_enabled)
+        .valign(Align::Center)
+        .build();
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        snd_switch.connect_active_notify(move |sw| {
+            let on = sw.is_active();
+            crate::config::update(|c| c.sounds_enabled = on);
+            crate::sounds::reload_active_pack();
+            render_styling_page(&c_box, &rel_t);
+        });
+    }
+    let unlink_btn = Button::builder()
+        .label(if cfg.sound_unlinked {
+            "🔓 Unlinked"
+        } else {
+            "🔗 Linked to Style"
+        })
+        .css_classes(if cfg.sound_unlinked {
+            vec!["plan-fmt-btn".to_string()]
+        } else {
+            vec!["plan-fmt-btn".to_string(), "active".to_string()]
+        })
+        .tooltip_text(if cfg.sound_unlinked {
+            "Sounds use an independent pack. Click to re-link to the active CSS style."
+        } else {
+            "Sounds automatically follow the active CSS style. Click to unlink and mix styles/sounds separately."
+        })
+        .build();
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        unlink_btn.connect_clicked(move |_| {
+            crate::config::update(|c| {
+                c.sound_unlinked = !c.sound_unlinked;
+                if c.sound_unlinked && c.sound_style.trim().is_empty() {
+                    c.sound_style = c.button_style.clone();
+                }
+            });
+            crate::sounds::reload_active_pack();
+            render_styling_page(&c_box, &rel_t);
+        });
+    }
+    top_ctrl_row.append(&snd_enable_lbl);
+    top_ctrl_row.append(&snd_switch);
+    top_ctrl_row.append(&unlink_btn);
+    audio_card.append(&top_ctrl_row);
+
+    // Dashboard Sounds Volume slider + Test button
+    let vol_wrap = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(4)
+        .build();
+    let init_vol_pct = (cfg.sound_volume.clamp(0.0, 1.0) * 100.0).round();
+    let vol_hdr = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let vol_title = Label::builder()
+        .label("Dashboard Sounds Volume")
+        .halign(Align::Start)
+        .hexpand(true)
+        .css_classes(vec!["plan-body".to_string()])
+        .build();
+    let vol_val_lbl = Label::builder()
+        .label(&format!("{}%", init_vol_pct as i32))
+        .halign(Align::End)
+        .css_classes(vec!["fav-score-badge".to_string()])
+        .build();
+    let test_pack_btn = Button::builder()
+        .label("▶ Test")
+        .css_classes(vec!["plan-close-btn".to_string()])
+        .tooltip_text("Preview active sound pack at current volume")
+        .build();
+    test_pack_btn.connect_clicked(|_| {
+        crate::sounds::preview_active_pack();
+    });
+    vol_hdr.append(&vol_title);
+    vol_hdr.append(&vol_val_lbl);
+    vol_hdr.append(&test_pack_btn);
+
+    let vol_scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+    vol_scale.set_draw_value(false);
+    vol_scale.set_hexpand(true);
+    vol_scale.set_value(init_vol_pct.clamp(0.0, 100.0));
+    vol_scale.set_css_classes(&["music-seek"]);
+
+    let pending_vol = Rc::new(Cell::new(init_vol_pct));
+    {
+        let lbl = vol_val_lbl.clone();
+        let pv = pending_vol.clone();
+        vol_scale.connect_value_changed(move |sc| {
+            let pct = sc.value().round().clamp(0.0, 100.0);
+            pv.set(pct);
+            lbl.set_label(&format!("{}%", pct as i32));
+            crate::config::update_in_memory(|c| c.sound_volume = pct / 100.0);
+        });
+    }
+    let commit_vol: Rc<dyn Fn()> = {
+        let pv = pending_vol.clone();
+        let fl = schedule_flush.clone();
+        Rc::new(move || {
+            let v = pv.get().clamp(0.0, 100.0) / 100.0;
+            crate::config::update_in_memory(|c| c.sound_volume = v);
+            fl();
+        })
+    };
+    attach_apply_on_release(&vol_scale, commit_vol);
+
+    vol_wrap.append(&vol_hdr);
+    vol_wrap.append(&vol_scale);
+    audio_card.append(&vol_wrap);
+
+    // Sound pack picker when Unlinked, or linked summary
+    if cfg.sound_unlinked {
+        audio_card.append(
+            &Label::builder()
+                .label("INDEPENDENT SOUND PACK")
+                .halign(Align::Start)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build(),
+        );
+        let snd_flow = FlowBox::builder()
+            .selection_mode(SelectionMode::None)
+            .homogeneous(true)
+            .min_children_per_line(2)
+            .max_children_per_line(3)
+            .column_spacing(6)
+            .row_spacing(6)
+            .build();
+
+        let is_silent = active_sound_key.is_none();
+        let silent_btn = Button::builder()
+            .label(if is_silent { "✓ Silent" } else { "Silent" })
+            .css_classes(if is_silent {
+                vec!["plan-fmt-btn".to_string(), "active".to_string()]
+            } else {
+                vec!["plan-fmt-btn".to_string()]
+            })
+            .hexpand(true)
+            .build();
+        {
+            let c_box = container.clone();
+            let rel_t = reload_theme.clone();
+            silent_btn.connect_clicked(move |_| {
+                crate::config::update(|c| c.sound_style = "none".to_string());
+                crate::sounds::reload_active_pack();
+                render_styling_page(&c_box, &rel_t);
+            });
+        }
+        snd_flow.insert(&silent_btn, -1);
+
+        for style in &styles {
+            let is_sel = active_sound_key.as_deref() == Some(style.key.as_str());
+            let base = if style.sound_count > 0 {
+                format!("{} ({})", style.name, style.sound_count)
+            } else {
+                style.name.clone()
+            };
+            let lbl = if is_sel {
+                format!("✓ {}", base)
+            } else {
+                base
+            };
+            let b = Button::builder()
+                .label(&lbl)
+                .css_classes(if is_sel {
+                    vec!["plan-fmt-btn".to_string(), "active".to_string()]
+                } else {
+                    vec!["plan-fmt-btn".to_string()]
+                })
+                .hexpand(true)
+                .build();
+            let k_str = style.key.clone();
+            let c_box = container.clone();
+            let rel_t = reload_theme.clone();
+            b.connect_clicked(move |_| {
+                crate::config::update(|c| c.sound_style = k_str.clone());
+                crate::sounds::reload_active_pack();
+                render_styling_page(&c_box, &rel_t);
+            });
+            snd_flow.insert(&b, -1);
+        }
+        audio_card.append(&snd_flow);
+    } else {
+        let linked_name = styles
+            .iter()
+            .find(|s| s.key == cfg.button_style)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| cfg.button_style.clone());
+        audio_card.append(
+            &Label::builder()
+                .label(&format!(
+                    "Linked: playing sounds from '{}' (click Unlink to mix CSS and sounds separately).",
+                    linked_name
+                ))
+                .halign(Align::Start)
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build(),
+        );
+    }
+
+    container.append(&audio_card);
+
+    // ------------------------------------------
+    // CARD 3: SOUND EVENT BINDINGS
+    // ------------------------------------------
+    if let Some(ref snd_key) = active_sound_key {
+        let snd_display = styles
+            .iter()
+            .find(|s| &s.key == snd_key)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| snd_key.clone());
+
+        container.append(
+            &Label::builder()
+                .label("EVENT SOUND BINDINGS")
+                .halign(Align::Start)
+                .css_classes(vec!["fav-group-header".to_string()])
+                .margin_top(6)
+                .build(),
+        );
+
+        let bind_card = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(6)
+            .css_classes(vec!["plan-check-row".to_string()])
+            .build();
+
+        let pack_top_row = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(6)
+            .build();
+        pack_top_row.append(
+            &Label::builder()
+                .label(&format!("Pack: {}", snd_display))
+                .halign(Align::Start)
+                .hexpand(true)
+                .css_classes(vec!["plan-h2".to_string()])
+                .build(),
+        );
+        let open_snd_dir_btn = Button::builder()
+            .label("Open sounds/")
+            .css_classes(vec!["plan-close-btn".to_string()])
+            .build();
+        {
+            let sk = snd_key.clone();
+            open_snd_dir_btn.connect_clicked(move |_| {
+                let d = crate::config::style_sounds_dir(&sk);
+                let _ = Command::new("xdg-open").arg(&d).spawn();
+            });
+        }
+        pack_top_row.append(&open_snd_dir_btn);
+        bind_card.append(&pack_top_row);
+
+        let avail_files = crate::config::list_style_sound_files(snd_key);
+        let parsed = crate::sounds::parse_sounds_file(snd_key);
+        let active_dialog: Rc<RefCell<Option<gtk4::FileChooserNative>>> =
+            Rc::new(RefCell::new(None));
+
+        bind_card.append(
+            &Label::builder()
+                .label(&if avail_files.is_empty() {
+                    "No audio files in assets/sounds/ yet — click an event below to import .wav/.ogg/.mp3/.flac files.".to_string()
+                } else {
+                    format!(
+                        "{} audio file(s) detected in styles/{}/assets/sounds/",
+                        avail_files.len(),
+                        snd_key
+                    )
+                })
+                .halign(Align::Start)
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build(),
+        );
+
+        let style_dir_path = crate::config::style_dir(snd_key);
+
+        for &(ev, _ev_key, ev_label) in crate::sounds::ALL_EVENTS {
+            let cur_raw = parsed.get(&ev).cloned();
+            let row_wrap = Box::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(6)
+                .build();
+
+            let ev_lbl = Label::builder()
+                .label(ev_label)
+                .halign(Align::Start)
+                .width_request(124)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .css_classes(vec!["plan-body".to_string()])
+                .build();
+
+            let pick_text = cur_raw
+                .as_deref()
+                .map(crate::sounds::short_binding_label)
+                .unwrap_or_else(|| "None".to_string());
+            let mut pick_cls = vec!["plan-fmt-btn".to_string()];
+            if cur_raw.is_some() {
+                pick_cls.push("active".to_string());
+            }
+            let pick_btn = Button::builder()
+                .label(&pick_text)
+                .css_classes(pick_cls)
+                .hexpand(true)
+                .tooltip_text(cur_raw.as_deref().unwrap_or("Click to assign an audio clip"))
+                .build();
+
+            let preview_btn = Button::builder()
+                .label("▶")
+                .css_classes(vec!["plan-close-btn".to_string()])
+                .sensitive(cur_raw.is_some())
+                .tooltip_text("Preview bound sound")
+                .build();
+            if let Some(ref raw_v) = cur_raw {
+                let first_part = raw_v
+                    .split('@')
+                    .next()
+                    .unwrap_or("")
+                    .split(',')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'');
+                let resolved_opt = if Path::new(first_part).is_absolute() {
+                    Some(PathBuf::from(first_part))
+                } else {
+                    crate::config::resolve_case_insensitive(&style_dir_path, first_part)
+                };
+                preview_btn.connect_clicked(move |_| {
+                    if let Some(ref p) = resolved_opt {
+                        crate::sounds::preview_sound_file(p);
+                    }
+                });
+            }
+
+            {
+                let rw_weak = row_wrap.downgrade();
+                let sk = snd_key.clone();
+                let files_c = avail_files.clone();
+                let dlg_slot = active_dialog.clone();
+                let c_box = container.clone();
+                let rel_t = reload_theme.clone();
+                let sd_path = style_dir_path.clone();
+
+                pick_btn.connect_clicked(move |_| {
+                    let Some(parent_box) = rw_weak.upgrade() else {
+                        return;
+                    };
+                    let pop = gtk4::Popover::builder()
+                        .css_classes(vec!["fav-popover".to_string()])
+                        .autohide(true)
+                        .build();
+                    pop.set_parent(&parent_box);
+                    pop.connect_closed(|p| {
+                        let pw = p.downgrade();
+                        glib::idle_add_local_once(move || {
+                            if let Some(pp) = pw.upgrade() {
+                                pp.unparent();
+                            }
+                        });
+                    });
+
+                    let menu = Box::builder()
+                        .orientation(Orientation::Vertical)
+                        .spacing(4)
+                        .margin_top(4)
+                        .margin_bottom(4)
+                        .margin_start(4)
+                        .margin_end(4)
+                        .width_request(240)
+                        .build();
+
+                    let none_btn = Button::builder()
+                        .label("None (Silent)")
+                        .css_classes(vec!["fav-hide-btn".to_string()])
+                        .hexpand(true)
+                        .build();
+                    {
+                        let sk_n = sk.clone();
+                        let pop_w = pop.downgrade();
+                        let cb_n = c_box.clone();
+                        let rt_n = rel_t.clone();
+                        none_btn.connect_clicked(move |_| {
+                            if let Some(p) = pop_w.upgrade() {
+                                p.popdown();
+                            }
+                            let _ = crate::sounds::save_sound_binding(&sk_n, ev, None);
+                            render_styling_page(&cb_n, &rt_n);
+                        });
+                    }
+                    menu.append(&none_btn);
+
+                    if !files_c.is_empty() {
+                        let sc = ScrolledWindow::builder()
+                            .hscrollbar_policy(PolicyType::Never)
+                            .vscrollbar_policy(PolicyType::Automatic)
+                            .max_content_height(200)
+                            .propagate_natural_height(true)
+                            .build();
+                        let f_box = Box::builder()
+                            .orientation(Orientation::Vertical)
+                            .spacing(4)
+                            .build();
+
+                        for rel in &files_c {
+                            let frow = Box::builder()
+                                .orientation(Orientation::Horizontal)
+                                .spacing(4)
+                                .build();
+                            let short = Path::new(rel)
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| rel.clone());
+                            let pick_f = Button::builder()
+                                .label(&short)
+                                .css_classes(vec!["fav-item-btn".to_string()])
+                                .hexpand(true)
+                                .tooltip_text(rel)
+                                .build();
+                            let play_f = Button::builder()
+                                .label("▶")
+                                .css_classes(vec!["plan-close-btn".to_string()])
+                                .tooltip_text("Preview")
+                                .build();
+                            let abs_p = sd_path.join(rel);
+                            play_f.connect_clicked(move |_| {
+                                crate::sounds::preview_sound_file(&abs_p);
+                            });
+
+                            let sk_p = sk.clone();
+                            let rel_p = rel.clone();
+                            let pop_w = pop.downgrade();
+                            let cb_p = c_box.clone();
+                            let rt_p = rel_t.clone();
+                            pick_f.connect_clicked(move |_| {
+                                if let Some(p) = pop_w.upgrade() {
+                                    p.popdown();
+                                }
+                                let _ = crate::sounds::save_sound_binding(&sk_p, ev, Some(&rel_p));
+                                render_styling_page(&cb_p, &rt_p);
+                            });
+                            frow.append(&pick_f);
+                            frow.append(&play_f);
+                            f_box.append(&frow);
+                        }
+                        sc.set_child(Some(&f_box));
+                        menu.append(&sc);
+                    }
+
+                    let import_btn = Button::builder()
+                        .label("+ Import Audio File...")
+                        .css_classes(vec!["primary-btn".to_string()])
+                        .hexpand(true)
+                        .build();
+                    {
+                        let sk_i = sk.clone();
+                        let pop_w = pop.downgrade();
+                        let ds = dlg_slot.clone();
+                        let cb_i = c_box.clone();
+                        let rt_i = rel_t.clone();
+                        import_btn.connect_clicked(move |_| {
+                            if let Some(p) = pop_w.upgrade() {
+                                p.popdown();
+                            }
+                            let dialog = gtk4::FileChooserNative::builder()
+                                .title(&format!("Import Sound for {}", ev_label))
+                                .action(gtk4::FileChooserAction::Open)
+                                .build();
+                            let filter = gtk4::FileFilter::new();
+                            filter.set_name(Some("Audio Files (WAV, OGG, FLAC, MP3, OPUS)"));
+                            for pat in &[
+                                "*.wav", "*.ogg", "*.oga", "*.flac", "*.mp3", "*.opus", "*.aiff",
+                                "*.m4a",
+                            ] {
+                                filter.add_pattern(pat);
+                            }
+                            dialog.add_filter(&filter);
+
+                            let sk_in = sk_i.clone();
+                            let cb_in = cb_i.clone();
+                            let rt_in = rt_i.clone();
+                            let ds_clear = ds.clone();
+                            dialog.connect_response(move |d, res| {
+                                if res == gtk4::ResponseType::Accept {
+                                    if let Some(src_p) = d.file().and_then(|f| f.path()) {
+                                        let base_d = crate::config::style_dir(&sk_in);
+                                        let dest_dir = crate::config::style_sounds_dir(&sk_in);
+                                        let _ = fs::create_dir_all(&dest_dir);
+                                        if let Some(fname) = src_p.file_name() {
+                                            let dest_path = dest_dir.join(fname);
+                                            if src_p != dest_path {
+                                                let _ = fs::copy(&src_p, &dest_path);
+                                            }
+                                            let rel_val = dest_path
+                                                .strip_prefix(&base_d)
+                                                .map(|r| r.to_string_lossy().to_string())
+                                                .unwrap_or_else(|_| {
+                                                    format!(
+                                                        "assets/sounds/{}",
+                                                        fname.to_string_lossy()
+                                                    )
+                                                });
+                                            let _ = crate::sounds::save_sound_binding(
+                                                &sk_in,
+                                                ev,
+                                                Some(&rel_val),
+                                            );
+                                            crate::sounds::preview_sound_file(&dest_path);
+                                            render_styling_page(&cb_in, &rt_in);
+                                        }
+                                    }
+                                }
+                                *ds_clear.borrow_mut() = None;
+                            });
+                            *ds.borrow_mut() = Some(dialog.clone());
+                            dialog.show();
+                        });
+                    }
+                    menu.append(&import_btn);
+
+                    pop.set_child(Some(&menu));
+                    pop.popup();
+                });
+            }
+
+            row_wrap.append(&ev_lbl);
+            row_wrap.append(&pick_btn);
+            row_wrap.append(&preview_btn);
+            bind_card.append(&row_wrap);
+        }
+
+        container.append(&bind_card);
+    }
+
+    if let Some((sw, v)) = saved_scroll {
+        if v > 0.0 {
+            glib::idle_add_local_once(move || {
+                let adj = sw.vadjustment();
+                adj.set_value(v.min((adj.upper() - adj.page_size()).max(0.0)));
+            });
+        }
     }
 }
