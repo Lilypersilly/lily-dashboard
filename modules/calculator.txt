@@ -1,0 +1,49 @@
+================================================================================
+MODULE EXPLANATION MANIFEST: calculator.rs
+================================================================================
+
+1. SUMMARY
+----------
+A multi-base calculator module for Lily Dashboard supporting Decimal (Base-10),
+Binary (Base-2), and Valalieh (Base-6) arithmetic with order-of-operations
+(PEMDAS), parentheses, and exponentiation (`^`). Features a Steins;Gate
+Divergence Meter number-spinning animation on evaluation (`=`) and a Quantum
+Decoherence button (`☢`) that multiplies the current result by a live quantum
+random number.
+
+
+2. IMPORTS & DASHPENDENCIES
+---------------------------
+Extra Crates (`// Dashpendencies:`):
+  - None.
+
+Core / Standard Library Imports Used:
+  - `gtk4` / `gtk4::glib`: Builds the calculator UI grid, base-toggle buttons,
+    entry field, and runs the 40ms Steins;Gate number-spin animation timer.
+  - `serde_json`: Parses the JSON response (`{"value": ...}`) returned by the
+    quantum random number API when the `☢` button is pressed.
+  - `std::cell::{Cell, RefCell}` & `std::rc::Rc`: Holds UI state (active base,
+    animation lock, last answer, and button sensitivity references).
+  - `std::fs::File` & `std::io::Read`: Reads 4 random bytes from `/dev/urandom`
+    for the visual number-spinning animation.
+  - `std::process::Command` & `std::sync::mpsc`: Runs `curl` on a background
+    thread when `☢` is clicked and sends the number back to the GTK main thread.
+  - `std::time::Duration`: Sets the 40ms frame interval for the spin animation.
+
+
+3. FILESYSTEM ACCESS
+--------------------
+  - Read-only: `/dev/urandom` (reads 4 bytes in `generate_random_spin()` to
+    generate random 6-digit display frames during the 400ms spin animation).
+  - Writes: None (0 bytes written to disk or SSD).
+
+
+4. COMMANDS & NETWORK
+---------------------
+  - Shell Command: `curl -sL -H "Accept: application/json" --max-time 2 <url>`
+      Executed ONLY when the user clicks the `☢` (Quantum Decoherence) button,
+      spawned asynchronously inside `std::thread::spawn` so the UI never blocks.
+  - Network URL Contacted: `https://lizaonair.com/qrng/?min=1&max=99`
+      Fetches a single quantum random number (1..99) to multiply the current
+      equation result by. If offline or unreachable within 2 seconds, falls
+      back locally to `42.0`.

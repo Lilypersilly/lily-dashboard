@@ -1163,6 +1163,12 @@ textview {{ padding: 16px; }}
                     &format!("gtk-application-prefer-dark-theme={}", gtk_dark),
                 );
                 let _ = fs::write(&s_ini, ini);
+            } else {
+                let ini = format!(
+                    "[Settings]\ngtk-theme-name={}\ngtk-icon-theme-name={}\ngtk-application-prefer-dark-theme={}\n",
+                    gtk_theme, icon_theme, gtk_dark
+                );
+                let _ = fs::write(&s_ini, ini);
             }
         }
 

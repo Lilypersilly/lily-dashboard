@@ -154,6 +154,22 @@ pub struct PathsConfig {
     pub source_repo_dir: String,
 }
 
+fn detect_default_keybinds_file() -> String {
+    let cfg = glib::user_config_dir();
+    for rel in [
+        "hypr/binds.lua",
+        "hypr/keybinds.lua",
+        "hypr/hyprland.lua",
+        "hypr/keybinds.conf",
+        "hypr/binds.conf",
+    ] {
+        if cfg.join(rel).is_file() {
+            return format!("~/.config/{}", rel);
+        }
+    }
+    "~/.config/hypr/hyprland.conf".to_string()
+}
+
 impl Default for PathsConfig {
     fn default() -> Self {
         let home = glib::home_dir();
@@ -163,14 +179,7 @@ impl Default for PathsConfig {
             "~/Documents/plans".to_string()
         };
 
-        let cfg = glib::user_config_dir();
-        let keybinds_file = if cfg.join("hypr/binds.lua").is_file() {
-            "~/.config/hypr/binds.lua".to_string()
-        } else if cfg.join("hypr/keybinds.conf").is_file() {
-            "~/.config/hypr/keybinds.conf".to_string()
-        } else {
-            "~/.config/hypr/hyprland.conf".to_string()
-        };
+        let keybinds_file = detect_default_keybinds_file();
 
         // Detect repo dir only if running from a local cargo build checkout
         let source_repo_dir = std::env::current_exe()
@@ -687,6 +696,13 @@ fn load_from_disk() -> AppConfig {
                 parsed.font_scale = 1.0;
             }
             parsed.font_scale = parsed.font_scale.clamp(0.75, 1.35);
+            if !expand_path(&parsed.paths.keybinds_file).is_file() {
+                let detected = detect_default_keybinds_file();
+                if expand_path(&detected).is_file() && detected != parsed.paths.keybinds_file {
+                    parsed.paths.keybinds_file = detected;
+                    save_to_disk(&parsed);
+                }
+            }
             return parsed;
         }
     }

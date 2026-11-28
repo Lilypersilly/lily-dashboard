@@ -64,6 +64,18 @@ It sits on the left edge of the active monitor, replaces Waybar (workspaces, sys
 
 ## Building & running
 
+### Quick Install (Arch Linux)
+
+```bash
+git clone https://github.com/Lilypersilly/lily-dashboard.git
+cd lily-dashboard
+./install.sh
+```
+
+`install.sh` installs required Arch build/runtime dependencies (`gtk4`, `gtk4-layer-shell`, Nerd Font, plus optional desktop tools after confirmation), compiles the release binary, symlinks `~/.local/bin/lily-dashboard`, configures dark GTK defaults, and wires startup/keybind/blur rules into your Hyprland config (supporting both Hyprlua `.lua` and classic `.conf`). Pass `-y` to skip prompts, or see `./install.sh --help`.
+
+### Manual Build
+
 ```bash
 cargo build --release
 ./target/release/lily-dashboard

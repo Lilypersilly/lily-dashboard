@@ -1,0 +1,126 @@
+================================================================================
+                    LILY DASHBOARD MODULE — SERVICES
+================================================================================
+
+File:      services.rs
+Tab ID:    services
+Title:     Services
+Lifecycle: stateful
+Hooks:     none
+
+--------------------------------------------------------------------------------
+1. SUMMARY
+--------------------------------------------------------------------------------
+
+A systemd service manager for Lily Dashboard supporting both System and User
+service scopes. It lists installed and loaded `.service` units (including
+stopped/disabled services), lets you filter by All/Active/Failed or search by
+name/description, and lets you pin frequently managed services (such as
+`plexmediaserver`, `docker`, or `sshd`) to the top of the list.
+
+Features:
+  - Left-click any service to open a 400px slide-out inspector pane displaying
+    its live state, cgroup freeze state, boot state, Main PID, memory usage,
+    start timestamp, one-click control buttons, and the last 45 `journalctl`
+    log lines (with a "Copy Logs" button).
+  - Right-click any service for a quick-action context menu:
+      * Start / Stop
+      * Restart
+      * Pause (Freeze) / Resume (Thaw) via systemd cgroup v2 freezer
+      * Pin to Top / Unpin (saved per scope)
+      * Enable at Boot / Disable at Boot
+      * Force Kill (SIGKILL)
+  - All `systemctl` and `journalctl` calls run on background threads so the GTK
+    UI never blocks. System-scope mutating actions invoke `pkexec` (when
+    installed) so your desktop Polkit agent handles authentication cleanly.
+
+
+--------------------------------------------------------------------------------
+2. IMPORTS & DASHPENDENCIES
+--------------------------------------------------------------------------------
+
+External Dashpendencies (crates.io):
+  - None. Uses only core crates already bundled with Lily Dashboard and the Rust
+    standard library.
+
+Core Crates & Imports Used:
+  - `gtk4` (`Align`, `Box`, `Button`, `GestureClick`, `Label`, `Orientation`,
+    `PolicyType`, `Popover`, `ScrolledWindow`, `SearchEntry`, `pango`,
+    `prelude::*`):
+      Builds the sidebar service list, right-click context popovers, and the
+      400px slide-out detail/logs pane.
+  - `gtk4::gdk`:
+      Writes recent `journalctl` logs to the Wayland clipboard when the user
+      clicks "Copy Logs" in the detail pane.
+  - `gtk4::glib`:
+      Resolves the user config directory (`user_config_dir`) and schedules
+      GTK main-loop callbacks (`timeout_add_local`, `timeout_add_local_once`,
+      `idle_add_local_once`, `ControlFlow`).
+  - `serde` (`Serialize`, `Deserialize`):
+      Serializes and deserializes pinned system/user service lists.
+  - `serde_json` (`from_str`, `to_string_pretty`):
+      Reads and writes the JSON config file for pinned services.
+  - `std` (`cell::{Cell, RefCell}`, `collections::{BTreeMap, BTreeSet, HashSet}`,
+    `fs`, `path::PathBuf`, `process::Command`, `rc::Rc`, `sync::mpsc`,
+    `time::Duration`, `thread::spawn`):
+      Manages UI state, reads/writes pin config, and executes `systemctl`,
+      `journalctl`, and `pkexec` on background threads.
+  - `crate::module_api` (`ModuleContext`, `ModuleHandle`):
+      Standard module API (`popover_guard`, `detail_pane`, `on_show`).
+  - `crate::config::bin_exists`:
+      Checks whether `pkexec` is installed in `PATH` before running system-level
+      mutating `systemctl` actions.
+  - Unsafe code:
+      None.
+
+
+--------------------------------------------------------------------------------
+3. FILESYSTEM ACCESS
+--------------------------------------------------------------------------------
+
+Directories Created (if missing):
+  - `~/.config/lily-dashboard/` (via `glib::user_config_dir()` + `fs::create_dir_all`)
+
+Files Read & Written:
+  - `~/.config/lily-dashboard/services.json`
+      Stores two JSON sets (`pinned_system` and `pinned_user`) of pinned
+      `.service` unit names. Read when the tab is built and written only when
+      the user pins or unpins a service.
+
+No other files or directories are read or written directly by this module.
+
+
+--------------------------------------------------------------------------------
+4. COMMANDS & NETWORK
+--------------------------------------------------------------------------------
+
+Shell Binaries Invoked (`std::process::Command::new`):
+  1. `systemctl [--user] list-unit-files --type=service --no-pager --no-legend --plain`
+       Read-only query to discover installed system/user `.service` unit files
+       and their boot states (`enabled`, `disabled`, `static`, etc.).
+  2. `systemctl [--user] list-units --type=service --all --no-pager --no-legend --plain`
+       Read-only query to read active/sub states and service descriptions.
+  3. `systemctl [--user] show --property=Id,FreezerState --no-pager <active_units...>`
+       Read-only batch query to detect paused (`frozen`) services in the list.
+  4. `systemctl [--user] show <unit> --property=ActiveState,SubState,FreezerState,UnitFileState,MainPID,MemoryCurrent,ActiveEnterTimestamp,Description --no-pager`
+       Read-only query to populate the 400px inspector detail pane when a
+       service is clicked.
+  5. `journalctl [--user] -u <unit> -n 45 --no-pager --output=short`
+       Read-only query to fetch the last 45 log lines for the selected service.
+  6. `pkexec systemctl <action> [extra_args...] <unit>` (for System scope when
+     `pkexec` is present; falls back to `systemctl <action> ... <unit>` if
+     absent) and `systemctl --user <action> [extra_args...] <unit>` (for User
+     scope):
+       Invoked ONLY when the user explicitly clicks a control button or
+       right-click menu action:
+         - `start`
+         - `stop`
+         - `restart`
+         - `freeze`          (pause service via cgroup v2 freezer)
+         - `thaw`            (resume paused service)
+         - `kill -s SIGKILL` (force kill service processes)
+         - `enable`          (enable service at boot)
+         - `disable`         (disable service at boot)
+
+Network Access:
+  - None. This module makes zero network connections and contacts no URLs.

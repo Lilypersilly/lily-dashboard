@@ -368,24 +368,24 @@ fn init_theme() -> Rc<dyn Fn()> {
     gtk4::style_context_add_provider_for_display(
         &display,
         &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        gtk4::STYLE_PROVIDER_PRIORITY_USER + 1,
     );
 
-    // Separate provider above STYLE_PROVIDER_PRIORITY_USER so our hairline scrollbars
+    // Separate provider above base dashboard CSS so our hairline scrollbars
     // beat ~/.config/gtk-4.0/gtk.css without interfering with dynamic_offset_provider
     let scrollbar_provider = CssProvider::new();
     gtk4::style_context_add_provider_for_display(
         &display,
         &scrollbar_provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_USER + 1,
+        gtk4::STYLE_PROVIDER_PRIORITY_USER + 2,
     );
 
-    // User-editable CSS style theme provider (`~/.config/lily-dashboard/themes/css/<name>.css`)
+    // User-editable CSS style theme provider (`~/.config/lily-dashboard/styles/<name>/<name>.css`)
     let user_css_provider = CssProvider::new();
     gtk4::style_context_add_provider_for_display(
         &display,
         &user_css_provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_USER + 2,
+        gtk4::STYLE_PROVIDER_PRIORITY_USER + 3,
     );
 
     // Structural performance guard provider above user CSS:
@@ -424,7 +424,7 @@ fn init_theme() -> Rc<dyn Fn()> {
     gtk4::style_context_add_provider_for_display(
         &display,
         &perf_guard_provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_USER + 3,
+        gtk4::STYLE_PROVIDER_PRIORITY_USER + 4,
     );
 
     let update_css: Rc<dyn Fn()> = {
@@ -446,6 +446,21 @@ fn init_theme() -> Rc<dyn Fn()> {
             let bg_pill = get_c!("bg_pill", get_c!("bg_dark", "2a202d"));
             let bg_recessed = get_c!("bg_recessed", get_c!("bg_dark", "141016"));
             let bg_contrast = get_c!("bg_contrast", get_c!("bg_dark", "110d13"));
+
+            let is_light_bg = {
+                let clean = bg_main.trim_start_matches('#');
+                if clean.len() >= 6 {
+                    let r = u8::from_str_radix(&clean[0..2], 16).unwrap_or(28) as f64;
+                    let g = u8::from_str_radix(&clean[2..4], 16).unwrap_or(22) as f64;
+                    let b = u8::from_str_radix(&clean[4..6], 16).unwrap_or(30) as f64;
+                    (0.299 * r + 0.587 * g + 0.114 * b) > 140.0
+                } else {
+                    false
+                }
+            };
+            if let Some(settings) = gtk4::Settings::default() {
+                settings.set_gtk_application_prefer_dark_theme(!is_light_bg);
+            }
             
             let fg_main = get_c!("fg_main", "fee4ff");
             let fg_muted = get_c!("fg_muted", get_c!("fg_dim", "a884a6"));
@@ -557,6 +572,7 @@ fn init_theme() -> Rc<dyn Fn()> {
             let css = format!(
                 r#"
                 window {{ background-color: transparent; }}
+                button {{ background-image: none; text-shadow: none; -gtk-icon-shadow: none; }}
                 .drawer-container {{ transform: translateX({closed_tx}); transition: transform {anim_ms}ms cubic-bezier(0.25, 0.8, 0.25, 1); }}
                 .drawer-container.open {{ transform: translateX(0px); }}
                 
@@ -1112,7 +1128,7 @@ fn build_ui(
     gtk4::style_context_add_provider_for_display(
         &gdk::Display::default().expect("Could not connect to a display."),
         &dynamic_offset_provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_USER,
+        gtk4::STYLE_PROVIDER_PRIORITY_USER + 2,
     );
 
     let stack = Stack::new();
