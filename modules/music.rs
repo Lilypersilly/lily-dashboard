@@ -1785,6 +1785,7 @@ pub fn build_music_ui() -> Box {
         .build();
     let home_content_box = Box::builder().orientation(Orientation::Vertical).spacing(6).build();
     home_scroll.set_child(Some(&home_content_box));
+    crate::module_api::attach_viewport_culler(&home_scroll, &home_content_box);
     home_screen.append(&home_scroll);
 
     // PAGE A: PLAYLISTS
@@ -1810,6 +1811,7 @@ pub fn build_music_ui() -> Box {
         .build();
     let playlists_box = Box::builder().orientation(Orientation::Vertical).spacing(6).build();
     pl_scroll.set_child(Some(&playlists_box));
+    crate::module_api::attach_viewport_culler(&pl_scroll, &playlists_box);
     playlists_screen.append(&pl_header_row);
     playlists_screen.append(&pl_scroll);
 
@@ -1864,6 +1866,7 @@ pub fn build_music_ui() -> Box {
         .build();
     let track_list_box = Box::builder().orientation(Orientation::Vertical).spacing(6).build();
     tr_scroll.set_child(Some(&track_list_box));
+    crate::module_api::attach_viewport_culler(&tr_scroll, &track_list_box);
     tracks_screen.append(&tr_top_row);
     tracks_screen.append(&active_pl_title_lbl);
     tracks_screen.append(&limit_edit_row);
@@ -1898,6 +1901,7 @@ pub fn build_music_ui() -> Box {
         .build();
     let queue_list_box = Box::builder().orientation(Orientation::Vertical).spacing(6).build();
     q_scroll.set_child(Some(&queue_list_box));
+    crate::module_api::attach_viewport_culler(&q_scroll, &queue_list_box);
     queue_screen.append(&q_top_row);
     queue_screen.append(&q_scroll);
 

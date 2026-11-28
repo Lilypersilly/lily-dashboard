@@ -333,6 +333,7 @@ pub fn build_passwords_ui(
         .build();
 
     scrolled.set_child(Some(&list_container));
+    crate::module_api::attach_viewport_culler(&scrolled, &list_container);
     root.append(&search_entry);
     root.append(&locker_bar);
     root.append(&scrolled);

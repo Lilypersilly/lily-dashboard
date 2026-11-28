@@ -121,6 +121,7 @@ where
         .build();
 
     list_scroll.set_child(Some(&files_box));
+    crate::module_api::attach_viewport_culler(&list_scroll, &files_box);
     list_view.append(&list_scroll);
 
     let create_box = Box::builder()
@@ -1089,6 +1090,7 @@ fn render_plan_file(
     }
 
     scrolled.set_child(Some(&content_box));
+    crate::module_api::attach_viewport_culler(&scrolled, &content_box);
     detail_view.append(&scrolled);
 
     if edit_mode {

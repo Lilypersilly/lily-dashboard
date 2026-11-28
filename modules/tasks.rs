@@ -134,6 +134,7 @@ pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::Modul
         .spacing(6)
         .build();
     scrolled.set_child(Some(&list_box));
+    crate::module_api::attach_viewport_culler(&scrolled, &list_box);
     root.append(&scrolled);
 
     // State Variables

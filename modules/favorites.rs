@@ -222,6 +222,7 @@ pub fn build_favorites_ui(popover_guard: Rc<Cell<usize>>) -> FavoritesUi {
         .build();
 
     scrolled.set_child(Some(&list_container));
+    crate::module_api::attach_viewport_culler(&scrolled, &list_container);
     root.append(&search_entry);
     root.append(&scrolled);
 

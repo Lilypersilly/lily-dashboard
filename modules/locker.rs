@@ -1137,6 +1137,7 @@ pub fn build_locker_ui(popover_guard: Rc<Cell<usize>>) -> Box {
         .spacing(6)
         .build();
     files_scroll.set_child(Some(&files_list_box));
+    crate::module_api::attach_viewport_culler(&files_scroll, &files_list_box);
 
     let status_bar_lbl = Label::builder()
         .label("Ready.")

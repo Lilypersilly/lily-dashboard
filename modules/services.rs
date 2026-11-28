@@ -592,6 +592,7 @@ pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::Modul
         .spacing(6)
         .build();
     scrolled.set_child(Some(&list_container));
+    crate::module_api::attach_viewport_culler(&scrolled, &list_container);
     root.append(&scrolled);
 
     // --- RIGHT 400PX SLIDE-OUT DETAIL PANE ---

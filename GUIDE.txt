@@ -246,3 +246,28 @@ safety before loading it:
    file path, shell command, and network call in the Rust code against the
    explanation file, and tell me if anything is undeclared or unsafe to run."
 
+
+--------------------------------------------------------------------------------
+8. CUSTOM GTK4 CSS THEME PERFORMANCE TIPS (`~/.config/lily-dashboard/themes/css/`)
+--------------------------------------------------------------------------------
+
+Lily Dashboard automatically culls offscreen gradients, shadows, and animations
+outside scroll viewports (`±320px`) and slides the drawer using GTK4's retained
+`GskRenderNode` cache. When designing heavy HUD / sci-fi / glass `.css` themes,
+keep these three GTK4 GSK renderer tips in mind for maximum FPS on onscreen rows:
+
+  1. Put full-panel grids / radial glows on `.dash-box, .plan-detail-pane`
+     instead of `stack, viewport`. Styling both `stack` and `viewport` stacks
+     multiple overlapping full-panel procedural shaders inside nested scroll
+     containers.
+  2. Avoid `infinite` animations that mutate blurred `box-shadow`s every frame.
+     In GTK4's GSK renderer, animating `opacity` or `border-color` is cheap,
+     whereas changing a blurred `inset` / outset `box-shadow` every frame forces
+     GSK to re-blur shadow nine-slices at monitor refresh rate while open.
+  3. Keep resting `.fav-item-btn` list rows lean (1–2 background layers) and
+     ignite heavy multi-layer corner brackets or glow sweeps on `:hover`,
+     `.pinned`, `.active`, or `.selected`. Because `.fav-item-btn` appears 20+
+     times simultaneously in visible list viewports, keeping its idle state lean
+     reduces onscreen GPU render nodes ~5x with nearly identical visuals.
+
+

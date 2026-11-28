@@ -2341,6 +2341,7 @@ pub fn build_system_ui(
         .margin_bottom(8)
         .build();
     kbd_dash_scroll.set_child(Some(&kbd_dash_box));
+    crate::module_api::attach_viewport_culler(&kbd_dash_scroll, &kbd_dash_box);
 
     let kbd_vim_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
@@ -2354,6 +2355,7 @@ pub fn build_system_ui(
         .margin_bottom(8)
         .build();
     kbd_vim_scroll.set_child(Some(&kbd_vim_box));
+    crate::module_api::attach_viewport_culler(&kbd_vim_scroll, &kbd_vim_box);
 
     kbd_sub_stack.add_named(&kbd_hypr_page, Some("hypr"));
     kbd_sub_stack.add_named(&kbd_dash_scroll, Some("dash"));
@@ -6836,6 +6838,7 @@ fn render_settings_page(
         .spacing(3)
         .build();
     font_scroll.set_child(Some(&font_list_box));
+    crate::module_api::attach_viewport_culler(&font_scroll, &font_list_box);
     font_card.append(&font_scroll);
 
     let all_fonts = Rc::new(crate::config::list_installed_fonts());
