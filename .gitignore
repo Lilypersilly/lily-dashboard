@@ -11,6 +11,25 @@ assets/css/*
 !assets/css/solid.css
 !assets/css/tonal.css
 
+# Local / custom modules (only keep the 15 official modules tracked)
+modules/*.rs
+modules/*.txt
+!modules/calendar.rs
+!modules/clipboard.rs
+!modules/drive.rs
+!modules/favorites.rs
+!modules/launcher.rs
+!modules/locker.rs
+!modules/music.rs
+!modules/passwords.rs
+!modules/plans.rs
+!modules/scicalc.rs
+!modules/services.rs
+!modules/system.rs
+!modules/tasks.rs
+!modules/timers.rs
+!modules/usb_drives.rs
+
 # Local scratch, agent rules, & release notes
 patchnotes.txt
 AGENTS.md

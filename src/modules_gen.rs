@@ -3,8 +3,6 @@
 
 use crate::module_api::{ModuleDescriptor, ModuleLifecycle};
 
-#[path = "../modules/calculator.rs"]
-pub mod calculator;
 #[path = "../modules/calendar.rs"]
 pub mod calendar;
 #[path = "../modules/clipboard.rs"]
@@ -27,8 +25,6 @@ pub mod plans;
 pub mod scicalc;
 #[path = "../modules/services.rs"]
 pub mod services;
-#[path = "../modules/steam.rs"]
-pub mod steam;
 #[path = "../modules/system.rs"]
 pub mod system;
 #[path = "../modules/tasks.rs"]
@@ -40,15 +36,6 @@ pub mod usb_drives;
 
 pub fn all_modules() -> Vec<ModuleDescriptor> {
     vec![
-        ModuleDescriptor {
-            id: "calculator",
-            title: "Calculator",
-            lifecycle: ModuleLifecycle::Stateful,
-            build: calculator::build,
-            init: None,
-            shutdown: None,
-            on_visibility: None,
-        },
         ModuleDescriptor {
             id: "calendar",
             title: "Calendar",
@@ -144,15 +131,6 @@ pub fn all_modules() -> Vec<ModuleDescriptor> {
             title: "Services",
             lifecycle: ModuleLifecycle::Stateful,
             build: services::build,
-            init: None,
-            shutdown: None,
-            on_visibility: None,
-        },
-        ModuleDescriptor {
-            id: "steam",
-            title: "Steam",
-            lifecycle: ModuleLifecycle::Stateless,
-            build: steam::build,
             init: None,
             shutdown: None,
             on_visibility: None,
