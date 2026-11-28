@@ -154,20 +154,117 @@ pub struct PathsConfig {
     pub source_repo_dir: String,
 }
 
-fn detect_default_keybinds_file() -> String {
-    let cfg = glib::user_config_dir();
-    for rel in [
-        "hypr/binds.lua",
-        "hypr/keybinds.lua",
-        "hypr/hyprland.lua",
-        "hypr/keybinds.conf",
-        "hypr/binds.conf",
-    ] {
-        if cfg.join(rel).is_file() {
-            return format!("~/.config/{}", rel);
+fn format_user_path(path: &Path) -> String {
+    let home = glib::home_dir();
+    if let Ok(rel) = path.strip_prefix(&home) {
+        format!("~/{}", rel.to_string_lossy())
+    } else {
+        path.to_string_lossy().to_string()
+    }
+}
+
+pub fn has_hyprlua_config() -> bool {
+    let hypr_dir = glib::user_config_dir().join("hypr");
+    hypr_dir.join("hyprland.lua").is_file()
+        || (hypr_dir.join("init.lua").is_file() && !hypr_dir.join("hyprland.conf").is_file())
+}
+
+fn find_required_lua_binds_file(hypr_dir: &Path) -> Option<PathBuf> {
+    let content = fs::read_to_string(hypr_dir.join("hyprland.lua")).ok()?;
+    for raw_line in content.lines() {
+        let line = raw_line.split("--").next().unwrap_or("");
+        let mut search_from = 0;
+        while let Some(pos) = line[search_from..].find("require") {
+            let start = search_from + pos;
+            let before_ok = start == 0
+                || !line[..start]
+                    .chars()
+                    .next_back()
+                    .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                    .unwrap_or(false);
+            let after_kw = &line[start + "require".len()..];
+            let after_ws = after_kw.trim_start();
+            let after_paren = after_ws
+                .strip_prefix('(')
+                .map(|s| s.trim_start())
+                .unwrap_or(after_ws);
+            if before_ok
+                && (after_kw.starts_with('(')
+                    || after_kw.starts_with(|c: char| c.is_whitespace() || c == '"' || c == '\''))
+            {
+                if let Some(quote) = after_paren.chars().next().filter(|&c| c == '"' || c == '\'') {
+                    if let Some(end_q) = after_paren[1..].find(quote) {
+                        let mod_name = after_paren[1..1 + end_q].trim();
+                        let lower = mod_name.to_ascii_lowercase();
+                        if lower.contains("bind") && lower != "lily-dashboard" {
+                            let rel = mod_name.replace('.', "/");
+                            for cand in [
+                                hypr_dir.join(format!("{}.lua", rel)),
+                                hypr_dir.join(&rel).join("init.lua"),
+                            ] {
+                                if cand.is_file() {
+                                    return Some(cand);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            search_from = start + "require".len();
         }
     }
-    "~/.config/hypr/hyprland.conf".to_string()
+    None
+}
+
+pub fn detect_default_keybinds_file_for(prefer_lua: bool) -> String {
+    let hypr_dir = glib::user_config_dir().join("hypr");
+    if prefer_lua {
+        for rel in [
+            "binds.lua",
+            "keybinds.lua",
+            "conf/binds.lua",
+            "conf/keybinds.lua",
+            "configs/binds.lua",
+            "configs/keybinds.lua",
+            "config/binds.lua",
+            "config/keybinds.lua",
+        ] {
+            let cand = hypr_dir.join(rel);
+            if cand.is_file() {
+                return format_user_path(&cand);
+            }
+        }
+        if let Some(req_file) = find_required_lua_binds_file(&hypr_dir) {
+            return format_user_path(&req_file);
+        }
+        for rel in ["hyprland.lua", "init.lua"] {
+            let cand = hypr_dir.join(rel);
+            if cand.is_file() {
+                return format_user_path(&cand);
+            }
+        }
+        format_user_path(&hypr_dir.join("hyprland.lua"))
+    } else {
+        for rel in [
+            "keybinds.conf",
+            "binds.conf",
+            "conf/keybinds.conf",
+            "conf/binds.conf",
+            "configs/keybinds.conf",
+            "configs/binds.conf",
+            "hyprland.conf",
+        ] {
+            let cand = hypr_dir.join(rel);
+            if cand.is_file() {
+                return format_user_path(&cand);
+            }
+        }
+        format_user_path(&hypr_dir.join("hyprland.conf"))
+    }
+}
+
+fn detect_default_keybinds_file() -> String {
+    detect_default_keybinds_file_for(has_hyprlua_config())
 }
 
 impl Default for PathsConfig {
@@ -696,9 +793,34 @@ fn load_from_disk() -> AppConfig {
                 parsed.font_scale = 1.0;
             }
             parsed.font_scale = parsed.font_scale.clamp(0.75, 1.35);
-            if !expand_path(&parsed.paths.keybinds_file).is_file() {
-                let detected = detect_default_keybinds_file();
-                if expand_path(&detected).is_file() && detected != parsed.paths.keybinds_file {
+            let hyprlua_active = match parsed.tools.hypr_dispatch_mode.as_str() {
+                "hyprlua" => true,
+                "classic" => false,
+                _ => has_hyprlua_config(),
+            };
+            let cur_path = expand_path(&parsed.paths.keybinds_file);
+            let cur_empty = parsed.paths.keybinds_file.trim().is_empty();
+            let cur_missing = cur_empty || !cur_path.is_file();
+            let cur_is_wrong_hyprland_conf = hyprlua_active
+                && cur_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.eq_ignore_ascii_case("hyprland.conf"))
+                    .unwrap_or(false);
+            let cur_is_wrong_lua_in_classic = parsed.tools.hypr_dispatch_mode == "classic"
+                && cur_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("lua"))
+                    .unwrap_or(false);
+            if cur_missing || cur_is_wrong_hyprland_conf || cur_is_wrong_lua_in_classic {
+                let detected = detect_default_keybinds_file_for(hyprlua_active);
+                if (expand_path(&detected).is_file()
+                    || cur_empty
+                    || cur_is_wrong_hyprland_conf
+                    || cur_is_wrong_lua_in_classic)
+                    && detected != parsed.paths.keybinds_file
+                {
                     parsed.paths.keybinds_file = detected;
                     save_to_disk(&parsed);
                 }
@@ -1069,8 +1191,36 @@ pub fn is_hyprlua() -> bool {
     match mode.as_str() {
         "hyprlua" => true,
         "classic" => false,
-        _ => glib::user_config_dir().join("hypr/hyprland.lua").is_file(),
+        _ => has_hyprlua_config(),
     }
+}
+
+pub fn resolve_keybinds_file() -> PathBuf {
+    let cfg = get();
+    let hyprlua_active = is_hyprlua();
+    let cur_raw = cfg.paths.keybinds_file.trim();
+    let cur_path = expand_path(cur_raw);
+    let is_wrong_hyprland_conf = hyprlua_active
+        && cur_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.eq_ignore_ascii_case("hyprland.conf"))
+            .unwrap_or(false);
+    let is_wrong_lua_in_classic = cfg.tools.hypr_dispatch_mode == "classic"
+        && cur_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("lua"))
+            .unwrap_or(false);
+
+    if cur_raw.is_empty() || is_wrong_hyprland_conf || is_wrong_lua_in_classic {
+        let detected = detect_default_keybinds_file_for(hyprlua_active);
+        if detected != cfg.paths.keybinds_file {
+            update(|c| c.paths.keybinds_file = detected.clone());
+        }
+        return expand_path(&detected);
+    }
+    cur_path
 }
 
 pub fn hypr_focus_workspace(ws: &str) {

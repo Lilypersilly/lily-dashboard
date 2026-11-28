@@ -1520,7 +1520,7 @@ fn split_top_level_args(s: &str) -> Vec<String> {
 }
 
 fn fetch_keybinds_snapshot() -> Vec<KeybindEntry> {
-    let path = crate::config::expand_path(&crate::config::get().paths.keybinds_file);
+    let path = crate::config::resolve_keybinds_file();
     let Ok(content) = fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -1733,7 +1733,7 @@ fn append_keybind_to_file(
     action_kind: &str,
     param: &str,
 ) -> Result<String, String> {
-    let path = crate::config::expand_path(&crate::config::get().paths.keybinds_file);
+    let path = crate::config::resolve_keybinds_file();
     let is_lua = is_lua_keybinds_file(&path);
     let new_line = format_hypr_keybind_line(is_lua, mods, key, action_kind, param)?;
 
@@ -1775,7 +1775,7 @@ fn append_keybind_to_file(
 }
 
 fn delete_keybind_line(line_idx: usize) -> Result<(), String> {
-    let path = crate::config::expand_path(&crate::config::get().paths.keybinds_file);
+    let path = crate::config::resolve_keybinds_file();
     let content = fs::read_to_string(&path).map_err(|e| format!("Read failed: {}", e))?;
     let mut lines: Vec<&str> = content.lines().collect();
     if line_idx >= lines.len() {
@@ -8777,7 +8777,32 @@ fn render_settings_page(
             ],
             &cfg.tools.hypr_dispatch_mode,
             Rc::new(move |val| {
-                crate::config::update(|c| c.tools.hypr_dispatch_mode = val);
+                crate::config::update(|c| {
+                    c.tools.hypr_dispatch_mode = val;
+                    let target_lua = match c.tools.hypr_dispatch_mode.as_str() {
+                        "hyprlua" => true,
+                        "classic" => false,
+                        _ => crate::config::has_hyprlua_config(),
+                    };
+                    let cur_ext_is_conf = crate::config::expand_path(&c.paths.keybinds_file)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("conf"))
+                        .unwrap_or(false);
+                    let cur_ext_is_lua = crate::config::expand_path(&c.paths.keybinds_file)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("lua"))
+                        .unwrap_or(false);
+                    if target_lua && (c.paths.keybinds_file.trim().is_empty() || cur_ext_is_conf) {
+                        c.paths.keybinds_file = crate::config::detect_default_keybinds_file_for(true);
+                    } else if !target_lua
+                        && (c.paths.keybinds_file.trim().is_empty() || cur_ext_is_lua)
+                    {
+                        c.paths.keybinds_file =
+                            crate::config::detect_default_keybinds_file_for(false);
+                    }
+                });
                 render_settings_page(&c_box, &rel_t, &app_t);
             }),
         );
@@ -9066,6 +9091,23 @@ fn render_dashboard_binds_tab(
         .spacing(6)
         .css_classes(vec!["plan-check-row".to_string()])
         .build();
+
+    let target_path = crate::config::resolve_keybinds_file();
+    let target_is_lua = is_lua_keybinds_file(&target_path);
+    let target_display = crate::config::get().paths.keybinds_file;
+    cli_card.append(
+        &Label::builder()
+            .label(&format!(
+                "Target: {} ({})",
+                target_display,
+                if target_is_lua { "Hyprlua" } else { "Classic" }
+            ))
+            .halign(Align::Start)
+            .ellipsize(gtk4::pango::EllipsizeMode::Middle)
+            .tooltip_text(&target_display)
+            .css_classes(vec!["plan-subnote".to_string()])
+            .build(),
+    );
 
     let exe_bin = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
