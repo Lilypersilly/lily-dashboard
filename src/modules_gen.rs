@@ -21,10 +21,16 @@ pub mod music;
 pub mod passwords;
 #[path = "../modules/plans.rs"]
 pub mod plans;
+#[path = "../modules/services.rs"]
+pub mod services;
 #[path = "../modules/system.rs"]
 pub mod system;
+#[path = "../modules/tasks.rs"]
+pub mod tasks;
 #[path = "../modules/timers.rs"]
 pub mod timers;
+#[path = "../modules/usb_drives.rs"]
+pub mod usb_drives;
 
 pub fn all_modules() -> Vec<ModuleDescriptor> {
     vec![
@@ -110,10 +116,28 @@ pub fn all_modules() -> Vec<ModuleDescriptor> {
             on_visibility: None,
         },
         ModuleDescriptor {
+            id: "services",
+            title: "Services",
+            lifecycle: ModuleLifecycle::Stateful,
+            build: services::build,
+            init: None,
+            shutdown: None,
+            on_visibility: None,
+        },
+        ModuleDescriptor {
             id: "system",
             title: "System",
             lifecycle: ModuleLifecycle::Stateful,
             build: system::build,
+            init: None,
+            shutdown: None,
+            on_visibility: None,
+        },
+        ModuleDescriptor {
+            id: "tasks",
+            title: "Tasks",
+            lifecycle: ModuleLifecycle::Stateful,
+            build: tasks::build,
             init: None,
             shutdown: None,
             on_visibility: None,
@@ -126,6 +150,15 @@ pub fn all_modules() -> Vec<ModuleDescriptor> {
             init: None,
             shutdown: None,
             on_visibility: None,
+        },
+        ModuleDescriptor {
+            id: "usb",
+            title: "USB Drives",
+            lifecycle: ModuleLifecycle::Stateful,
+            build: usb_drives::build,
+            init: Some(usb_drives::init),
+            shutdown: None,
+            on_visibility: Some(usb_drives::set_enabled),
         },
     ]
 }

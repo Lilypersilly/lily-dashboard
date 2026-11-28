@@ -341,8 +341,11 @@ pub const ALL_TAB_IDS: &[(&str, &str)] = &[
     ("timers", "Timers"),
     ("music", "Music"),
     ("drive", "Drive"),
+    ("usb", "USB Drives"),
     ("passwords", "Passwords"),
     ("locker", "Locker"),
+    ("tasks", "Tasks"),
+    ("services", "Services"),
     ("system", "System"),
 ];
 
@@ -358,9 +361,12 @@ pub const DEFAULT_SIDEBAR_ITEMS: &[&str] = &[
     "music",
     "---",
     "drive",
+    "usb",
     "passwords",
     "locker",
     "---",
+    "tasks",
+    "services",
     "system",
 ];
 

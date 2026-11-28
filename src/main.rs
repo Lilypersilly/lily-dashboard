@@ -2268,6 +2268,9 @@ fn build_ui(
                 if let Some(ref dp) = h.detail_pane {
                     dp.set_visible(false);
                 }
+                if let Some(ref hide_cb) = h.on_hide {
+                    hide_cb();
+                }
             }
             window_clone.set_keyboard_mode(KeyboardMode::None);
             drawer_clone.remove_css_class("open");
