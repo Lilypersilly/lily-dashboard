@@ -35,20 +35,20 @@ const CORE_CRATES: &[&str] = &[
 /// Populated for each release; any third-party or modified module triggers the trust gate.
 pub const OFFICIAL_MODULE_HASHES: &[(&str, &str)] = &[
     ("calendar.rs", "c4ca163b679e95358df5506de473ee06e2abd9fda61a660c4255e41e9e0e20ff"),
-    ("clipboard.rs", "8d40884f49b7240a5a8c7621141356de2f196d9146b04c8cfee4f8e7f963d4e3"),
-    ("drive.rs", "b33efb89afcc39cbcba51a55838ffbd3cdcb636570c904dc2debd2463354e00b"),
+    ("clipboard.rs", "23392f864a9b3ba7bd405d96e56ed08f32721ff50fb4e17f16024004185ffe1d"),
+    ("drive.rs", "98a880b6151fef85787b8ba3d28f49eb09d2578308345c2279ba2dc8b316a593"),
     ("favorites.rs", "72b05148295f1222d134faf34e129e1e4e43e661861aa8bdc4e18eb916b85d53"),
     ("launcher.rs", "dc1bb2f1e58ea96e46b6a6fbd60fa894013079f178aa6c8abfc5fe7a6a128a4c"),
     ("locker.rs", "4cee3389b7c0d76fda7094faf1ce95ff0cb5ff9acfef8161eb4de2d45c66abdc"),
-    ("music.rs", "5deb0fb7561b01ba6273a3ba059e6cdbb083468e4986911ffe42b5ac28e63da0"),
+    ("music.rs", "7a4de93471ee2cf7fe8ee545879b0ae99b59b951947d7f980ddacc119cfe3933"),
     ("passwords.rs", "bc367dccb91b44197cd3e0ef4f5d37fb7f954d8840c102713107d6bbec610070"),
     ("plans.rs", "48caab6f214a96d8745a09e723f029089e4085fcf0dee4cb189d210385c7e3be"),
     ("scicalc.rs", "19fbcb7574e64ec0909b68e9b6d672415dd02ce83f4589f5ab7abb14c18657b1"),
     ("services.rs", "a9a65ca8e7a2084bf3e9f8cd534495ba23d872e7bab4e43128b6d0e0486173c9"),
-    ("system.rs", "c0fa8c54e2bb367f6d5d5e9e6a34fb88063300f06cc9b7cd6d4988e529a32877"),
+    ("system.rs", "5c8324eb2d376d882831d306571a85b3e8f54cfc1acb8bb91acb64ac786220ed"),
     ("tasks.rs", "f5b54095008b3c3038995680c70273108d05a23c5347632412a6e7770903f380"),
-    ("timers.rs", "808bc9651210c6058886c490b04ae85c962cc5e6e133f14b924db690531162c1"),
-    ("usb_drives.rs", "c25e7f109678498ffbbf3e2f561f40e8c57a2693d0007c66cb0155882cb6d390"),
+    ("timers.rs", "ef1e566458af60f8c016a9a8801469d0888c2f2a617544d55c4bcb274ee8a6cc"),
+    ("usb_drives.rs", "679b70a0497d139c7eaa79906c350efd4484569849899cafc76461bef1921d3c"),
 ];
 
 #[derive(Clone, Debug)]

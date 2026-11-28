@@ -450,7 +450,7 @@ pub fn build_clipboard_ui(popover_guard: Rc<Cell<usize>>) -> Box {
             .build();
         warn_card.append(
             &Label::builder()
-                .label("⚠ Missing dependency: wl-clipboard (wl-paste)")
+                .label("󰀦 Missing dependency: wl-clipboard (wl-paste)")
                 .halign(Align::Start)
                 .css_classes(vec!["plan-step".to_string()])
                 .build(),

@@ -541,7 +541,7 @@ pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::Modul
             .build();
         warn_card.append(
             &Label::builder()
-                .label("⚠ Missing dependency: udisks2 (udisksctl)")
+                .label("󰀦 Missing dependency: udisks2 (udisksctl)")
                 .halign(Align::Start)
                 .css_classes(vec!["plan-step".to_string()])
                 .build(),

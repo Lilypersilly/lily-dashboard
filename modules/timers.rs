@@ -246,7 +246,7 @@ pub fn build_timers_ui() -> Box {
         let state_ref = s_proc.borrow();
         for job in state_ref.process_jobs.iter() {
             let row = Box::builder().orientation(Orientation::Horizontal).spacing(6).css_classes(vec!["plan-check-row".to_string(), "selected".to_string()]).build();
-            let icon = Label::builder().label("👁️").build();
+            let icon = Label::builder().label("󰈈").build();
             let desc = format!("Watching {} (PID {})", job.name, job.pid);
             let lbl = Label::builder().label(&desc).hexpand(true).halign(Align::Start).build();
             let cond = if job.condition == WatchCondition::OnClose { "Until Closed" } else { "Until Idle" };
@@ -404,7 +404,7 @@ pub fn build_timers_ui() -> Box {
                 .min()
                 .map(format_duration)
         } else if !s.process_jobs.is_empty() {
-            Some(format!("👁{}", s.process_jobs.len()))
+            Some(format!("󰈈 {}", s.process_jobs.len()))
         } else {
             None
         };

@@ -621,7 +621,7 @@ fn init_theme() -> Rc<dyn Fn()> {
 
                 .sidebar-footer-btn {{ background-color: transparent; border: none; border-radius: {r_bar}px; padding: 2px 3px; margin: 0px; min-height: 0px; min-width: 0px; box-shadow: none; transition: background-color 0.15s ease; }}
                 .sidebar-footer-btn:hover {{ background-color: {accent1_15}; }}
-                .sidebar-weather-lbl {{ color: #{accent2}; font-family: '{ui_font}', sans-serif; font-size: {fs_13}px; font-weight: bold; }}
+                .sidebar-weather-lbl {{ color: #{accent2}; font-family: '{ui_font}', '{mono_font}', sans-serif; font-size: {fs_13}px; font-weight: bold; }}
                 .sidebar-clock-lbl {{ color: #{fg_main}; font-family: '{mono_font}', '{ui_font}', sans-serif; font-size: {fs_12}px; font-weight: bold; }}
                 .sidebar-reload-lbl {{ color: #{fg_main}; font-family: '{ui_font}', sans-serif; font-size: {fs_11}px; font-weight: bold; }}
 
@@ -684,7 +684,7 @@ fn init_theme() -> Rc<dyn Fn()> {
                 calendar.lily-calendar > grid > label.day-number.today {{ border: 1px solid #{accent1}; font-weight: bold; }}
                 calendar.lily-calendar > grid > label.day-number.other-month {{ opacity: 0.35; }}
                 
-                label {{ color: #{fg_main}; font-family: '{ui_font}', sans-serif; font-size: {fs_16}px; }}
+                label {{ color: #{fg_main}; font-family: '{ui_font}', '{mono_font}', sans-serif; font-size: {fs_16}px; }}
                 entry {{ background-color: #{bg_recessed}; color: #{fg_main}; caret-color: #{accent2}; border: 1px solid {accent1_35}; border-radius: {r_sm}px; padding: 6px 10px; font-family: '{ui_font}', sans-serif; font-size: {fs_14}px; box-shadow: none; }}
                 entry:focus-within {{ border-color: #{accent1}; outline: none; box-shadow: none; }}
                 entry > text > placeholder {{ color: #{fg_muted}; }}

@@ -9341,7 +9341,7 @@ fn render_styling_page(container: &Box, reload_theme: &Rc<dyn Fn()>) {
         for style in &styles {
             let active = cfg.button_style == style.key;
             let base_lbl = if style.sound_count > 0 {
-                format!("{} ♪", style.name)
+                format!("{} 󰝚", style.name)
             } else {
                 style.name.clone()
             };
@@ -9558,9 +9558,9 @@ fn render_styling_page(container: &Box, reload_theme: &Rc<dyn Fn()>) {
     }
     let unlink_btn = Button::builder()
         .label(if cfg.sound_unlinked {
-            "🔓 Unlinked"
+            "󰌸 Unlinked"
         } else {
-            "🔗 Linked to Style"
+            "󰌷 Linked to Style"
         })
         .css_classes(if cfg.sound_unlinked {
             vec!["plan-fmt-btn".to_string()]

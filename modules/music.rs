@@ -1732,7 +1732,7 @@ pub fn build_music_ui() -> Box {
             .build();
         warn_card.append(
             &Label::builder()
-                .label(&format!("⚠ Missing: {}", missing_music_tools.join(", ")))
+                .label(&format!("󰀦 Missing: {}", missing_music_tools.join(", ")))
                 .halign(Align::Start)
                 .css_classes(vec!["plan-step".to_string()])
                 .build(),

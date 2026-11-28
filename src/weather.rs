@@ -92,24 +92,24 @@ fn save_config(cfg: &WeatherConfig) {
     }
 }
 
-// Maps WMO weather codes to Emojis and descriptions
+// Maps WMO weather codes to monochrome Nerd Font icons and descriptions
 fn wmo_to_text(code: u8) -> (&'static str, &'static str) {
     match code {
-        0 => ("☀️", "Clear"),
-        1 => ("🌤️", "Mostly Clear"),
-        2 => ("⛅", "Partly Cloudy"),
-        3 => ("☁️", "Overcast"),
-        45 | 48 => ("🌫️", "Fog"),
-        51 | 53 | 55 => ("🌧️", "Drizzle"),
-        56 | 57 => ("🌧️", "Frz Drizzle"),
-        61 | 63 | 65 => ("🌧️", "Rain"),
-        66 | 67 => ("🌧️", "Frz Rain"),
-        71 | 73 | 75 => ("❄️", "Snow"),
-        77 => ("❄️", "Snow Grains"),
-        80 | 81 | 82 => ("🌦️", "Showers"),
-        85 | 86 => ("❄️", "Snow Showers"),
-        95 | 96 | 99 => ("⛈️", "Thunderstorm"),
-        _ => ("❓", "Unknown"),
+        0 => ("󰖙", "Clear"),
+        1 => ("󰖙", "Mostly Clear"),
+        2 => ("󰖕", "Partly Cloudy"),
+        3 => ("󰖐", "Overcast"),
+        45 | 48 => ("󰖑", "Fog"),
+        51 | 53 | 55 => ("󰖗", "Drizzle"),
+        56 | 57 => ("󰖗", "Frz Drizzle"),
+        61 | 63 | 65 => ("󰖖", "Rain"),
+        66 | 67 => ("󰖖", "Frz Rain"),
+        71 | 73 | 75 => ("󰖘", "Snow"),
+        77 => ("󰖘", "Snow Grains"),
+        80 | 81 | 82 => ("󰖗", "Showers"),
+        85 | 86 => ("󰖘", "Snow Showers"),
+        95 | 96 | 99 => ("󰖓", "Thunderstorm"),
+        _ => ("󰋗", "Unknown"),
     }
 }
 
@@ -381,10 +381,10 @@ pub fn build_weather_ui(main_stack: &Stack) -> (Box, Button) {
 
             let s_rise = extract_time(&data.daily.sunrise[idx]);
             let s_set = extract_time(&data.daily.sunset[idx]);
-            sun_lbl.set_label(&format!("☀️ {} - {}", s_rise, s_set));
+            sun_lbl.set_label(&format!("󰖙 {} - {}", s_rise, s_set));
 
             let rain_prob = data.daily.precipitation_probability_max[idx];
-            rain_lbl.set_label(&format!("🌧️ {}% Rain Chance", rain_prob));
+            rain_lbl.set_label(&format!("󰖗 {}% Rain Chance", rain_prob));
 
             if idx == 0 {
                 // Today's Live Current Data
@@ -394,8 +394,8 @@ pub fn build_weather_ui(main_stack: &Stack) -> (Box, Button) {
                 d_lbl.set_label(c_desc);
                 
                 bt_lbl.set_label(&format!("{:.1}°C", data.current.temperature_2m));
-                w_lbl.set_label(&format!("💨 {:.1} km/h", data.current.wind_speed_10m));
-                sec_lbl.set_label(&format!("💧 {:.0}% (Feels {:.0}°C)", data.current.relative_humidity_2m, data.current.apparent_temperature));
+                w_lbl.set_label(&format!("󰖝 {:.1} km/h", data.current.wind_speed_10m));
+                sec_lbl.set_label(&format!("󰖎 {:.0}% (Feels {:.0}°C)", data.current.relative_humidity_2m, data.current.apparent_temperature));
             } else {
                 // Future Days Data
                 if idx == 1 {
@@ -407,8 +407,8 @@ pub fn build_weather_ui(main_stack: &Stack) -> (Box, Button) {
                 let low = data.daily.temperature_2m_min[idx];
                 
                 bt_lbl.set_label(&format!("{:.0}° / {:.0}°C", high, low));
-                w_lbl.set_label(&format!("💨 Max {:.1} km/h", data.daily.wind_speed_10m_max[idx]));
-                sec_lbl.set_label(&format!("🔆 Max UV Index: {:.1}", data.daily.uv_index_max[idx]));
+                w_lbl.set_label(&format!("󰖝 Max {:.1} km/h", data.daily.wind_speed_10m_max[idx]));
+                sec_lbl.set_label(&format!("󰖙 Max UV Index: {:.1}", data.daily.uv_index_max[idx]));
             }
         })
     };
@@ -548,7 +548,7 @@ pub fn build_weather_ui(main_stack: &Stack) -> (Box, Button) {
                 }
                 WeatherMsg::Forecast(None) => {
                     sidebar_lbl.set_label("Weather\nError");
-                    big_emoji_lbl.set_label("❌");
+                    big_emoji_lbl.set_label("󰅙");
                     big_temp_lbl.set_label("Offline");
                     desc_lbl.set_label("Check your internet connection.");
                 }

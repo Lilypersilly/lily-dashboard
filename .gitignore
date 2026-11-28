@@ -1,3 +1,15 @@
 /target
 *.code-workspace
 
+# Local / custom style packages (only keep the 6 original stock styles in assets/css/)
+styles/
+assets/css/*
+!assets/css/ghost.css
+!assets/css/neon.css
+!assets/css/outlined.css
+!assets/css/pill.css
+!assets/css/solid.css
+!assets/css/tonal.css
+
+# Local scratch / release notes
+patchnotes.txt

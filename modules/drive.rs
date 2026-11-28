@@ -68,7 +68,7 @@ pub fn build_drive_ui() -> Box {
             .build();
         warn_card.append(
             &Label::builder()
-                .label("⚠ Missing dependency: rclone")
+                .label("󰀦 Missing dependency: rclone")
                 .halign(Align::Start)
                 .css_classes(vec!["plan-step".to_string()])
                 .build(),
