@@ -98,6 +98,8 @@ fn main() {
             let startup_cfg = config::get();
             if startup_cfg.hyprland.apply_on_startup {
                 config::apply_hyprland_settings(&startup_cfg.hyprland);
+            } else if startup_cfg.hyprland.active_border_mode != "config" {
+                config::apply_hyprland_border_config(&startup_cfg.hyprland);
             }
 
             session::init_session_tracker();

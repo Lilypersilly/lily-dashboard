@@ -8081,6 +8081,225 @@ fn render_settings_page(
     }
     hypr_card.append(&bs_row);
 
+    {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        make_choice_group(
+            &hypr_card,
+            "Active Border Color",
+            &[
+                ("solid", "Solid"),
+                ("gradient", "Gradient"),
+                ("config", "Hypr Config"),
+            ],
+            &cfg.hyprland.active_border_mode,
+            Rc::new(move |mode| {
+                let updated = crate::config::update(|c| c.hyprland.active_border_mode = mode.clone());
+                if mode == "config" {
+                    crate::config::hypr_reload_preserving_overrides();
+                } else {
+                    crate::config::apply_hyprland_border_config(&updated.hyprland);
+                }
+                render_settings_page(&c_box, &rel_t, &app_t);
+            }),
+        );
+    }
+
+    let palette_for_borders = crate::config::resolve_theme_colors(&cfg);
+    let append_border_color_picker =
+        |parent: &Box, title: &str, current_spec: &str, on_pick: Rc<dyn Fn(String)>| {
+            let wrap = Box::builder()
+                .orientation(Orientation::Vertical)
+                .spacing(4)
+                .margin_top(2)
+                .build();
+
+            let resolved_hex = crate::config::resolve_border_color_hex(current_spec, &palette_for_borders);
+            let r_f = u8::from_str_radix(&resolved_hex[0..2], 16).unwrap_or(233) as f64 / 255.0;
+            let g_f = u8::from_str_radix(&resolved_hex[2..4], 16).unwrap_or(117) as f64 / 255.0;
+            let b_f = u8::from_str_radix(&resolved_hex[4..6], 16).unwrap_or(202) as f64 / 255.0;
+
+            let hdr = Box::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(6)
+                .build();
+            let title_lbl = Label::builder()
+                .label(title)
+                .halign(Align::Start)
+                .hexpand(true)
+                .css_classes(vec!["plan-subnote".to_string()])
+                .build();
+            let swatch = DrawingArea::builder()
+                .content_width(18)
+                .content_height(18)
+                .valign(Align::Center)
+                .build();
+            swatch.set_draw_func(move |_, cr, w, h| {
+                cr.set_source_rgba(r_f, g_f, b_f, 1.0);
+                cr.rectangle(1.0, 1.0, (w as f64 - 2.0).max(2.0), (h as f64 - 2.0).max(2.0));
+                let _ = cr.fill();
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
+                cr.set_line_width(1.0);
+                cr.rectangle(0.5, 0.5, (w as f64 - 1.0).max(2.0), (h as f64 - 1.0).max(2.0));
+                let _ = cr.stroke();
+            });
+            let hex_lbl = Label::builder()
+                .label(&format!("#{}", resolved_hex))
+                .halign(Align::End)
+                .css_classes(vec!["fav-score-badge".to_string()])
+                .build();
+            hdr.append(&title_lbl);
+            hdr.append(&swatch);
+            hdr.append(&hex_lbl);
+            wrap.append(&hdr);
+
+            let roles: &[(&str, &str)] = &[
+                ("accent", "Accent"),
+                ("accent2", "Accent 2"),
+                ("selection", "Selection"),
+                ("fg_main", "Text"),
+                ("bg_pill", "Surface"),
+            ];
+            let chip_flow = FlowBox::builder()
+                .selection_mode(SelectionMode::None)
+                .column_spacing(4)
+                .row_spacing(4)
+                .max_children_per_line(5)
+                .build();
+            let mut is_role = false;
+            for &(rk, rl) in roles {
+                let active = current_spec.eq_ignore_ascii_case(rk)
+                    || (rk == "accent2" && current_spec.eq_ignore_ascii_case("magenta"));
+                if active {
+                    is_role = true;
+                }
+                let btn = Button::builder()
+                    .label(rl)
+                    .css_classes(if active {
+                        vec!["plan-fmt-btn".to_string(), "active".to_string()]
+                    } else {
+                        vec!["plan-fmt-btn".to_string()]
+                    })
+                    .build();
+                let rk_s = rk.to_string();
+                let cb = on_pick.clone();
+                btn.connect_clicked(move |_| cb(rk_s.clone()));
+                chip_flow.insert(&btn, -1);
+            }
+            wrap.append(&chip_flow);
+
+            let custom_row = Box::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(6)
+                .build();
+            let hex_entry = Entry::builder()
+                .placeholder_text("#RRGGBB (custom hex)")
+                .text(&if is_role {
+                    String::new()
+                } else {
+                    format!("#{}", resolved_hex)
+                })
+                .css_classes(vec!["fav-search".to_string()])
+                .hexpand(true)
+                .build();
+            let apply_hex_btn = Button::builder()
+                .label("Set")
+                .css_classes(vec!["plan-fmt-btn".to_string()])
+                .build();
+            {
+                let he = hex_entry.clone();
+                let cb = on_pick.clone();
+                let submit_hex = Rc::new(move || {
+                    let clean = he.text().trim().trim_start_matches('#').to_string();
+                    if clean.len() == 6 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+                        cb(format!("#{}", clean.to_ascii_lowercase()));
+                    }
+                });
+                let sh1 = submit_hex.clone();
+                apply_hex_btn.connect_clicked(move |_| sh1());
+                hex_entry.connect_activate(move |_| submit_hex());
+            }
+            custom_row.append(&hex_entry);
+            custom_row.append(&apply_hex_btn);
+            wrap.append(&custom_row);
+            parent.append(&wrap);
+        };
+
+    if cfg.hyprland.active_border_mode == "solid" {
+        let c_box = container.clone();
+        let rel_t = reload_theme.clone();
+        let app_t = apply_tabs.clone();
+        append_border_color_picker(
+            &hypr_card,
+            "Border Color",
+            &cfg.hyprland.active_border_color1,
+            Rc::new(move |spec| {
+                let updated =
+                    crate::config::update(|c| c.hyprland.active_border_color1 = spec.clone());
+                crate::config::apply_hyprland_border_config(&updated.hyprland);
+                render_settings_page(&c_box, &rel_t, &app_t);
+            }),
+        );
+    } else if cfg.hyprland.active_border_mode == "gradient" {
+        {
+            let c_box = container.clone();
+            let rel_t = reload_theme.clone();
+            let app_t = apply_tabs.clone();
+            append_border_color_picker(
+                &hypr_card,
+                "Gradient Start",
+                &cfg.hyprland.active_border_color1,
+                Rc::new(move |spec| {
+                    let updated =
+                        crate::config::update(|c| c.hyprland.active_border_color1 = spec.clone());
+                    crate::config::apply_hyprland_border_config(&updated.hyprland);
+                    render_settings_page(&c_box, &rel_t, &app_t);
+                }),
+            );
+        }
+        {
+            let c_box = container.clone();
+            let rel_t = reload_theme.clone();
+            let app_t = apply_tabs.clone();
+            append_border_color_picker(
+                &hypr_card,
+                "Gradient End",
+                &cfg.hyprland.active_border_color2,
+                Rc::new(move |spec| {
+                    let updated =
+                        crate::config::update(|c| c.hyprland.active_border_color2 = spec.clone());
+                    crate::config::apply_hyprland_border_config(&updated.hyprland);
+                    render_settings_page(&c_box, &rel_t, &app_t);
+                }),
+            );
+        }
+
+        let init_deg = cfg.hyprland.active_border_angle.clamp(0, 360) as f64;
+        let (ang_row, ang_scale, ang_lbl) = make_slider_row(
+            "Gradient Angle",
+            0.0,
+            360.0,
+            5.0,
+            init_deg,
+            format!("{}°", init_deg as i32),
+        );
+        {
+            let lbl = ang_lbl.clone();
+            let flush = schedule_flush.clone();
+            ang_scale.connect_value_changed(move |sc| {
+                let deg = (sc.value() / 5.0).round() as i32 * 5;
+                let deg = deg.clamp(0, 360);
+                lbl.set_label(&format!("{}°", deg));
+                let updated =
+                    crate::config::update_in_memory(|c| c.hyprland.active_border_angle = deg);
+                crate::config::apply_hyprland_border_config(&updated.hyprland);
+                flush();
+            });
+        }
+        hypr_card.append(&ang_row);
+    }
+
     // 2d. Blur toggle + Size + Passes
     let blur_hdr_row = Box::builder()
         .orientation(Orientation::Horizontal)
@@ -8290,6 +8509,10 @@ fn render_settings_page(
                 c.hyprland.gaps_in = None;
                 c.hyprland.gaps_out = None;
                 c.hyprland.border_size = None;
+                c.hyprland.active_border_mode = "config".to_string();
+                c.hyprland.active_border_color1 = "accent".to_string();
+                c.hyprland.active_border_color2 = "accent2".to_string();
+                c.hyprland.active_border_angle = 45;
                 c.hyprland.blur_enabled = None;
                 c.hyprland.blur_size = None;
                 c.hyprland.blur_passes = None;

@@ -219,6 +219,14 @@ pub struct HyprlandConfig {
     pub blur_passes: Option<i32>,
     pub active_opacity: Option<f64>,
     pub inactive_opacity: Option<f64>,
+    /// Hyprland active window border color style: "solid", "gradient", or "config"
+    pub active_border_mode: String,
+    /// Solid border color or Gradient Start ("accent", "accent2", "selection", "fg_main", "bg_pill", or "#RRGGBB")
+    pub active_border_color1: String,
+    /// Gradient End color ("accent", "accent2", "selection", "fg_main", "bg_pill", or "#RRGGBB")
+    pub active_border_color2: String,
+    /// Hyprland active border gradient angle in degrees (0..=360)
+    pub active_border_angle: i32,
 }
 
 impl Default for HyprlandConfig {
@@ -239,6 +247,10 @@ impl Default for HyprlandConfig {
             blur_passes: None,
             active_opacity: None,
             inactive_opacity: None,
+            active_border_mode: "solid".to_string(),
+            active_border_color1: "accent".to_string(),
+            active_border_color2: "accent2".to_string(),
+            active_border_angle: 45,
         }
     }
 }
@@ -1114,13 +1126,109 @@ pub fn hypr_exec_with_rules(rules: &str, cmd: &str) {
     }
 }
 
+fn lua_value_literal(raw_val: &str) -> String {
+    let t = raw_val.trim();
+    if t == "true" || t == "false" || t.parse::<f64>().is_ok() {
+        t.to_string()
+    } else {
+        format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
 fn lua_nested_config_expr(key: &str, raw_val: &str) -> String {
-    let parts: Vec<&str> = key.split(':').filter(|s| !s.is_empty()).collect();
-    let mut expr = raw_val.to_string();
+    let parts: Vec<&str> = key.split([':', '.']).filter(|s| !s.is_empty()).collect();
+    let mut expr = lua_value_literal(raw_val);
     for part in parts.iter().rev() {
         expr = format!("{{ {} = {} }}", part, expr);
     }
     format!("hl.config({})", expr)
+}
+
+pub fn resolve_border_color_hex(spec: &str, palette: &HashMap<String, String>) -> String {
+    let trimmed = spec.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "accent" | "accent1" => palette
+            .get("accent")
+            .or_else(|| palette.get("accent1"))
+            .map(|s| s.trim_start_matches('#').to_string())
+            .unwrap_or_else(|| "e975ca".to_string()),
+        "accent2" | "magenta" => palette
+            .get("magenta")
+            .or_else(|| palette.get("accent2"))
+            .map(|s| s.trim_start_matches('#').to_string())
+            .unwrap_or_else(|| "ffc2ff".to_string()),
+        "selection" => palette
+            .get("selection")
+            .or_else(|| palette.get("accent1"))
+            .map(|s| s.trim_start_matches('#').to_string())
+            .unwrap_or_else(|| "bf40a1".to_string()),
+        "fg_main" | "fg" => palette
+            .get("fg_main")
+            .map(|s| s.trim_start_matches('#').to_string())
+            .unwrap_or_else(|| "fee4ff".to_string()),
+        "bg_pill" | "surface" => palette
+            .get("bg_pill")
+            .or_else(|| palette.get("bg_dark"))
+            .map(|s| s.trim_start_matches('#').to_string())
+            .unwrap_or_else(|| "2a202d".to_string()),
+        "bg_main" | "bg" => palette
+            .get("bg_main")
+            .map(|s| s.trim_start_matches('#').to_string())
+            .unwrap_or_else(|| "1c161e".to_string()),
+        _ => {
+            let clean = trimmed.trim_start_matches('#');
+            if clean.len() == 6 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+                clean.to_ascii_lowercase()
+            } else {
+                "e975ca".to_string()
+            }
+        }
+    }
+}
+
+pub fn hypr_active_border_value(h: &HyprlandConfig) -> Option<String> {
+    let map = resolve_theme_colors(&get());
+    let c1 = resolve_border_color_hex(&h.active_border_color1, &map);
+    let c2 = resolve_border_color_hex(&h.active_border_color2, &map);
+    let angle = h.active_border_angle.clamp(0, 360);
+
+    match h.active_border_mode.as_str() {
+        "solid" => Some(format!("rgba({}ee)", c1)),
+        "gradient" => Some(format!("rgba({}ee) rgba({}ee) {}deg", c1, c2, angle)),
+        _ => None,
+    }
+}
+
+pub fn hypr_active_border_lua_literal(h: &HyprlandConfig) -> Option<String> {
+    let map = resolve_theme_colors(&get());
+    let c1 = resolve_border_color_hex(&h.active_border_color1, &map);
+    let c2 = resolve_border_color_hex(&h.active_border_color2, &map);
+    let angle = h.active_border_angle.clamp(0, 360);
+
+    match h.active_border_mode.as_str() {
+        "solid" => Some(format!("\"rgba({}ee)\"", c1)),
+        "gradient" => Some(format!(
+            "{{ colors = {{ \"rgba({}ee)\", \"rgba({}ee)\" }}, angle = {} }}",
+            c1, c2, angle
+        )),
+        _ => None,
+    }
+}
+
+pub fn apply_hyprland_border_config(h: &HyprlandConfig) {
+    if is_hyprlua() {
+        if let Some(lua_val) = hypr_active_border_lua_literal(h) {
+            let lua = format!(
+                "hl.config({{ general = {{ col = {{ active_border = {} }} }} }})",
+                lua_val
+            );
+            let _ = Command::new("hyprctl").args(["eval", &lua]).spawn();
+        }
+    } else if let Some(val) = hypr_active_border_value(h) {
+        let _ = Command::new("hyprctl")
+            .args(["keyword", "general:col.active_border", &val])
+            .spawn();
+    }
 }
 
 pub fn hypr_set_keyword(key: &str, val: &str) {
@@ -1213,22 +1321,33 @@ pub fn apply_hyprland_settings(h: &HyprlandConfig) {
         pairs.push(("decoration:inactive_opacity", format!("{:.2}", v)));
     }
 
-    if pairs.is_empty() {
-        return;
-    }
-
     if is_hyprlua() {
-        let lua_stmts: Vec<String> = pairs
+        let mut lua_stmts: Vec<String> = pairs
             .iter()
             .map(|(k, v)| lua_nested_config_expr(k, v))
             .collect();
+        if let Some(lua_val) = hypr_active_border_lua_literal(h) {
+            lua_stmts.push(format!(
+                "hl.config({{ general = {{ col = {{ active_border = {} }} }} }})",
+                lua_val
+            ));
+        }
+        if lua_stmts.is_empty() {
+            return;
+        }
         let script = lua_stmts.join("; ");
         let _ = Command::new("hyprctl").args(["eval", &script]).spawn();
     } else {
-        let batch: Vec<String> = pairs
+        let mut batch: Vec<String> = pairs
             .iter()
             .map(|(k, v)| format!("keyword {} {}", k, v))
             .collect();
+        if let Some(border_val) = hypr_active_border_value(h) {
+            batch.push(format!("keyword general:col.active_border {}", border_val));
+        }
+        if batch.is_empty() {
+            return;
+        }
         let _ = Command::new("hyprctl")
             .args(["--batch", &batch.join(" ; ")])
             .spawn();
