@@ -11,5 +11,6 @@ assets/css/*
 !assets/css/solid.css
 !assets/css/tonal.css
 
-# Local scratch / release notes
+# Local scratch, agent rules, & release notes
 patchnotes.txt
+AGENTS.md
