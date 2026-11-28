@@ -1991,6 +1991,7 @@ pub fn build_system_ui(
             .margin_end(14)
             .build();
         sc.set_child(Some(&inner));
+        crate::module_api::attach_viewport_culler(&sc, &inner);
         (sc, inner)
     };
 
@@ -2286,6 +2287,7 @@ pub fn build_system_ui(
         .margin_bottom(8)
         .build();
     kbd_scroll.set_child(Some(&kbd_list_box));
+    crate::module_api::attach_viewport_culler(&kbd_scroll, &kbd_list_box);
 
     // Unified 3-Category Bar inside Keybinds: Hyprland | Dashboard | Vim
     let kbd_cat_bar = Box::builder()

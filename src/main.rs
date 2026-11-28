@@ -321,14 +321,37 @@ fn scope_css_for_preview(scope_prefix: &str, raw_css: &str) -> String {
         if sel_header.starts_with('@') {
             continue;
         }
+        // Only keep rules that can actually style the preview Button (`button`, `.plan-fmt-btn`, `label`),
+        // skipping heavy container/control rules (`stack`, `viewport`, `entry`, `scale`, etc.) so custom
+        // theme previews don't bloat global selector matching.
         let scoped: Vec<String> = sel_header
             .split(',')
             .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
+            .filter(|s| {
+                !s.is_empty()
+                    && (s.contains("plan-fmt-btn")
+                        || s.starts_with("button")
+                        || s.starts_with("label"))
+            })
             .map(|s| format!("{} {}", scope_prefix, s))
             .collect();
         if !scoped.is_empty() {
-            out.push_str(&format!("{} {{{}}}\n", scoped.join(", "), body));
+            // Strip `infinite` from preview button animations so inactive theme cards in Settings
+            // never keep ticking infinite shadow/gradient @keyframes in the background!
+            let safe_body: String = body
+                .split(';')
+                .map(|decl| {
+                    let d = decl.trim();
+                    if d.starts_with("animation") && d.contains("infinite") {
+                        ""
+                    } else {
+                        decl
+                    }
+                })
+                .filter(|s| !s.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(";");
+            out.push_str(&format!("{} {{{};}}\n", scoped.join(", "), safe_body));
         }
     }
     out
@@ -358,6 +381,45 @@ fn init_theme() -> Rc<dyn Fn()> {
         &display,
         &user_css_provider,
         gtk4::STYLE_PROVIDER_PRIORITY_USER + 2,
+    );
+
+    // Structural performance guard provider above user CSS:
+    // 1. Keeps internal non-scrolling layout-clamp wrappers (`sidebar_clamp`, `stack_clamp`)
+    //    transparent so `viewport` rules in user CSS don't render 2× redundant full-screen shaders.
+    // 2. Freezes animations & transitions inside `.dash-hibernated` while the drawer is closed
+    //    offscreen so infinite `@keyframes` cost 0% GPU/CPU when closed.
+    // 3. Strips offscreen gradients/shadows/animations on `.lily-offscreen` rows (>320px outside
+    //    scroll viewports) without changing widget dimensions or scroll height.
+    let perf_guard_provider = CssProvider::new();
+    perf_guard_provider.load_from_data(
+        r#"
+        scrolledwindow.internal-layout-clamp,
+        scrolledwindow.internal-layout-clamp > viewport {
+            background: none;
+            background-color: transparent;
+            background-image: none;
+            border: none;
+            box-shadow: none;
+        }
+        .dash-hibernated,
+        .dash-hibernated * {
+            animation: none;
+            transition: none;
+        }
+        .lily-offscreen,
+        .lily-offscreen * {
+            background-image: none;
+            box-shadow: none;
+            text-shadow: none;
+            animation: none;
+            transition: none;
+        }
+        "#,
+    );
+    gtk4::style_context_add_provider_for_display(
+        &display,
+        &perf_guard_provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_USER + 3,
     );
 
     let update_css: Rc<dyn Fn()> = {
@@ -762,8 +824,15 @@ fn init_theme() -> Rc<dyn Fn()> {
             // Load active CSS style theme file from `~/.config/lily-dashboard/themes/css/<name>.css`
             // plus scoped live self-previews for homemade themes at the same USER+2 priority
             // so custom preview buttons always win over whichever stock style is active!
+            // `.lily-settled` suppresses 1-shot mount animations on already-settled/offscreen rows
+            // during scroll/filter while preserving `:hover` and `.active`/`.selected`/`.pinned` animations!
             let raw_style = config::load_css_theme_source(&cfg.button_style);
-            let user_style_css = format!("{}\n{}\n{}", palette_vars_css, raw_style, custom_previews);
+            let settled_guard = ".lily-settled:not(:hover):not(.active):not(.selected):not(.pinned):not(.armed), \
+                                 .lily-settled *:not(:hover):not(.active):not(.selected):not(.pinned):not(.armed) { animation: none; }";
+            let user_style_css = format!(
+                "{}\n{}\n{}\n{}",
+                palette_vars_css, raw_style, settled_guard, custom_previews
+            );
             user_css_provider.load_from_data(&user_style_css);
 
             // Force every toplevel layer-shell window (dashboard, media popout, stickies)
@@ -870,33 +939,68 @@ fn update_input_region(window: &ApplicationWindow, is_open: bool, dash_width: i3
             Region::create_rectangle(&RectangleInt::new(x, 0, total_w, height))
         };
         surface.set_input_region(&region);
-        window.queue_draw();
     }
 }
-fn move_to_monitor(window: &ApplicationWindow, target: Option<&str>) {
-    let pinned = config::get().layout.pinned_monitor;
-    let mut active_name = if !pinned.trim().is_empty() {
-        Some(pinned)
-    } else {
-        target.map(|s| s.to_string())
-    };
 
-    // Fallback to hyprctl if no explicit target provided (e.g., on first launch)
-    if active_name.is_none() {
-        if let Ok(output) = std::process::Command::new("hyprctl").args(["monitors", "-j"]).output() {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                if let Some(monitors) = json.as_array() {
-                    active_name = monitors.iter()
-                        .find(|m| m.get("focused").and_then(|f| f.as_bool()).unwrap_or(false))
-                        .and_then(|m| m.get("name"))
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_string());
-                }
-            }
+thread_local! {
+    static FOCUSED_HYPR_MON: RefCell<String> = const { RefCell::new(String::new()) };
+    static APPLIED_GDK_MON: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn query_focused_monitor_fast() -> Option<String> {
+    use std::io::{Read, Write};
+    let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
+    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".to_string());
+    let sock_path = format!("{}/hypr/{}/.socket.sock", runtime, sig);
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock_path).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(40)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(40)));
+    stream.write_all(b"j/monitors").ok()?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).ok()?;
+    let json = serde_json::from_slice::<serde_json::Value>(&buf).ok()?;
+    json.as_array()?
+        .iter()
+        .find(|m| m.get("focused").and_then(|f| f.as_bool()).unwrap_or(false))
+        .and_then(|m| m.get("name"))
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_string())
+}
+
+fn move_to_monitor(window: &ApplicationWindow, target: Option<&str>) {
+    if let Some(t) = target {
+        if !t.is_empty() {
+            FOCUSED_HYPR_MON.with(|slot| *slot.borrow_mut() = t.to_string());
         }
     }
 
+    let pinned = config::get().layout.pinned_monitor;
+    let active_name = if !pinned.trim().is_empty() {
+        Some(pinned)
+    } else if let Some(t) = target.filter(|s| !s.is_empty()) {
+        Some(t.to_string())
+    } else {
+        let cached = FOCUSED_HYPR_MON.with(|slot| slot.borrow().clone());
+        if !cached.is_empty() {
+            Some(cached)
+        } else {
+            let queried = query_focused_monitor_fast();
+            if let Some(ref m) = queried {
+                FOCUSED_HYPR_MON.with(|slot| *slot.borrow_mut() = m.clone());
+            }
+            queried
+        }
+    };
+
     let Some(target_name) = active_name else { return };
+
+    // Skip `window.set_monitor` when already bound to this connector — re-setting the same
+    // monitor on a Wayland layer-shell surface triggers an unnecessary configure/repaint cycle!
+    let already_applied = APPLIED_GDK_MON.with(|slot| *slot.borrow() == target_name);
+    if already_applied {
+        return;
+    }
+
     let Some(display) = gdk::Display::default() else { return };
     let gdk_monitors = display.monitors();
 
@@ -904,6 +1008,7 @@ fn move_to_monitor(window: &ApplicationWindow, target: Option<&str>) {
         if let Some(mon) = gdk_monitors.item(i).and_downcast::<gdk::Monitor>() {
             if let Some(conn) = mon.connector() {
                 if conn == target_name {
+                    APPLIED_GDK_MON.with(|slot| *slot.borrow_mut() = target_name);
                     window.set_monitor(&mon);
                     break;
                 }
@@ -962,44 +1067,19 @@ fn build_ui(
 
     let dash_box = Box::builder()
         .orientation(Orientation::Horizontal)
-        .css_classes(vec!["dash-box".to_string()])
+        .css_classes(vec!["dash-box".to_string(), "dash-hibernated".to_string()])
         .width_request(400)
         .overflow(Overflow::Hidden)
         .build();
 
-    // Dynamically adjust closed translateX offset whenever dash_box changes width!
+    // Dynamically adjust closed translateX offset & Wayland input hitbox ONLY when layout
+    // or surface dimensions actually change (4-frame self-terminating burst -> 0 Hz idle frame clock!).
     let dynamic_offset_provider = CssProvider::new();
     gtk4::style_context_add_provider_for_display(
         &gdk::Display::default().expect("Could not connect to a display."),
         &dynamic_offset_provider,
         gtk4::STYLE_PROVIDER_PRIORITY_USER,
     );
-
-    let last_dash_width = Rc::new(Cell::new(0));
-    let last_side_right = Rc::new(Cell::new(config::get().layout.side == "right"));
-    let dyn_off_prov_tick = dynamic_offset_provider.clone();
-    let last_w_watch = last_dash_width.clone();
-    let last_side_watch = last_side_right.clone();
-    dash_box.add_tick_callback(move |box_widget, _| {
-        let w = box_widget.width();
-        let is_right = config::get().layout.side == "right";
-        if w > 0 && (w != last_w_watch.get() || is_right != last_side_watch.get()) {
-            last_w_watch.set(w);
-            last_side_watch.set(is_right);
-            let push_back = w + 10;
-            let closed_val = if is_right {
-                format!("{}px", push_back)
-            } else {
-                format!("-{}px", push_back)
-            };
-            dyn_off_prov_tick.load_from_data(&format!(
-                ".drawer-container {{ transform: translateX({}); }}
-                 .drawer-container.open {{ transform: translateX(0px); }}",
-                closed_val
-            ));
-        }
-        glib::ControlFlow::Continue
-    });
 
     let stack = Stack::new();
     stack.set_hhomogeneous(false);
@@ -1023,6 +1103,7 @@ fn build_ui(
         .has_frame(false)
         .hexpand(false)
         .vexpand(true)
+        .css_classes(vec!["internal-layout-clamp".to_string()])
         .child(&sidebar_column)
         .build();
 
@@ -1044,6 +1125,7 @@ fn build_ui(
         .vexpand(true)
         .child(&sidebar_nav)
         .build();
+    module_api::attach_viewport_culler(&sidebar_nav_scroll, &sidebar_nav);
 
     let nav_buttons_rc: Rc<RefCell<Vec<(String, Button)>>> = Rc::new(RefCell::new(Vec::new()));
     let nav_folders_rc: Rc<RefCell<Vec<(Button, Box, Vec<String>)>>> =
@@ -2122,6 +2204,83 @@ fn build_ui(
         },
     };
 
+    // Event-driven 4-frame geometry burst synchronizer (replaces permanent VSync tick loops so
+    // GdkFrameClock rests at 0 Hz whenever the dashboard is idle or closed).
+    let schedule_geometry_sync: Rc<dyn Fn()> = {
+        let burst_active = Rc::new(Cell::new(false));
+        let burst_frames = Rc::new(Cell::new(0u8));
+        let last_dash_width = Rc::new(Cell::new(0));
+        let last_side_right = Rc::new(Cell::new(config::get().layout.side == "right"));
+        let last_win_height = Rc::new(Cell::new(0));
+        let last_hitbox_width = Rc::new(Cell::new(0));
+        let last_hitbox_open = Rc::new(Cell::new(false));
+
+        let win_g = window.clone();
+        let db_g = dash_box.clone();
+        let open_g = is_open.clone();
+        let dyn_prov = dynamic_offset_provider.clone();
+
+        Rc::new(move || {
+            burst_frames.set(5);
+            if burst_active.get() {
+                return;
+            }
+            burst_active.set(true);
+
+            let ba = burst_active.clone();
+            let bf = burst_frames.clone();
+            let ldw = last_dash_width.clone();
+            let lsr = last_side_right.clone();
+            let lwh = last_win_height.clone();
+            let lhw = last_hitbox_width.clone();
+            let lho = last_hitbox_open.clone();
+            let db = db_g.clone();
+            let op = open_g.clone();
+            let dp = dyn_prov.clone();
+
+            win_g.add_tick_callback(move |win, _| {
+                let w = db.width();
+                let h = win.height();
+                let is_right = config::get().layout.side == "right";
+                let open_now = op.get();
+
+                if w > 0 && (w != ldw.get() || is_right != lsr.get()) {
+                    ldw.set(w);
+                    lsr.set(is_right);
+                    let push_back = w + 10;
+                    let closed_val = if is_right {
+                        format!("{}px", push_back)
+                    } else {
+                        format!("-{}px", push_back)
+                    };
+                    dp.load_from_data(&format!(
+                        ".drawer-container {{ transform: translateX({}); }}
+                         .drawer-container.open {{ transform: translateX(0px); }}",
+                        closed_val
+                    ));
+                }
+
+                if h > 0 && (h != lwh.get() || w != lhw.get() || open_now != lho.get()) {
+                    lwh.set(h);
+                    lhw.set(w);
+                    lho.set(open_now);
+                    if let Some(app_win) = win.downcast_ref::<ApplicationWindow>() {
+                        update_input_region(app_win, open_now, w);
+                    }
+                }
+
+                let rem = bf.get().saturating_sub(1);
+                bf.set(rem);
+                if rem == 0 {
+                    ba.set(false);
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+        })
+    };
+
     let dash_for_mods = dash_box.clone();
     let nav_buttons_sync = nav_buttons_rc.clone();
     let nav_folders_sync = nav_folders_rc.clone();
@@ -2131,6 +2290,7 @@ fn build_ui(
     let mods_sync = compiled_modules.clone();
     let win_for_mods = window.clone();
     let sb_for_mods = sidebar_clamp.clone();
+    let geom_for_mods = schedule_geometry_sync.clone();
 
     stack.connect_visible_child_name_notify(move |stk| {
         let current = stk.visible_child_name();
@@ -2207,6 +2367,10 @@ fn build_ui(
                         slot.append(&handle.widget);
                     }
                     if let Some(ref dp) = handle.detail_pane {
+                        let g_dp = geom_for_mods.clone();
+                        dp.connect_visible_notify(move |_| {
+                            g_dp();
+                        });
                         if config::get().layout.side == "right" {
                             dash_for_mods.prepend(dp);
                         } else {
@@ -2231,6 +2395,7 @@ fn build_ui(
                 }
             }
         }
+        geom_for_mods();
     });
 
     let stack_clamp = gtk4::ScrolledWindow::builder()
@@ -2243,6 +2408,7 @@ fn build_ui(
         .has_frame(false)
         .hexpand(false)
         .vexpand(true)
+        .css_classes(vec!["internal-layout-clamp".to_string()])
         .child(&stack)
         .build();
 
@@ -2300,6 +2466,7 @@ fn build_ui(
         let cl_w = clock_btn.clone();
         let rl_w = reload_btn.clone();
         let vb_w = vim_mode_badge.clone();
+        let geom_l = schedule_geometry_sync.clone();
 
         Rc::new(move || {
             let cfg = config::get();
@@ -2372,6 +2539,7 @@ fn build_ui(
             // 5. Monitor pinning & hitbox refresh
             move_to_monitor(&win_l, None);
             update_input_region(&win_l, open_l.get(), db_l.width());
+            geom_l();
         })
     };
     *layout_rebuild_slot.borrow_mut() = Some(apply_layout_and_chrome.clone());
@@ -2451,9 +2619,14 @@ fn build_ui(
     let open_click = is_open.clone();
     let closing_click = is_closing.clone();
     let dash_box_btn = dash_box.clone();
+    let sidebar_col_btn = sidebar_column.clone();
+    let ws_widget_btn = workspaces_widget.clone();
+    let slide_gen = Rc::new(Cell::new(0u64));
 
     trigger_btn.connect_clicked(move |btn| {
         let currently_open = open_click.get();
+        let cur_gen = slide_gen.get().wrapping_add(1);
+        slide_gen.set(cur_gen);
 
         if !currently_open {
             move_to_monitor(&window_clone, None);
@@ -2462,16 +2635,20 @@ fn build_ui(
             media_for_toggle.set_dashboard_open(true);
             stickies_for_toggle.set_dashboard_open(true);
 
+            // Keep `.dash-hibernated` ON during the slide transition! Because all child CSS
+            // animations & transitions inside `dash_box` stay frozen while `.drawer-container`
+            // animates `translateX`, GTK4 reuses `dash_box`'s cached `GskRenderNode` in O(1)
+            // on every frame of the slide instead of re-shading gradients & blurring shadows!
+            if !dash_box_btn.has_css_class("dash-hibernated") {
+                dash_box_btn.add_css_class("dash-hibernated");
+            }
+
             // Use Exclusive keyboard interactivity while open so pressing SUPER immediately
             // steals and holds keyboard focus even when the cursor is over another window
             // (Hyprland follow_mouse won't steal it back). Closing resets to None.
             window_clone.set_keyboard_mode(KeyboardMode::Exclusive);
-            // Pass the exact width of the dashboard to the hitbox
             update_input_region(&window_clone, true, dash_box_btn.width());
             window_clone.present();
-
-            btn.add_css_class("riding");
-            drawer_clone.add_css_class("open");
 
             if let Some(cur) = stack_for_open.visible_child_name() {
                 if let Some(h) = handles_toggle.borrow().get(cur.as_str()) {
@@ -2491,23 +2668,28 @@ fn build_ui(
                 }
             }
 
-            let open_kb = open_click.clone();
-            let stk_kb = stack_for_open.clone();
-            let handles_kb = handles_toggle.clone();
-            let win_kb = window_clone.clone();
-            let sb_kb = sidebar_for_open.clone();
-            glib::timeout_add_local_once(Duration::from_millis(80), move || {
-                if open_kb.get() {
-                    if let Some(cur) = stk_kb.visible_child_name() {
-                        if let Some(h) = handles_kb.borrow().get(cur.as_str()) {
-                            if let Some(ref show_cb) = h.on_show {
-                                show_cb();
-                            }
-                        }
-                    }
-                    let vcfg = config::get().bindings.vim;
-                    if vcfg.enabled && vcfg.start_in_normal {
-                        vim_exit_insert_to_normal(&win_kb, &stk_kb, sb_kb.upcast_ref());
+            btn.add_css_class("riding");
+            drawer_clone.add_css_class("open");
+
+            let open_ms = config::get().layout.anim_duration_ms.max(16);
+            let gen_chk = slide_gen.clone();
+            let open_chk = open_click.clone();
+            let db_open_done = dash_box_btn.clone();
+            let sb_settle = sidebar_col_btn.clone();
+            let ws_settle = ws_widget_btn.clone();
+            glib::timeout_add_local_once(Duration::from_millis(open_ms), move || {
+                if gen_chk.get() == cur_gen && open_chk.get() {
+                    // Unfreeze interactive hover/active animations now that the slide has landed!
+                    db_open_done.remove_css_class("dash-hibernated");
+                    // Settle persistent chrome once after first open so future drawer toggles
+                    // never re-trigger 1-shot mount @keyframes (`hud-lock-in` / `cyber-unfold`).
+                    if !sb_settle.has_css_class("lily-settled") {
+                        let sb_s = sb_settle.clone();
+                        let ws_s = ws_settle.clone();
+                        glib::timeout_add_local_once(Duration::from_millis(360), move || {
+                            sb_s.add_css_class("lily-settled");
+                            ws_s.add_css_class("lily-settled");
+                        });
                     }
                 }
             });
@@ -2518,6 +2700,10 @@ fn build_ui(
             media_for_toggle.set_dashboard_open(false);
             stickies_for_toggle.set_dashboard_open(false);
 
+            // Freeze child animations & transitions BEFORE Frame 1 of the close slide so GTK4
+            // slides the retained `GskRenderNode` in O(1) without ticking blurred box-shadows!
+            dash_box_btn.add_css_class("dash-hibernated");
+
             // Cleanly dismiss every open Popover (right-click menus, Entry context menus, etc.)
             // BEFORE shrinking the layer-shell input region so GTK4 never keeps an orphaned
             // Wayland popup pointer grab that breaks clicking.
@@ -2525,7 +2711,9 @@ fn build_ui(
 
             for h in handles_toggle.borrow().values() {
                 if let Some(ref dp) = h.detail_pane {
-                    dp.set_visible(false);
+                    if dp.is_visible() {
+                        dp.set_visible(false);
+                    }
                 }
                 if let Some(ref hide_cb) = h.on_hide {
                     hide_cb();
@@ -2539,14 +2727,16 @@ fn build_ui(
             let win_after = window_clone.clone();
             let open_after = open_click.clone();
             let closing_after = closing_click.clone();
+            let gen_chk = slide_gen.clone();
 
             let close_ms = config::get().layout.anim_duration_ms.max(16);
             glib::timeout_add_local_once(Duration::from_millis(close_ms), move || {
-                closing_after.set(false);
-                if !open_after.get() {
-                    btn_after.remove_css_class("riding");
-                    // Pass 0, width doesn't matter when the dashboard is closed
-                    update_input_region(&win_after, false, 0);
+                if gen_chk.get() == cur_gen {
+                    closing_after.set(false);
+                    if !open_after.get() {
+                        btn_after.remove_css_class("riding");
+                        update_input_region(&win_after, false, 0);
+                    }
                 }
             });
         }
@@ -2638,27 +2828,19 @@ fn build_ui(
     window.set_child(Some(&drawer_container));
     apply_layout_and_chrome();
 
-    // --- THE BULLETPROOF HITBOX FIX (UPDATED FOR DYNAMIC WIDTH) ---
-    let last_known_height = Rc::new(Cell::new(0));
-    let last_known_width = Rc::new(Cell::new(0));
-    let win_tick = window.clone();
-    let open_tick = is_open.clone();
-    let dash_box_tick = dash_box.clone();
-
-    win_tick.add_tick_callback(move |win, _| {
-        let current_height = win.height();
-        let current_width = dash_box_tick.width();
-        
-        // If the height OR width changes physically, update the hitbox instantly!
-        if current_height > 0 && (current_height != last_known_height.get() || current_width != last_known_width.get()) {
-            last_known_height.set(current_height);
-            last_known_width.set(current_width);
-            let app_win = win.downcast_ref::<ApplicationWindow>().unwrap();
-            update_input_region(app_win, open_tick.get(), current_width);
-        }
-        glib::ControlFlow::Continue
-    });
-    // ----------------------------------
+    // Event-driven Wayland surface resize hooks (replaces permanent win_tick frame-clock polling!)
+    {
+        let geom_realize = schedule_geometry_sync.clone();
+        window.connect_realize(move |win| {
+            geom_realize();
+            if let Some(surface) = win.surface() {
+                let g_w = geom_realize.clone();
+                surface.connect_width_notify(move |_| g_w());
+                let g_h = geom_realize.clone();
+                surface.connect_height_notify(move |_| g_h());
+            }
+        });
+    }
 
     // --- START HYPRLAND IPC LISTENER ---
     enum HyprIpcEvent {
@@ -2728,8 +2910,10 @@ fn build_ui(
     // Map the window hitbox dynamically so it doesn't break if you move screens while it's open
     let open_map = is_open.clone();
     let dash_box_map = dash_box.clone();
+    let geom_map = schedule_geometry_sync.clone();
     window.connect_map(move |win| {
         update_input_region(win, open_map.get(), dash_box_map.width());
+        geom_map();
     });
 
     // Ensure it's on the right screen as soon as you boot the dashboard

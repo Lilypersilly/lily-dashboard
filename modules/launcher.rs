@@ -35,11 +35,25 @@ struct LauncherConfig {
 #[derive(Clone)]
 struct AppEntry {
     name: String,
-    description: String,
+    name_lower: String,
+    desc_lower: String,
     exec_name: String,
+    exec_lower: String,
     exec_path: PathBuf,
     exec_cmdline: String,
     app_info: gio::AppInfo,
+}
+
+thread_local! {
+    static INSTALLED_APPS_CACHE: RefCell<Option<(std::time::Instant, Vec<AppEntry>)>> =
+        const { RefCell::new(None) };
+}
+
+struct CachedAppRow {
+    app: AppEntry,
+    row_box: Box,
+    btn: Button,
+    arrow_lbl: Label,
 }
 
 pub struct LauncherUi {
@@ -197,20 +211,31 @@ fn preload_app_in_background(app: AppEntry) {
 }
 
 fn load_installed_apps() -> Vec<AppEntry> {
+    if let Some(cached) = INSTALLED_APPS_CACHE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(ts, _)| ts.elapsed() < Duration::from_secs(25))
+            .map(|(_, list)| list.clone())
+    }) {
+        return cached;
+    }
+
     let mut apps: Vec<AppEntry> = gio::AppInfo::all()
         .into_iter()
         .filter(|app| app.should_show())
         .map(|app| {
             let name = app.display_name().to_string();
-            let description = app
+            let name_lower = name.to_lowercase();
+            let desc_lower = app
                 .description()
-                .map(|d| d.to_string())
+                .map(|d| d.to_lowercase())
                 .unwrap_or_default();
             let exec_path = app.executable();
             let exec_name = exec_path
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
+            let exec_lower = exec_name.to_lowercase();
             let exec_cmdline = app
                 .commandline()
                 .map(|c| clean_exec_cmdline(&c.to_string_lossy()))
@@ -218,8 +243,10 @@ fn load_installed_apps() -> Vec<AppEntry> {
 
             AppEntry {
                 name,
-                description,
+                name_lower,
+                desc_lower,
                 exec_name,
+                exec_lower,
                 exec_path,
                 exec_cmdline,
                 app_info: app,
@@ -227,7 +254,10 @@ fn load_installed_apps() -> Vec<AppEntry> {
         })
         .collect();
 
-    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    apps.sort_by(|a, b| a.name_lower.cmp(&b.name_lower));
+    INSTALLED_APPS_CACHE.with(|slot| {
+        *slot.borrow_mut() = Some((std::time::Instant::now(), apps.clone()));
+    });
     apps
 }
 
@@ -280,44 +310,333 @@ where
         .spacing(6)
         .build();
 
+    let math_top_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(6)
+        .visible(false)
+        .build();
+    let preload_header = Label::builder()
+        .label("PRELOADED IN RAM")
+        .halign(Align::Start)
+        .css_classes(vec!["fav-group-header".to_string()])
+        .margin_top(2)
+        .visible(false)
+        .build();
+    let preload_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(6)
+        .visible(false)
+        .build();
+    let apps_header = Label::builder()
+        .label("APPLICATIONS")
+        .halign(Align::Start)
+        .css_classes(vec!["fav-group-header".to_string()])
+        .margin_top(6)
+        .build();
+    let apps_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(6)
+        .build();
+    let fallback_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(6)
+        .visible(false)
+        .build();
+
+    list_container.append(&math_top_box);
+    list_container.append(&preload_header);
+    list_container.append(&preload_box);
+    list_container.append(&apps_header);
+    list_container.append(&apps_box);
+    list_container.append(&fallback_box);
+
     scrolled.set_child(Some(&list_container));
+    crate::module_api::attach_viewport_culler(&scrolled, &apps_box);
     root.append(&search_entry);
     root.append(&scrolled);
 
     let installed = load_installed_apps();
     let cfg = load_config();
 
-    let apps = Rc::new(RefCell::new(installed));
+    let apps = Rc::new(RefCell::new(installed.clone()));
     let pinned = Rc::new(RefCell::new(cfg.pinned_apps));
     let preloaded = Rc::new(RefCell::new(cfg.preloaded_apps));
+    let query_state = Rc::new(RefCell::new(String::new()));
+    let refresh_slot: Rc<RefCell<Option<Rc<dyn Fn(bool)>>>> = Rc::new(RefCell::new(None));
 
-    populate_app_list(
-        &list_container,
-        &apps,
-        &pinned,
-        &preloaded,
-        "",
-        &popover_guard,
-        &on_launch,
-    );
+    // Pre-build one reusable GTK row per installed app so search keystrokes toggle visibility
+    // and reorder existing widgets in-place (zero widget allocations, zero icon reloads, and
+    // zero mount-animation storms while typing!).
+    let cached_rows: Rc<Vec<CachedAppRow>> = {
+        let mut rows = Vec::with_capacity(installed.len());
+        for (idx, app) in installed.iter().enumerate() {
+            let row = build_cached_app_row(
+                app,
+                &pinned,
+                &preloaded,
+                &popover_guard,
+                &on_launch,
+                &refresh_slot,
+                false,
+            );
+            if idx >= 18 {
+                row.row_box.add_css_class("lily-settled");
+                row.row_box.add_css_class("lily-offscreen");
+            }
+            apps_box.append(&row.row_box);
+            rows.push(row);
+        }
+        Rc::new(rows)
+    };
 
-    let list_filter = list_container.clone();
-    let apps_filter = apps.clone();
-    let pinned_filter = pinned.clone();
-    let preloaded_filter = preloaded.clone();
-    let guard_filter = popover_guard.clone();
-    let launch_filter = on_launch.clone();
+    let last_order: Rc<RefCell<Vec<usize>>> =
+        Rc::new(RefCell::new((0..cached_rows.len()).collect()));
+    let last_preload_sig: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let refresh_list: Rc<dyn Fn(bool)> = {
+        let sc_r = scrolled.clone();
+        let math_top_r = math_top_box.clone();
+        let pre_hdr_r = preload_header.clone();
+        let pre_box_r = preload_box.clone();
+        let apps_hdr_r = apps_header.clone();
+        let apps_box_r = apps_box.clone();
+        let fall_box_r = fallback_box.clone();
+        let rows_r = cached_rows.clone();
+        let apps_r = apps.clone();
+        let pin_r = pinned.clone();
+        let pre_r = preloaded.clone();
+        let q_r = query_state.clone();
+        let order_r = last_order.clone();
+        let pre_sig_r = last_preload_sig.clone();
+        let guard_r = popover_guard.clone();
+        let launch_r = on_launch.clone();
+        let ref_slot_r = refresh_slot.clone();
+
+        Rc::new(move |is_initial: bool| {
+            while let Some(c) = math_top_r.first_child() {
+                math_top_r.remove(&c);
+            }
+            while let Some(c) = fall_box_r.first_child() {
+                fall_box_r.remove(&c);
+            }
+
+            let raw_q = q_r.borrow().clone();
+            let query_trimmed = raw_q.trim();
+            let explicit_math = query_trimmed.starts_with('=');
+            let query_owned = query_trimmed.to_lowercase();
+            let query = query_owned.as_str();
+
+            // 0. Explicit `= expr` quick-math card right at the very top
+            if explicit_math {
+                if let Some((expr_disp, ans)) = eval_quick_math(query_trimmed) {
+                    append_math_card(&math_top_r, &expr_disp, &ans);
+                    math_top_r.set_visible(true);
+                } else {
+                    math_top_r.set_visible(false);
+                }
+            } else {
+                math_top_r.set_visible(false);
+            }
+
+            // 1. Preloaded section (only when search is empty and preloaded set is non-empty)
+            if query.is_empty() && !pre_r.borrow().is_empty() {
+                let mut cur_sig: Vec<String> = pre_r.borrow().iter().cloned().collect();
+                cur_sig.sort();
+                if *pre_sig_r.borrow() != cur_sig {
+                    *pre_sig_r.borrow_mut() = cur_sig;
+                    while let Some(c) = pre_box_r.first_child() {
+                        pre_box_r.remove(&c);
+                    }
+                    let pre_list: Vec<AppEntry> = apps_r
+                        .borrow()
+                        .iter()
+                        .filter(|a| pre_r.borrow().contains(&a.name))
+                        .cloned()
+                        .collect();
+                    for app in pre_list {
+                        let prow = build_cached_app_row(
+                            &app,
+                            &pin_r,
+                            &pre_r,
+                            &guard_r,
+                            &launch_r,
+                            &ref_slot_r,
+                            true,
+                        );
+                        if !is_initial {
+                            prow.row_box.add_css_class("lily-settled");
+                        }
+                        pre_box_r.append(&prow.row_box);
+                    }
+                }
+                pre_hdr_r.set_visible(true);
+                pre_box_r.set_visible(true);
+            } else {
+                pre_hdr_r.set_visible(false);
+                pre_box_r.set_visible(false);
+            }
+
+            if explicit_math {
+                apps_hdr_r.set_visible(false);
+                apps_box_r.set_visible(false);
+                fall_box_r.set_visible(false);
+                return;
+            }
+
+            apps_hdr_r.set_visible(true);
+            apps_box_r.set_visible(true);
+
+            let new_order: Vec<usize> = {
+                let pin_set = pin_r.borrow();
+                if query.is_empty() {
+                    let mut idxs: Vec<usize> = (0..rows_r.len()).collect();
+                    idxs.sort_by(|&ia, &ib| {
+                        let a = &rows_r[ia].app;
+                        let b = &rows_r[ib].app;
+                        let a_pin = pin_set.contains(&a.name);
+                        let b_pin = pin_set.contains(&b.name);
+                        b_pin.cmp(&a_pin).then_with(|| ia.cmp(&ib))
+                    });
+                    idxs
+                } else {
+                    let mut scored: Vec<(i32, usize)> = rows_r
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, r)| {
+                            let s = app_match_score(
+                                &r.app,
+                                query,
+                                pin_set.contains(&r.app.name),
+                            )?;
+                            Some((s, idx))
+                        })
+                        .collect();
+                    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                    scored.into_iter().map(|(_, idx)| idx).collect()
+                }
+            };
+
+            let mut matched = vec![false; rows_r.len()];
+            for &idx in &new_order {
+                matched[idx] = true;
+            }
+
+            for (idx, row) in rows_r.iter().enumerate() {
+                if !matched[idx] && row.row_box.is_visible() {
+                    row.row_box.set_visible(false);
+                }
+            }
+
+            {
+                let pin_set = pin_r.borrow();
+                let pre_set = pre_r.borrow();
+                for (vis_pos, &idx) in new_order.iter().enumerate() {
+                    let row = &rows_r[idx];
+                    let is_pin = pin_set.contains(&row.app.name);
+                    let is_pre = pre_set.contains(&row.app.name);
+
+                    if is_pin != row.btn.has_css_class("pinned") {
+                        if is_pin {
+                            row.btn.add_css_class("pinned");
+                        } else {
+                            row.btn.remove_css_class("pinned");
+                        }
+                    }
+
+                    let badge = if is_pin && is_pre {
+                        "[PIN+RAM] ->"
+                    } else if is_pin {
+                        "[PIN] ->"
+                    } else if is_pre {
+                        "[RAM] ->"
+                    } else {
+                        "->"
+                    };
+                    if row.arrow_lbl.label() != badge {
+                        row.arrow_lbl.set_label(badge);
+                    }
+
+                    if !is_initial {
+                        if !row.row_box.has_css_class("lily-settled") {
+                            row.row_box.add_css_class("lily-settled");
+                        }
+                        if vis_pos < 20 && row.row_box.has_css_class("lily-offscreen") {
+                            row.row_box.remove_css_class("lily-offscreen");
+                        }
+                    }
+
+                    if !row.row_box.is_visible() {
+                        row.row_box.set_visible(true);
+                    }
+                }
+            }
+
+            if *order_r.borrow() != new_order {
+                let mut prev: Option<&Box> = None;
+                for &idx in &new_order {
+                    let rb = &rows_r[idx].row_box;
+                    apps_box_r.reorder_child_after(rb, prev);
+                    prev = Some(rb);
+                }
+                *order_r.borrow_mut() = new_order.clone();
+            }
+
+            if new_order.is_empty() && !query.is_empty() {
+                if let Some((expr_disp, ans)) = eval_quick_math(query_trimmed) {
+                    append_math_card(&fall_box_r, &expr_disp, &ans);
+                }
+
+                let cmd_btn = Button::builder()
+                    .css_classes(vec!["fav-item-btn".to_string()])
+                    .hexpand(true)
+                    .build();
+
+                let row = Box::builder()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(6)
+                    .build();
+
+                let lbl = Label::builder()
+                    .label(&format!("Run command: {}", query_trimmed))
+                    .halign(Align::Start)
+                    .hexpand(true)
+                    .ellipsize(gtk4::pango::EllipsizeMode::End)
+                    .build();
+
+                let arrow = Label::builder()
+                    .label("->")
+                    .css_classes(vec!["fav-score-badge".to_string()])
+                    .build();
+
+                row.append(&lbl);
+                row.append(&arrow);
+                cmd_btn.set_child(Some(&row));
+
+                let cmd_str = query_trimmed.to_string();
+                let launch_cb = launch_r.clone();
+                cmd_btn.connect_clicked(move |_| {
+                    let _ = Command::new("sh").arg("-c").arg(&cmd_str).spawn();
+                    launch_cb();
+                });
+
+                fall_box_r.append(&cmd_btn);
+                fall_box_r.set_visible(true);
+            } else {
+                fall_box_r.set_visible(false);
+            }
+
+            sc_r.vadjustment().set_value(0.0);
+            crate::module_api::refresh_viewport_culler(&sc_r, &apps_box_r);
+        })
+    };
+    *refresh_slot.borrow_mut() = Some(refresh_list.clone());
+    refresh_list(true);
+
+    let q_filter = query_state.clone();
+    let ref_filter = refresh_list.clone();
     search_entry.connect_search_changed(move |entry| {
-        let raw_q = entry.text().trim().to_string();
-        populate_app_list(
-            &list_filter,
-            &apps_filter,
-            &pinned_filter,
-            &preloaded_filter,
-            &raw_q,
-            &guard_filter,
-            &launch_filter,
-        );
+        *q_filter.borrow_mut() = entry.text().trim().to_string();
+        ref_filter(false);
     });
 
     let apps_activate = apps.clone();
@@ -352,7 +671,7 @@ where
 
         scored.sort_by(|a, b| {
             b.0.cmp(&a.0)
-                .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+                .then_with(|| a.1.name_lower.cmp(&b.1.name_lower))
         });
 
         if let Some((_, app)) = scored.first() {
@@ -373,169 +692,13 @@ where
     }
 }
 
-fn populate_app_list(
-    container: &Box,
-    apps_rc: &Rc<RefCell<Vec<AppEntry>>>,
-    pinned_rc: &Rc<RefCell<HashSet<String>>>,
-    preloaded_rc: &Rc<RefCell<HashSet<String>>>,
-    raw_query: &str,
-    popover_guard: &Rc<Cell<usize>>,
-    on_launch: &Rc<dyn Fn()>,
-) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
-
-    let query_trimmed = raw_query.trim();
-    let explicit_math = query_trimmed.starts_with('=');
-    let query_owned = query_trimmed.to_lowercase();
-    let query = query_owned.as_str();
-
-    // 0. Explicit `= expr` quick-math card right at the very top
-    if explicit_math {
-        if let Some((expr_disp, ans)) = eval_quick_math(query_trimmed) {
-            append_math_card(container, &expr_disp, &ans);
-        }
-    }
-
-    // 1. If search is empty and we have preloaded apps, show the PRELOADED section at the top!
-    if query.is_empty() && !preloaded_rc.borrow().is_empty() {
-        let preload_header = Label::builder()
-            .label("PRELOADED IN RAM")
-            .halign(Align::Start)
-            .css_classes(vec!["fav-group-header".to_string()])
-            .margin_top(2)
-            .build();
-        container.append(&preload_header);
-
-        let preloaded_list: Vec<AppEntry> = apps_rc
-            .borrow()
-            .iter()
-            .filter(|a| preloaded_rc.borrow().contains(&a.name))
-            .cloned()
-            .collect();
-
-        for app in preloaded_list {
-            let row = build_app_row(
-                &app,
-                container,
-                apps_rc,
-                pinned_rc,
-                preloaded_rc,
-                raw_query,
-                popover_guard,
-                on_launch,
-                true,
-            );
-            container.append(&row);
-        }
-    }
-
-    if !explicit_math {
-        let header = Label::builder()
-            .label("APPLICATIONS")
-            .halign(Align::Start)
-            .css_classes(vec!["fav-group-header".to_string()])
-            .margin_top(6)
-            .build();
-        container.append(&header);
-
-        let filtered: Vec<AppEntry> = {
-            let pin_set = pinned_rc.borrow();
-            if query.is_empty() {
-                let mut all: Vec<AppEntry> = apps_rc.borrow().clone();
-                all.sort_by(|a, b| {
-                    let a_pin = pin_set.contains(&a.name);
-                    let b_pin = pin_set.contains(&b.name);
-                    b_pin
-                        .cmp(&a_pin)
-                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                });
-                all
-            } else {
-                let mut scored: Vec<(i32, AppEntry)> = apps_rc
-                    .borrow()
-                    .iter()
-                    .filter_map(|app| {
-                        let s = app_match_score(app, query, pin_set.contains(&app.name))?;
-                        Some((s, app.clone()))
-                    })
-                    .collect();
-                scored.sort_by(|a, b| {
-                    b.0.cmp(&a.0)
-                        .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
-                });
-                scored.into_iter().map(|(_, a)| a).collect()
-            }
-        };
-
-        let match_count = filtered.len();
-
-        for app in filtered {
-            let row = build_app_row(
-                &app,
-                container,
-                apps_rc,
-                pinned_rc,
-                preloaded_rc,
-                raw_query,
-                popover_guard,
-                on_launch,
-                false,
-            );
-            container.append(&row);
-        }
-
-        if match_count == 0 && !query.is_empty() {
-            if let Some((expr_disp, ans)) = eval_quick_math(query_trimmed) {
-                append_math_card(container, &expr_disp, &ans);
-            }
-
-            let cmd_btn = Button::builder()
-                .css_classes(vec!["fav-item-btn".to_string()])
-                .hexpand(true)
-                .build();
-
-            let row = Box::builder()
-                .orientation(Orientation::Horizontal)
-                .spacing(6)
-                .build();
-
-            let lbl = Label::builder()
-                .label(&format!("Run command: {}", query_trimmed))
-                .halign(Align::Start)
-                .hexpand(true)
-                .ellipsize(gtk4::pango::EllipsizeMode::End)
-                .build();
-
-            let arrow = Label::builder()
-                .label("->")
-                .css_classes(vec!["fav-score-badge".to_string()])
-                .build();
-
-            row.append(&lbl);
-            row.append(&arrow);
-            cmd_btn.set_child(Some(&row));
-
-            let cmd_str = query_trimmed.to_string();
-            let launch_cb = on_launch.clone();
-            cmd_btn.connect_clicked(move |_| {
-                let _ = Command::new("sh").arg("-c").arg(&cmd_str).spawn();
-                launch_cb();
-            });
-
-            container.append(&cmd_btn);
-        }
-    }
-}
-
 /// Scores an app against a non-empty lowercase query so exact/prefix/word-start name & binary
 /// matches always rank above mid-word or description-only matches (e.g. `"tor"` puts `Tor Browser`
 /// at #1 instead of `"text ediTOR"` / `"moniTOR"`).
 fn app_match_score(app: &AppEntry, q: &str, is_pinned: bool) -> Option<i32> {
-    let name = app.name.to_lowercase();
-    let exec = app.exec_name.to_lowercase();
-    let desc = app.description.to_lowercase();
+    let name = app.name_lower.as_str();
+    let exec = app.exec_lower.as_str();
+    let desc = app.desc_lower.as_str();
 
     let word_starts = |s: &str| {
         s.split(|c: char| !c.is_alphanumeric())
@@ -548,13 +711,13 @@ fn app_match_score(app: &AppEntry, q: &str, is_pinned: bool) -> Option<i32> {
         900 - (name.len().min(60) as i32)
     } else if exec.starts_with(q) {
         830 - (exec.len().min(40) as i32)
-    } else if word_starts(&name) {
+    } else if word_starts(name) {
         760 - (name.len().min(50) as i32)
     } else if let Some(pos) = name.find(q) {
         560 - (pos.min(40) as i32)
     } else if let Some(pos) = exec.find(q) {
         460 - (pos.min(40) as i32)
-    } else if word_starts(&desc) {
+    } else if word_starts(desc) {
         240
     } else if desc.contains(q) {
         100
@@ -927,17 +1090,15 @@ fn eval_quick_math(raw: &str) -> Option<(String, String)> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_app_row(
+fn build_cached_app_row(
     app: &AppEntry,
-    container: &Box,
-    apps_rc: &Rc<RefCell<Vec<AppEntry>>>,
     pinned_rc: &Rc<RefCell<HashSet<String>>>,
     preloaded_rc: &Rc<RefCell<HashSet<String>>>,
-    query: &str,
     popover_guard: &Rc<Cell<usize>>,
     on_launch: &Rc<dyn Fn()>,
+    refresh_slot: &Rc<RefCell<Option<Rc<dyn Fn(bool)>>>>,
     is_preload_section: bool,
-) -> Box {
+) -> CachedAppRow {
     let is_pinned = pinned_rc.borrow().contains(&app.name);
     let is_preloaded = preloaded_rc.borrow().contains(&app.name);
 
@@ -1007,13 +1168,10 @@ fn build_app_row(
     let right_click = GestureClick::builder().button(3).build();
     let row_weak = row_box.downgrade();
     let app_ctx = app.clone();
-    let container_ctx = container.clone();
-    let apps_ctx = apps_rc.clone();
     let pinned_ctx = pinned_rc.clone();
     let preloaded_ctx = preloaded_rc.clone();
-    let query_ctx = query.to_string();
     let guard_ctx = popover_guard.clone();
-    let launch_ctx = on_launch.clone();
+    let ref_ctx = refresh_slot.clone();
 
     right_click.connect_pressed(move |_, _, _, _| {
         let Some(parent_row) = row_weak.upgrade() else {
@@ -1107,13 +1265,9 @@ fn build_app_row(
         // Pin button handler
         {
             let app_name = app_ctx.name.clone();
-            let container_pin = container_ctx.clone();
-            let apps_pin = apps_ctx.clone();
             let pinned_pin = pinned_ctx.clone();
             let preloaded_pin = preloaded_ctx.clone();
-            let query_pin = query_ctx.clone();
-            let guard_pin = guard_ctx.clone();
-            let launch_pin = launch_ctx.clone();
+            let ref_pin = ref_ctx.clone();
             let pop_pin = popover.downgrade();
 
             pin_btn.connect_clicked(move |_| {
@@ -1129,28 +1283,18 @@ fn build_app_row(
                     }
                     save_config(&set, &preloaded_pin.borrow());
                 }
-                populate_app_list(
-                    &container_pin,
-                    &apps_pin,
-                    &pinned_pin,
-                    &preloaded_pin,
-                    &query_pin,
-                    &guard_pin,
-                    &launch_pin,
-                );
+                if let Some(ref cb) = *ref_pin.borrow() {
+                    cb(false);
+                }
             });
         }
 
         // Preload button handler
         {
             let app_clone = app_ctx.clone();
-            let container_pre = container_ctx.clone();
-            let apps_pre = apps_ctx.clone();
             let pinned_pre = pinned_ctx.clone();
             let preloaded_pre = preloaded_ctx.clone();
-            let query_pre = query_ctx.clone();
-            let guard_pre = guard_ctx.clone();
-            let launch_pre = launch_ctx.clone();
+            let ref_pre = ref_ctx.clone();
             let pop_pre = popover.downgrade();
 
             preload_btn.connect_clicked(move |_| {
@@ -1174,15 +1318,9 @@ fn build_app_row(
                     preload_app_in_background(app_clone.clone());
                 }
 
-                populate_app_list(
-                    &container_pre,
-                    &apps_pre,
-                    &pinned_pre,
-                    &preloaded_pre,
-                    &query_pre,
-                    &guard_pre,
-                    &launch_pre,
-                );
+                if let Some(ref cb) = *ref_pre.borrow() {
+                    cb(false);
+                }
             });
         }
 
@@ -1191,7 +1329,12 @@ fn build_app_row(
     btn.add_controller(right_click);
 
     row_box.append(&btn);
-    row_box
+    CachedAppRow {
+        app: app.clone(),
+        row_box,
+        btn,
+        arrow_lbl: arrow,
+    }
 }
 
 pub fn init() {
@@ -1202,11 +1345,19 @@ pub fn build(ctx: &crate::module_api::ModuleContext) -> crate::module_api::Modul
     let close_cb = ctx.close_drawer.clone();
     let ui = build_launcher_ui(ctx.popover_guard.clone(), move || close_cb());
     let entry = ui.search_entry.clone();
+    let root_settle = ui.root.clone();
     crate::module_api::ModuleHandle {
         widget: ui.root.upcast(),
         detail_pane: None,
         on_show: Some(std::rc::Rc::new(move || {
             entry.grab_focus();
+            if !root_settle.has_css_class("lily-settled") {
+                let r_s = root_settle.clone();
+                let dur = crate::config::get().layout.anim_duration_ms + 360;
+                glib::timeout_add_local_once(Duration::from_millis(dur), move || {
+                    r_s.add_css_class("lily-settled");
+                });
+            }
         })),
         on_hide: None,
     }

@@ -96,6 +96,169 @@ pub fn set_sidebar_badge(tab_id: &str, badge: Option<&str>) {
 }
 
 // ==========================================
+// VIEWPORT OFFSCREEN GPU SHADER / SHADOW CULLER
+// ==========================================
+//
+// `GtkBox` inside `GtkScrolledWindow` snapshots ALL children on every scroll frame even when
+// 80%+ of rows are hundreds of pixels outside the visible viewport clip. With heavy user CSS
+// themes (9-layer gradients, blurred inset/outset box-shadows, infinite @keyframes), offscreen
+// widgets otherwise generate 1,000+ redundant GSK render nodes per frame.
+//
+// `attach_viewport_culler` toggles `.lily-offscreen` (paint-only: strips gradients, shadows,
+// and animations without altering widget dimensions or scroll height) on children outside a
+// generous ±320px overscan window, checking only on ≥140px scroll steps or content resize.
+
+fn apply_cull_pass(scrolled: &gtk4::ScrolledWindow, content_box: &gtk4::Box) {
+    let view_h = scrolled.height() as f32;
+    if view_h <= 16.0 {
+        return;
+    }
+    let min_y = -320.0_f32;
+    let max_y = view_h + 320.0_f32;
+
+    let cull_one = |w: &Widget| {
+        if !w.is_visible() {
+            return;
+        }
+        // Never cull focused widgets so keyboard / Vim navigation stays seamless
+        if w.has_focus() || w.focus_child().is_some() {
+            if w.has_css_class("lily-offscreen") {
+                w.remove_css_class("lily-offscreen");
+            }
+            return;
+        }
+        let Some(bounds) = w.compute_bounds(scrolled) else {
+            return;
+        };
+        let h = bounds.height();
+        if h <= 0.5 {
+            return;
+        }
+        let y = bounds.y();
+        let is_off = (y + h) < min_y || y > max_y;
+        if is_off {
+            if !w.has_css_class("lily-settled") {
+                w.add_css_class("lily-settled");
+            }
+            if !w.has_css_class("lily-offscreen") {
+                w.add_css_class("lily-offscreen");
+            }
+        } else if w.has_css_class("lily-offscreen") {
+            w.remove_css_class("lily-offscreen");
+        }
+    };
+
+    let mut child = content_box.first_child();
+    while let Some(c) = child {
+        let next = c.next_sibling();
+        // If a child is a tall FlowBox (e.g. Wallpapers tile grid) or tall inner section Box
+        // (e.g. `theme_content_box` or an expanded Settings category), cull its children
+        // individually rather than treating the whole wrapper as one tall block!
+        if c.height() as f32 > view_h + 360.0
+            && (c.clone().downcast::<gtk4::FlowBox>().is_ok()
+                || c.clone().downcast::<gtk4::Box>().is_ok())
+        {
+            if c.has_css_class("lily-offscreen") {
+                c.remove_css_class("lily-offscreen");
+            }
+            let mut sub = c.first_child();
+            while let Some(item) = sub {
+                let next_item = item.next_sibling();
+                if item.height() as f32 > view_h + 360.0
+                    && item.clone().downcast::<gtk4::FlowBox>().is_ok()
+                {
+                    if item.has_css_class("lily-offscreen") {
+                        item.remove_css_class("lily-offscreen");
+                    }
+                    let mut leaf = item.first_child();
+                    while let Some(lf) = leaf {
+                        let next_lf = lf.next_sibling();
+                        cull_one(&lf);
+                        leaf = next_lf;
+                    }
+                } else {
+                    cull_one(&item);
+                }
+                sub = next_item;
+            }
+            child = next;
+            continue;
+        }
+        cull_one(&c);
+        child = next;
+    }
+}
+
+pub fn refresh_viewport_culler(scrolled: &gtk4::ScrolledWindow, content_box: &gtk4::Box) {
+    let sc_w = scrolled.downgrade();
+    let bx_w = content_box.downgrade();
+    gtk4::glib::idle_add_local_once(move || {
+        if let (Some(sc), Some(bx)) = (sc_w.upgrade(), bx_w.upgrade()) {
+            apply_cull_pass(&sc, &bx);
+        }
+    });
+}
+
+pub fn attach_viewport_culler(scrolled: &gtk4::ScrolledWindow, content_box: &gtk4::Box) {
+    let vadj = scrolled.vadjustment();
+    let last_cull_y = Rc::new(Cell::new(-10_000.0_f64));
+    let pending_idle = Rc::new(Cell::new(false));
+
+    {
+        let sc_w = scrolled.downgrade();
+        let bx_w = content_box.downgrade();
+        let last_y = last_cull_y.clone();
+        vadj.connect_value_changed(move |adj| {
+            let val = adj.value();
+            if (val - last_y.get()).abs() < 140.0 {
+                return;
+            }
+            last_y.set(val);
+            if let (Some(sc), Some(bx)) = (sc_w.upgrade(), bx_w.upgrade()) {
+                apply_cull_pass(&sc, &bx);
+            }
+        });
+    }
+
+    let schedule_recheck = {
+        let sc_w = scrolled.downgrade();
+        let bx_w = content_box.downgrade();
+        let last_y = last_cull_y;
+        let pend = pending_idle;
+        Rc::new(move |adj_val: f64| {
+            if pend.get() {
+                return;
+            }
+            pend.set(true);
+            let sc_i = sc_w.clone();
+            let bx_i = bx_w.clone();
+            let ly = last_y.clone();
+            let p_done = pend.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                p_done.set(false);
+                ly.set(adj_val);
+                if let (Some(sc), Some(bx)) = (sc_i.upgrade(), bx_i.upgrade()) {
+                    apply_cull_pass(&sc, &bx);
+                }
+            });
+        })
+    };
+
+    {
+        let sched = schedule_recheck.clone();
+        vadj.connect_upper_notify(move |adj| {
+            sched(adj.value());
+        });
+    }
+    {
+        let sched = schedule_recheck;
+        vadj.connect_page_size_notify(move |adj| {
+            sched(adj.value());
+        });
+    }
+}
+
+// ==========================================
 // DECOUPLED VAULT BRIDGE (Locker <-> Passwords)
 // ==========================================
 

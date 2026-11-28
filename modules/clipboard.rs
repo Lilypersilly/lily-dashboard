@@ -485,6 +485,7 @@ pub fn build_clipboard_ui(popover_guard: Rc<Cell<usize>>) -> Box {
         .build();
 
     scrolled.set_child(Some(&list_container));
+    crate::module_api::attach_viewport_culler(&scrolled, &list_container);
     root.append(&scrolled);
 
     let query_rc = Rc::new(RefCell::new(String::new()));
@@ -586,6 +587,8 @@ fn populate_clipboard_list(
         .cloned()
         .collect();
 
+    let mut row_idx = 0usize;
+
     if !pinned_items.is_empty() {
         let pin_hdr = Label::builder()
             .label("PINNED")
@@ -596,7 +599,13 @@ fn populate_clipboard_list(
         container.append(&pin_hdr);
 
         for item in &pinned_items {
-            container.append(&build_clip_row(item, container, query_rc, popover_guard));
+            let row = build_clip_row(item, container, query_rc, popover_guard);
+            if row_idx >= 18 {
+                row.add_css_class("lily-settled");
+                row.add_css_class("lily-offscreen");
+            }
+            row_idx += 1;
+            container.append(&row);
         }
     }
 
@@ -610,8 +619,21 @@ fn populate_clipboard_list(
         container.append(&hist_hdr);
 
         for item in &history_items {
-            container.append(&build_clip_row(item, container, query_rc, popover_guard));
+            let row = build_clip_row(item, container, query_rc, popover_guard);
+            if row_idx >= 18 {
+                row.add_css_class("lily-settled");
+                row.add_css_class("lily-offscreen");
+            }
+            row_idx += 1;
+            container.append(&row);
         }
+    }
+
+    if let Some(sc) = container
+        .ancestor(ScrolledWindow::static_type())
+        .and_then(|w| w.downcast::<ScrolledWindow>().ok())
+    {
+        crate::module_api::refresh_viewport_culler(&sc, container);
     }
 
     if pinned_items.is_empty() && history_items.is_empty() {
